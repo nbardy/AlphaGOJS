@@ -1,6 +1,3 @@
-
-Test for mem leaks
-
 Possibly use one synced data per round
 Change the gameEnded to be faster by not syncing data.
 
