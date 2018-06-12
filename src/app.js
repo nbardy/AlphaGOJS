@@ -1,11 +1,10 @@
-import {newGame,gameEnded,getMoveRandom,getMoveClostestToICenter,progressBoard} from './data.js';
+import {newGame,gameEnded,getMoveRandom,getMoveClosestToICenter,progressBoard,makeMove} from './data.js';
 import {newCanvas,drawGame} from './draw.js';
 import {runml} from './nn.js';
-import * as dl from 'deeplearn'
-
-const ROW_COUNT  = 200,
-      COL_COUNT  = 200,
-      CELL_WIDTH = 2,
+import * as tf from '@tensorflow/tfjs'
+const ROW_COUNT  = 50,
+      COL_COUNT  = 50,
+      CELL_WIDTH = 10,
       TURN_SPEED = 0;
 
 var gameThreads = [];
@@ -33,33 +32,55 @@ function start() {
     board: board
   }
 
+  const optimizer = tf.train.momentum(0.1, 0.01)
+
   drawGame(game, opts)
   // dl.ENV.set('DEBUG',true)
+  //
+  const t0 = performance.mark("startgame");
 
-  var player = 1;
+  var player;
   var move;
-  const next = function() {
-    move = getMoveRandom(game,opts);
-    game.set(player,move);
-    player = -1
+  var nextGame;
+  const next = function(currentGame) {
+    
+    tf.tidy(() => {
+      player = 1;
+      move = getMoveRandom(currentGame,opts);
 
-    drawGame(game, opts);
-
-    move = getMoveRandom(game,opts);
-    game.set(player,move);
-    player = 1
+      nextGame = makeMove(currentGame, player, move)
+      currentGame.dispose()
 
 
-    game = progressBoard(game,opts);
+      player = -1
 
-    if (!gameEnded(game)) {
-      gameThreads.push(setTimeout(next, TURN_SPEED));
-    } else {
-      drawGame(game, opts);
-    }
+      // drawGame(nextGame, opts);
+      //
+
+      move = getMoveRandom(nextGame,opts);
+      nextGame = makeMove(nextGame, player, move)
+
+      nextGame = progressBoard(nextGame,opts);
+
+      var advancedGame;
+
+      if (!gameEnded(nextGame)) {
+        advancedGame = tf.keep(nextGame);
+        gameThreads.push(setTimeout(() => { 
+          next(advancedGame)
+        }, TURN_SPEED));
+      } else {
+        drawGame(nextGame, opts);
+        const t1 = performance.mark("endgame");
+        performance.measure("game", "startgame","endgame")
+        advancedGame = tf.keep(newGame(ROW_COUNT, COL_COUNT));
+        next(advancedGame)
+        // TODO
+      }
+    })
   }
 
-  next()
+  next(game)
 }
 
 function clean() {
@@ -67,5 +88,3 @@ function clean() {
   gameThreads.forEach(v => clearTimeout(v))
   gameThreads = [];
 }
-
-runml()

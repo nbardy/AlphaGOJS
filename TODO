@@ -1,7 +1,7 @@
-Fix weird col vs row thing. only works when they are equal, must of flip flopped something
-Add ML Bits
 
-ML Ideas
---------
+Test for mem leaks
 
-Do one that takes board state ->
+Possibly use one synced data per round
+Change the gameEnded to be faster by not syncing data.
+
+Make getMoveRandom faster not syncing to check for empty state.

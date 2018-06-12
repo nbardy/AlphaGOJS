@@ -12,6 +12,7 @@ module.exports = {
   devServer: {
     hot: true
   },
+  devtool: "eval-source-map",
   plugins: [
     new CleanWebpackPlugin(['dist']),
     new HtmlWebpackPlugin({
@@ -20,6 +21,7 @@ module.exports = {
     new webpack.NamedModulesPlugin(),
     new webpack.HotModuleReplacementPlugin()
   ],
+  mode: 'development',
   module: {
     rules: [
       {

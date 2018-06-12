@@ -1,0 +1,13 @@
+Why cljs wrapper?
+
+Adding new Syntax makes it trivial to stay thread safe.
+
+I could do this in javascript with the babel.
+
+tensor should only be called inside of tidy
+(defntidy 
+  (tf/add
+    (s/zeros 52 )
+    (s/ones  52 )))
+
+Dev: Warning when called outside of tidy.

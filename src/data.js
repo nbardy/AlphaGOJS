@@ -1,13 +1,42 @@
-import * as dl from 'deeplearn'
+import * as tf from '@tensorflow/tfjs'
+import * as nn from './nn'
 
-window.dl = dl;
 function newGame(rows,cols)  {
   const size = rows * cols;
-  const cells = new Int8Array(size);
+  // const cells = new Int8Array(size);
 
-  const buffer = dl.buffer([size],'int32',cells);
-  return buffer;
+  // const buffer = tf.buffer([size],'int32',cells);
+  // return buffer;
+  return tf.zeros([size], 'int32');
 
+}
+
+const bufferCache = {};
+
+function zeroBuffer(game) {
+  const gameShape = game.shape;
+  if(bufferCache[gameShape]) {
+    return bufferCache[gameShape];
+  }
+  else {
+    const buf = tf.buffer(game.shape, 'int32');
+    bufferCache[gameShape] = buf;
+    return buf;
+  }
+}
+
+export function makeMove(game, player, move) {
+  const buf = zeroBuffer(game);
+  return tf.tidy( () => {
+    buf.set(player, move);
+
+    const newGame = game.add(buf.toTensor());
+
+    // Unset from zero buffer
+    buf.set(0, move);
+
+    return newGame;
+  })
 }
 
 function isEmpty(game, i) {
@@ -16,6 +45,8 @@ function isEmpty(game, i) {
 
 function getMoveRandom(game) {
   var randSpot = Math.floor(game.size * Math.random())
+
+  return randSpot;
 
   if(isEmpty(game,randSpot)) {
     return randSpot;
@@ -33,7 +64,7 @@ function getFirstEmptySquare(game) {
   }
 }
 
-function getMoveClostestToICenter(game,opts) {
+function getMoveClosestToICenter(game,opts) {
   const {COL_COUNT,ROW_COUNT} = opts;
   const middle = rowAndColToI([ROW_COUNT/2,COL_COUNT/2],opts)
   // const middle = 5500;
@@ -63,57 +94,12 @@ function ItoRowAndCol(i,{ROW_COUNT, COL_COUNT}) {
 }
 
 
-function neighbors(i, opts) {
-  const {ROW_COUNT, COL_COUNT} = opts;;
-  const [row, col] = ItoRowAndCol(i, opts)
-  return [
-    [row + 1 , col],
-    [row - 1 , col],
-    [row , col + 1],
-    [row , col - 1]
-  ].filter(function([row,col]) {
-    return (row >= 0 && row < ROW_COUNT) && (col >= 0 && col < COL_COUNT)
-  })
-  .map(function(cell) {  return rowAndColToI(cell,opts); })
-}
-
-function addCellFreq(freqs, i, player) {
-  // Add default values
-  if(!freqs.get(i)) {
-    freqs.set(i, new Map([["total", 0]]))
+const randomCache = [];
+function fillCache(n,shape) {
+  console.log("Filling cache")
+  for(var i = 0; i < n; i++) {
+    randomCache.push(tf.keep(tf.randomUniform(shape)));
   }
-
-  if(!freqs.get(i).get(player)) {
-    freqs.get(i).set(player,0);
-  }
-
-  freqs.get(i).set(player,freqs.get(i).get(player) + 1)
-  freqs.get(i).set("total",freqs.get(i).get("total") + 1)
-}
-
-// A map of indexs containing freq of each players neighbor
-// e.g. {4:  {-1: 2, 1: 1},
-//       12: {-1: 1, 1: 3}}
-// In this example:
-//   'square 4' has two neighbors of 'player -1' and 1 neighbors of player 1
-//   'square 12 has one neighbors of 'player -1' and 3 neighbors of player 1
-//
-function neighborFrequencies(game,opts) {
-  const freqs = new Map();
-
-  for(let i = 0; i < game.size; i++) {
-    if(game.get(i) === 0) {
-      neighbors(i,opts).forEach(
-        function(neighbor) {
-          const neighborValue = game.get(neighbor);
-          if(neighborValue !== 0)  {
-            addCellFreq(freqs,i,neighborValue);
-          }
-        })
-    }
-  }
-
-  return freqs;
 }
 
 // Spreads plague to empty squares
@@ -126,10 +112,9 @@ function progressBoard(game, opts) {
   var newVal;
   // const neighborFreqs = neighborFrequencies(game,opts);
 
-  const next = dl.tidy("spread", () => {
-    const init = game.toTensor();
-    const x = dl.tensor1d([1, 2, 3, 4]);
-
+  return tf.tidy("spread", () => {
+    const init = game;
+    const x = tf.tensor1d([1, 2, 3, 4]);
     const init2d = init.reshape(shape);
     // TODO: Replace slice and stack with gather
     // init2d.print();
@@ -138,33 +123,32 @@ function progressBoard(game, opts) {
     const left      = padded.slice([2,1],shape);
     const down      = padded.slice([1,0],shape);
     const right     = padded.slice([1,2],shape);
-    const neighbors = dl.stack([up,down,left,right],2);
-    const random    = dl.randomUniform(neighbors.shape);
-    const weights   = random.mul(dl.cast(neighbors, 'float32'));
-    const prob      = weights.sum(2);
-    const rounded   = dl.cast(prob.mul(dl.scalar(2)), 'int32');
-    // const probInc   = dl.mul(rounded,dl.scalar(50)); // To make Effect less random
-    const nextVals  = rounded.clipByValue(-1,1);
-    const isZero    = init2d.notEqual(dl.scalar(0,'int32'))
-    const final     = dl.where(isZero,init2d,nextVals)
+    const neighbors = tf.stack([up,down,left,right],2);
+    // const random    = tf.randomUniform(neighbors.shape);
 
-    return final;
+    if(randomCache.length == 0) {
+      fillCache(200,neighbors.shape);
+    }
+    const random    = randomCache[Math.floor(Math.random() * 200)];
+    const weights   = random.mul(tf.cast(neighbors, 'float32'));
+    const prob      = weights.sum(2);
+    const rounded   = tf.cast(prob.mul(tf.scalar(2)), 'int32');
+    // const probInc   = tf.mul(rounded,tf.scalar(50)); // To make Effect less random
+    const nextVals  = rounded.clipByValue(-1,1);
+    const isZero    = init2d.notEqual(tf.scalar(0,'int32'))
+    const final     = tf.where(isZero,init2d,nextVals)
+
+    return final.as1D();
   });
 
-
-  return next.as1D().buffer();
 }
 
 function gameEnded(game) {
-  for(let i = 0; i < game.size; i++) {
-
-    if(game.get(i) === 0) {
-      return false;
-    }
-  }
-
-  return true;
+  return tf.tidy(() => {
+    const v = game.equal(tf.scalar(0,'int32')).sum().dataSync()[0];
+    return v === 0;
+  })
 }
 
 
-export {rowAndColToI, getMoveRandom, getMoveClostestToICenter, gameEnded, newGame, progressBoard}
+export {rowAndColToI, getMoveRandom, getMoveClosestToICenter, gameEnded, newGame, progressBoard}
