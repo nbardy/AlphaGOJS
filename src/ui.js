@@ -320,17 +320,24 @@ export class UI {
 
   _startLoop() {
     var self = this;
+    var errorCount = 0;
     var loop = function () {
       if (self._destroyed) return;
-      if (!self.paused) {
-        for (var t = 0; t < self.ticksPerFrame; t++) {
-          self.trainer.tick();
+      try {
+        if (!self.paused) {
+          for (var t = 0; t < self.ticksPerFrame; t++) {
+            self.trainer.tick();
+          }
         }
+        if (!self.humanPlaying) {
+          self._renderGrid();
+        }
+        self._updateStats();
+        errorCount = 0;
+      } catch (e) {
+        errorCount++;
+        if (errorCount < 5) console.warn('Tick error:', e.message);
       }
-      if (!self.humanPlaying) {
-        self._renderGrid();
-      }
-      self._updateStats();
       requestAnimationFrame(loop);
     };
     requestAnimationFrame(loop);

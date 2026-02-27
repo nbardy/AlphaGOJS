@@ -16,12 +16,22 @@ export class PolicyNetwork {
     return tf.model({ inputs: input, outputs: output });
   }
 
+  _flattenStates(states) {
+    var n = states.length;
+    var bs = this.boardSize;
+    var flat = new Float32Array(n * bs);
+    for (var i = 0; i < n; i++) {
+      flat.set(states[i], i * bs);
+    }
+    return flat;
+  }
+
   getActions(states, masks) {
     var boardSize = this.boardSize;
     var n = states.length;
     if (n === 0) return [];
 
-    var statesTensor = tf.tensor2d(states);
+    var statesTensor = tf.tensor2d(this._flattenStates(states), [n, boardSize]);
     var preds = this.model.predict(statesTensor);
     var predsData = preds.dataSync();
     preds.dispose();
@@ -75,7 +85,7 @@ export class PolicyNetwork {
       rewardsArr.push(experiences[i].reward);
     }
 
-    var statesTensor = tf.tensor2d(statesData);
+    var statesTensor = tf.tensor2d(this._flattenStates(statesData), [batchSize, boardSize]);
 
     var actionMaskData = new Float32Array(batchSize * boardSize);
     for (var i = 0; i < batchSize; i++) {
