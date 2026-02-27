@@ -1,6 +1,6 @@
 ## Cursor Cloud specific instructions
 
-This is **ml-blog**, a client-side TensorFlow.js self-play ML demo (2D grid game rendered on HTML Canvas). Single `package.json`, no monorepo. No backend, no database, no external services.
+**AlphaPlague** — a browser-based self-play RL plague/territory game using TensorFlow.js. Single `package.json`, no monorepo. No backend, no database, no external services.
 
 ### Running the dev server
 
@@ -11,11 +11,20 @@ NODE_OPTIONS=--openssl-legacy-provider yarn run start:dev
 
 The app serves at `http://localhost:8080` with HMR enabled.
 
+### Architecture
+
+- `src/game.js` — Pure JS game logic (no TF.js dependency), 10×10 plague territory game
+- `src/model.js` — TF.js policy network (256→128→100 dense, REINFORCE training with entropy bonus)
+- `src/trainer.js` — Self-play trainer running 40 parallel games with batched inference
+- `src/ui.js` — Dark-theme UI with training grid, stats, and human-vs-AI play mode
+- `src/app.js` — Entry point
+- `src/data.js`, `src/nn.js`, `src/draw.js` — Legacy/unused files from original prototype
+
 ### Key caveats
 
-- **Node 18 required.** The project uses Webpack 4 + webpack-cli 2 + Babel 6, which are incompatible with Node 20+.
-- **`NODE_OPTIONS=--openssl-legacy-provider`** is required when running webpack commands on Node 18 (MD4 hash function used by webpack 4 is not available in OpenSSL 3).
-- **webpack version pinning:** After `yarn install`, run `npm install webpack@4.19.1 --no-save` to downgrade webpack to a version compatible with webpack-cli@2. The `^4.0.0` semver range in `package.json` resolves to 4.47.0 which has an incompatible JSON schema structure that crashes webpack-cli@2.
-- **No lockfile:** Both `yarn.lock` and `package-lock.json` are gitignored, so dependency resolution may vary.
-- **No tests or linter configured.** There are no test scripts or linting tools in this project.
-- **WebGL required for full simulation.** The TensorFlow.js game simulation requires WebGL. In headless/cloud VMs without GPU, TF.js falls back to CPU but hits a dtype mismatch error in the game loop. The app structure (canvas, score text) still renders.
+- **Node 18 required.** Webpack 4 + webpack-cli 2 + Babel 6 are incompatible with Node 20+.
+- **`NODE_OPTIONS=--openssl-legacy-provider`** is required for webpack on Node 18.
+- **webpack version pinning:** After `yarn install`, run `npm install webpack@4.19.1 --no-save` to downgrade webpack to a version compatible with webpack-cli@2. The `^4.0.0` range resolves to 4.47.0 which crashes webpack-cli@2.
+- **No lockfile:** Both `yarn.lock` and `package-lock.json` are gitignored.
+- **No tests or linter configured.**
+- **TF.js CPU backend:** The cloud VM lacks WebGL. TF.js falls back to CPU automatically (warning in console is harmless). Game logic is pure JS so it works fine; only the NN model uses TF.js.
