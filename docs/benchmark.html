@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>AlphaPlague — GPU vs CPU Benchmarks</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a1a;color:#c0c0e0;font-family:'Courier New',monospace;padding:20px}
+h1{color:#00ff88;text-align:center;font-size:24px;margin-bottom:4px}
+.subtitle{text-align:center;color:#556;font-size:11px;margin-bottom:20px}
+.section{background:#151530;border:1px solid #2a2a5a;border-radius:8px;padding:16px;margin-bottom:16px;max-width:900px;margin-left:auto;margin-right:auto}
+.section h2{color:#4488ff;font-size:14px;margin-bottom:10px;border-bottom:1px solid #2a2a5a;padding-bottom:6px}
+.gpu-info{font-size:12px;line-height:1.8}
+.gpu-info .label{color:#6666aa;display:inline-block;width:160px}
+.gpu-info .val{color:#ffcc00}
+.gpu-info .val.yes{color:#00ff88}
+.gpu-info .val.no{color:#ff3366}
+table{width:100%;border-collapse:collapse;font-size:12px;margin-top:8px}
+th{text-align:left;color:#6666aa;font-size:10px;text-transform:uppercase;letter-spacing:1px;padding:6px 8px;border-bottom:1px solid #2a2a5a}
+td{padding:6px 8px;border-bottom:1px solid #1a1a40}
+td.num{text-align:right;font-weight:bold;color:#ffcc00}
+td.winner{color:#00ff88;font-weight:bold}
+td.loser{color:#ff3366}
+.bar-cell{width:200px}
+.bar{height:16px;border-radius:3px;min-width:2px;transition:width 0.3s}
+.bar.js{background:#4488ff}
+.bar.gpu{background:#00ff88}
+.bar.img{background:#ffcc00}
+.bar.fill{background:#ff6644}
+button{background:#2244aa;color:#fff;border:none;padding:10px 24px;border-radius:6px;cursor:pointer;font-family:inherit;font-size:14px;display:block;margin:20px auto}
+button:hover{background:#3355cc}
+button:disabled{background:#333;cursor:wait;color:#666}
+.status{text-align:center;color:#888;font-size:12px;margin:10px 0;min-height:18px}
+.back{text-align:center;margin-top:20px}
+.back a{color:#4488ff;font-size:12px}
+canvas{display:none}
+</style>
+</head>
+<body>
+
+<h1>AlphaPlague — GPU vs CPU Benchmarks</h1>
+<div class="subtitle">Run on your machine to compare WebGPU compute vs JavaScript typed arrays</div>
+
+<div class="section" id="sys-section">
+  <h2>System Information</h2>
+  <div class="gpu-info" id="sys-info">Detecting...</div>
+</div>
+
+<div class="section" id="bench-section" style="display:none">
+  <h2>Benchmark Results</h2>
+  <div class="status" id="status"></div>
+  <table id="results"><thead><tr>
+    <th>Benchmark</th><th>JS Typed Arrays</th><th>WebGPU Compute</th><th>Speedup</th><th>Comparison</th>
+  </tr></thead><tbody id="results-body"></tbody></table>
+</div>
+
+<button id="run-btn" onclick="runAll()" disabled>Detecting GPU...</button>
+
+<div class="section" id="render-section" style="display:none">
+  <h2>Rendering Benchmarks</h2>
+  <table id="render-results"><thead><tr>
+    <th>Method</th><th>Throughput</th><th>Latency</th><th>Comparison</th>
+  </tr></thead><tbody id="render-body"></tbody></table>
+</div>
+
+<canvas id="test-canvas" width="20" height="20"></canvas>
+<canvas id="test-canvas2" width="400" height="400"></canvas>
+
+<div class="back"><a href="./">← Back to AlphaPlague</a></div>
+
+<script>
+var ROWS = 20, COLS = 20, SIZE = ROWS * COLS;
+var NUM_GAMES = 80;
+var hasWebGPU = false;
+var gpuDevice = null;
+var gpuAdapter = null;
+var adapterInfo = null;
+
+// ===================== SYSTEM DETECTION =====================
+async function detectSystem() {
+  var info = document.getElementById('sys-info');
+  var lines = [];
+
+  lines.push('<div><span class="label">User Agent:</span> <span class="val">' + navigator.userAgent.split(') ')[0] + ')</span></div>');
+  lines.push('<div><span class="label">Hardware Concurrency:</span> <span class="val">' + navigator.hardwareConcurrency + ' threads</span></div>');
+  lines.push('<div><span class="label">Device Memory:</span> <span class="val">' + (navigator.deviceMemory || 'unknown') + ' GB</span></div>');
+
+  // WebGL info
+  var glCanvas = document.createElement('canvas');
+  var gl = glCanvas.getContext('webgl2') || glCanvas.getContext('webgl');
+  if (gl) {
+    var dbg = gl.getExtension('WEBGL_debug_renderer_info');
+    lines.push('<div><span class="label">WebGL Renderer:</span> <span class="val">' + (dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER)) + '</span></div>');
+    lines.push('<div><span class="label">WebGL Vendor:</span> <span class="val">' + (dbg ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VENDOR)) + '</span></div>');
+  } else {
+    lines.push('<div><span class="label">WebGL:</span> <span class="val no">Not available</span></div>');
+  }
+
+  // WebGPU
+  if (navigator.gpu) {
+    try {
+      gpuAdapter = await navigator.gpu.requestAdapter();
+      if (gpuAdapter) {
+        gpuDevice = await gpuAdapter.requestDevice();
+        adapterInfo = await gpuAdapter.requestAdapterInfo();
+        hasWebGPU = true;
+        lines.push('<div><span class="label">WebGPU:</span> <span class="val yes">Available ✓</span></div>');
+        lines.push('<div><span class="label">GPU Adapter:</span> <span class="val">' + (adapterInfo.description || adapterInfo.vendor + ' ' + adapterInfo.architecture) + '</span></div>');
+        lines.push('<div><span class="label">GPU Vendor:</span> <span class="val">' + adapterInfo.vendor + '</span></div>');
+        lines.push('<div><span class="label">Max Buffer Size:</span> <span class="val">' + (gpuDevice.limits.maxBufferSize / 1024 / 1024).toFixed(0) + ' MB</span></div>');
+        lines.push('<div><span class="label">Max Workgroup Size:</span> <span class="val">' + gpuDevice.limits.maxComputeWorkgroupSizeX + '</span></div>');
+        lines.push('<div><span class="label">Max Workgroups/Dispatch:</span> <span class="val">' + gpuDevice.limits.maxComputeWorkgroupsPerDimension + '</span></div>');
+      } else {
+        lines.push('<div><span class="label">WebGPU:</span> <span class="val no">No adapter found</span></div>');
+      }
+    } catch (e) {
+      lines.push('<div><span class="label">WebGPU:</span> <span class="val no">Error: ' + e.message + '</span></div>');
+    }
+  } else {
+    lines.push('<div><span class="label">WebGPU:</span> <span class="val no">Not available (navigator.gpu missing)</span></div>');
+  }
+
+  info.innerHTML = lines.join('');
+  var btn = document.getElementById('run-btn');
+  btn.disabled = false;
+  btn.textContent = hasWebGPU ? '▶ Run All Benchmarks (WebGPU + CPU)' : '▶ Run CPU Benchmarks (no WebGPU)';
+}
+
+// ===================== JS BENCHMARKS =====================
+function benchSpreadPlagueJS(numGames, iters) {
+  var boards = [];
+  for (var g = 0; g < numGames; g++) {
+    var b = new Int8Array(SIZE);
+    for (var i = 0; i < 40; i++) b[Math.floor(Math.random() * SIZE)] = Math.random() > 0.5 ? 1 : -1;
+    boards.push(b);
+  }
+  var t0 = performance.now();
+  for (var iter = 0; iter < iters; iter++) {
+    for (var g = 0; g < numGames; g++) {
+      var board = boards[g];
+      var nb = Int8Array.from(board);
+      for (var r = 0; r < ROWS; r++) {
+        for (var c = 0; c < COLS; c++) {
+          var i = r * COLS + c;
+          if (board[i] !== 0) continue;
+          var sum = 0;
+          if (r > 0) sum += board[(r-1)*COLS+c] * Math.random();
+          if (r < ROWS-1) sum += board[(r+1)*COLS+c] * Math.random();
+          if (c > 0) sum += board[r*COLS+(c-1)] * Math.random();
+          if (c < COLS-1) sum += board[r*COLS+(c+1)] * Math.random();
+          nb[i] = Math.max(-1, Math.min(1, Math.trunc(sum * 2)));
+        }
+      }
+      boards[g] = nb;
+    }
+  }
+  return performance.now() - t0;
+}
+
+function benchGetBoardJS(numGames, iters) {
+  var boards = [];
+  for (var g = 0; g < numGames; g++) {
+    var b = new Int8Array(SIZE);
+    for (var i = 0; i < SIZE; i++) b[i] = [-1,0,1][Math.floor(Math.random()*3)];
+    boards.push(b);
+  }
+  var t0 = performance.now();
+  for (var iter = 0; iter < iters; iter++) {
+    var flat = new Float32Array(numGames * SIZE);
+    for (var g = 0; g < numGames; g++) {
+      var board = boards[g];
+      var off = g * SIZE;
+      for (var i = 0; i < SIZE; i++) flat[off + i] = board[i];
+    }
+  }
+  return performance.now() - t0;
+}
+
+function benchMatMulJS(M, K, N, iters) {
+  var A = new Float32Array(M * K);
+  var B = new Float32Array(K * N);
+  var C = new Float32Array(M * N);
+  for (var i = 0; i < A.length; i++) A[i] = Math.random();
+  for (var i = 0; i < B.length; i++) B[i] = Math.random();
+  var t0 = performance.now();
+  for (var iter = 0; iter < iters; iter++) {
+    for (var m = 0; m < M; m++) {
+      for (var n = 0; n < N; n++) {
+        var sum = 0;
+        for (var k = 0; k < K; k++) sum += A[m * K + k] * B[k * N + n];
+        C[m * N + n] = sum;
+      }
+    }
+  }
+  return performance.now() - t0;
+}
+
+// ===================== WEBGPU BENCHMARKS =====================
+var plagueShader = `
+@group(0) @binding(0) var<storage, read> boardIn: array<i32>;
+@group(0) @binding(1) var<storage, read_write> boardOut: array<i32>;
+@group(0) @binding(2) var<uniform> params: vec4<u32>;
+
+fn hash(s: u32) -> f32 {
+  var x = s;
+  x = x ^ (x >> 16u); x = x * 0x45d9f3bu;
+  x = x ^ (x >> 16u); x = x * 0x45d9f3bu;
+  x = x ^ (x >> 16u);
+  return f32(x & 0x7FFFFFu) / f32(0x7FFFFFu);
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let idx = gid.x;
+  let rows = params.x;
+  let cols = params.y;
+  let size = rows * cols;
+  let totalCells = params.z;
+  let frame = params.w;
+  if (idx >= totalCells) { return; }
+
+  let i = idx;
+  let localIdx = i % size;
+  let r = localIdx / cols;
+  let c = localIdx % cols;
+
+  if (boardIn[i] != 0) { boardOut[i] = boardIn[i]; return; }
+
+  let seed = idx * 4u + frame * 31337u;
+  var sum: f32 = 0.0;
+  if (r > 0u)        { sum += f32(boardIn[i - cols]) * hash(seed); }
+  if (r < rows - 1u) { sum += f32(boardIn[i + cols]) * hash(seed + 1u); }
+  if (c > 0u)        { sum += f32(boardIn[i - 1u])   * hash(seed + 2u); }
+  if (c < cols - 1u) { sum += f32(boardIn[i + 1u])   * hash(seed + 3u); }
+
+  boardOut[i] = clamp(i32(trunc(sum * 2.0)), -1, 1);
+}
+`;
+
+var matmulShader = `
+@group(0) @binding(0) var<storage, read> A: array<f32>;
+@group(0) @binding(1) var<storage, read> B: array<f32>;
+@group(0) @binding(2) var<storage, read_write> C: array<f32>;
+@group(0) @binding(3) var<uniform> dims: vec4<u32>; // M, K, N, 0
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let m = gid.x;
+  let n = gid.y;
+  let M = dims.x; let K = dims.y; let N = dims.z;
+  if (m >= M || n >= N) { return; }
+  var sum: f32 = 0.0;
+  for (var k: u32 = 0u; k < K; k = k + 1u) {
+    sum += A[m * K + k] * B[k * N + n];
+  }
+  C[m * N + n] = sum;
+}
+`;
+
+async function benchSpreadPlagueGPU(numGames, iters) {
+  if (!gpuDevice) return -1;
+  var totalCells = numGames * SIZE;
+  var bufSize = totalCells * 4;
+
+  var boardData = new Int32Array(totalCells);
+  for (var g = 0; g < numGames; g++) {
+    for (var i = 0; i < 40; i++) boardData[g * SIZE + Math.floor(Math.random() * SIZE)] = Math.random() > 0.5 ? 1 : -1;
+  }
+
+  var bufIn = gpuDevice.createBuffer({ size: bufSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  var bufOut = gpuDevice.createBuffer({ size: bufSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  var paramBuf = gpuDevice.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+
+  var module = gpuDevice.createShaderModule({ code: plagueShader });
+  var pipeline = gpuDevice.createComputePipeline({ layout: 'auto', compute: { module: module, entryPoint: 'main' } });
+  var bindGroup = gpuDevice.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: bufIn } },
+      { binding: 1, resource: { buffer: bufOut } },
+      { binding: 2, resource: { buffer: paramBuf } },
+    ]
+  });
+
+  gpuDevice.queue.writeBuffer(bufIn, 0, boardData);
+  var workgroups = Math.ceil(totalCells / 256);
+
+  // Warmup
+  for (var w = 0; w < 5; w++) {
+    gpuDevice.queue.writeBuffer(paramBuf, 0, new Uint32Array([ROWS, COLS, totalCells, w]));
+    var enc = gpuDevice.createCommandEncoder();
+    var pass = enc.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(workgroups);
+    pass.end();
+    gpuDevice.queue.submit([enc.finish()]);
+  }
+  await gpuDevice.queue.onSubmittedWorkDone();
+
+  var t0 = performance.now();
+  for (var iter = 0; iter < iters; iter++) {
+    gpuDevice.queue.writeBuffer(paramBuf, 0, new Uint32Array([ROWS, COLS, totalCells, iter]));
+    var enc = gpuDevice.createCommandEncoder();
+    var pass = enc.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(workgroups);
+    pass.end();
+    gpuDevice.queue.submit([enc.finish()]);
+  }
+  await gpuDevice.queue.onSubmittedWorkDone();
+  var dt = performance.now() - t0;
+
+  bufIn.destroy(); bufOut.destroy(); paramBuf.destroy();
+  return dt;
+}
+
+async function benchMatMulGPU(M, K, N, iters) {
+  if (!gpuDevice) return -1;
+
+  var A = new Float32Array(M * K);
+  var B = new Float32Array(K * N);
+  for (var i = 0; i < A.length; i++) A[i] = Math.random();
+  for (var i = 0; i < B.length; i++) B[i] = Math.random();
+
+  var bufA = gpuDevice.createBuffer({ size: A.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  var bufB = gpuDevice.createBuffer({ size: B.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  var bufC = gpuDevice.createBuffer({ size: M * N * 4, usage: GPUBufferUsage.STORAGE });
+  var dimBuf = gpuDevice.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+
+  gpuDevice.queue.writeBuffer(bufA, 0, A);
+  gpuDevice.queue.writeBuffer(bufB, 0, B);
+  gpuDevice.queue.writeBuffer(dimBuf, 0, new Uint32Array([M, K, N, 0]));
+
+  var module = gpuDevice.createShaderModule({ code: matmulShader });
+  var pipeline = gpuDevice.createComputePipeline({ layout: 'auto', compute: { module: module, entryPoint: 'main' } });
+  var bindGroup = gpuDevice.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: bufA } },
+      { binding: 1, resource: { buffer: bufB } },
+      { binding: 2, resource: { buffer: bufC } },
+      { binding: 3, resource: { buffer: dimBuf } },
+    ]
+  });
+
+  var wgX = Math.ceil(M / 16), wgY = Math.ceil(N / 16);
+
+  // Warmup
+  for (var w = 0; w < 5; w++) {
+    var enc = gpuDevice.createCommandEncoder();
+    var pass = enc.beginComputePass();
+    pass.setPipeline(pipeline); pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(wgX, wgY);
+    pass.end();
+    gpuDevice.queue.submit([enc.finish()]);
+  }
+  await gpuDevice.queue.onSubmittedWorkDone();
+
+  var t0 = performance.now();
+  for (var iter = 0; iter < iters; iter++) {
+    var enc = gpuDevice.createCommandEncoder();
+    var pass = enc.beginComputePass();
+    pass.setPipeline(pipeline); pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(wgX, wgY);
+    pass.end();
+    gpuDevice.queue.submit([enc.finish()]);
+  }
+  await gpuDevice.queue.onSubmittedWorkDone();
+  var dt = performance.now() - t0;
+
+  bufA.destroy(); bufB.destroy(); bufC.destroy(); dimBuf.destroy();
+  return dt;
+}
+
+// ===================== RENDERING BENCHMARKS =====================
+function benchFillRect(numBoards, iters) {
+  var canvas = document.getElementById('test-canvas2');
+  canvas.width = COLS * 3 * 10;
+  canvas.height = ROWS * 3 * (Math.ceil(numBoards / 10));
+  var ctx = canvas.getContext('2d');
+  var boards = [];
+  for (var g = 0; g < numBoards; g++) {
+    var b = new Int8Array(SIZE);
+    for (var i = 0; i < SIZE; i++) b[i] = [-1,0,1][Math.floor(Math.random()*3)];
+    boards.push(b);
+  }
+  var cs = 3;
+  var t0 = performance.now();
+  for (var iter = 0; iter < iters; iter++) {
+    for (var g = 0; g < numBoards; g++) {
+      var ox = (g % 10) * COLS * cs, oy = Math.floor(g / 10) * ROWS * cs;
+      var board = boards[g];
+      for (var r = 0; r < ROWS; r++) {
+        for (var c = 0; c < COLS; c++) {
+          var val = board[r * COLS + c];
+          ctx.fillStyle = val === 1 ? '#00ff88' : val === -1 ? '#ff3366' : '#1e1e3a';
+          ctx.fillRect(ox + c * cs, oy + r * cs, cs, cs);
+        }
+      }
+    }
+  }
+  return performance.now() - t0;
+}
+
+function benchImageData(numBoards, iters) {
+  var canvas = document.getElementById('test-canvas');
+  canvas.width = COLS;
+  canvas.height = ROWS;
+  var ctx = canvas.getContext('2d');
+  var imgData = ctx.createImageData(COLS, ROWS);
+  var boards = [];
+  for (var g = 0; g < numBoards; g++) {
+    var b = new Int8Array(SIZE);
+    for (var i = 0; i < SIZE; i++) b[i] = [-1,0,1][Math.floor(Math.random()*3)];
+    boards.push(b);
+  }
+  var t0 = performance.now();
+  for (var iter = 0; iter < iters; iter++) {
+    for (var g = 0; g < numBoards; g++) {
+      var board = boards[g], data = imgData.data;
+      for (var i = 0; i < SIZE; i++) {
+        var off = i * 4, val = board[i];
+        if (val === 1) { data[off]=0; data[off+1]=255; data[off+2]=136; }
+        else if (val === -1) { data[off]=255; data[off+1]=51; data[off+2]=102; }
+        else { data[off]=30; data[off+1]=30; data[off+2]=58; }
+        data[off+3] = 255;
+      }
+      ctx.putImageData(imgData, 0, 0);
+    }
+  }
+  return performance.now() - t0;
+}
+
+// ===================== RUNNER =====================
+function setStatus(msg) { document.getElementById('status').textContent = msg; }
+
+function addRow(name, jsMs, jsIters, gpuMs, gpuIters) {
+  var tbody = document.getElementById('results-body');
+  var row = document.createElement('tr');
+  var jsRate = (jsIters / jsMs * 1000).toFixed(0);
+  var gpuRate = gpuMs > 0 ? (gpuIters / gpuMs * 1000).toFixed(0) : '—';
+  var speedup = gpuMs > 0 ? ((jsMs / jsIters) / (gpuMs / gpuIters)).toFixed(1) + 'x' : '—';
+  var jsPerMs = jsIters / jsMs;
+  var gpuPerMs = gpuMs > 0 ? gpuIters / gpuMs : 0;
+  var maxRate = Math.max(jsPerMs, gpuPerMs);
+  var jsW = Math.round(jsPerMs / maxRate * 180);
+  var gpuW = gpuPerMs > 0 ? Math.round(gpuPerMs / maxRate * 180) : 0;
+  var jsClass = gpuMs > 0 && jsPerMs >= gpuPerMs ? 'winner' : (gpuMs > 0 ? 'loser' : '');
+  var gpuClass = gpuMs > 0 && gpuPerMs > jsPerMs ? 'winner' : (gpuMs > 0 ? 'loser' : '');
+
+  row.innerHTML = '<td>' + name + '</td>'
+    + '<td class="num ' + jsClass + '">' + jsRate + '/sec</td>'
+    + '<td class="num ' + gpuClass + '">' + gpuRate + (gpuMs > 0 ? '/sec' : '') + '</td>'
+    + '<td class="num">' + speedup + '</td>'
+    + '<td class="bar-cell"><div class="bar js" style="width:' + jsW + 'px" title="JS"></div>'
+    + (gpuW > 0 ? '<div class="bar gpu" style="width:' + gpuW + 'px;margin-top:2px" title="GPU"></div>' : '')
+    + '</td>';
+  tbody.appendChild(row);
+}
+
+function addRenderRow(name, ms, iters, color) {
+  var tbody = document.getElementById('render-body');
+  var row = document.createElement('tr');
+  var rate = (iters / ms * 1000).toFixed(0);
+  var latency = (ms / iters * 1000).toFixed(1);
+  row.innerHTML = '<td>' + name + '</td><td class="num">' + rate + ' frames/sec</td><td class="num">' + latency + ' μs/frame</td>'
+    + '<td class="bar-cell"><div class="bar ' + color + '" style="width:' + Math.min(180, Math.round(iters/ms*180/50)) + 'px"></div></td>';
+  tbody.appendChild(row);
+}
+
+async function runAll() {
+  var btn = document.getElementById('run-btn');
+  btn.disabled = true;
+  btn.textContent = 'Running...';
+  document.getElementById('bench-section').style.display = 'block';
+  document.getElementById('render-section').style.display = 'block';
+  document.getElementById('results-body').innerHTML = '';
+  document.getElementById('render-body').innerHTML = '';
+
+  await new Promise(function(r) { setTimeout(r, 100); });
+
+  // --- Plague spread: 1 game ---
+  setStatus('Benchmarking: spreadPlague (1 game)...');
+  await new Promise(function(r) { setTimeout(r, 50); });
+  var jsMs1 = benchSpreadPlagueJS(1, 5000);
+  var gpuMs1 = hasWebGPU ? await benchSpreadPlagueGPU(1, 5000) : -1;
+  addRow('spreadPlague × 1 game', jsMs1, 5000, gpuMs1, 5000);
+
+  // --- Plague spread: 80 games ---
+  setStatus('Benchmarking: spreadPlague (80 games)...');
+  await new Promise(function(r) { setTimeout(r, 50); });
+  var jsMs80 = benchSpreadPlagueJS(80, 500);
+  var gpuMs80 = hasWebGPU ? await benchSpreadPlagueGPU(80, 500) : -1;
+  addRow('spreadPlague × 80 games', jsMs80, 500, gpuMs80, 500);
+
+  // --- Plague spread: 1000 games ---
+  setStatus('Benchmarking: spreadPlague (1000 games)...');
+  await new Promise(function(r) { setTimeout(r, 50); });
+  var jsMs1k = benchSpreadPlagueJS(1000, 50);
+  var gpuMs1k = hasWebGPU ? await benchSpreadPlagueGPU(1000, 50) : -1;
+  addRow('spreadPlague × 1000 games', jsMs1k, 50, gpuMs1k, 50);
+
+  // --- Board flatten: 80 games ---
+  setStatus('Benchmarking: getBoardForNN (80 games flatten)...');
+  await new Promise(function(r) { setTimeout(r, 50); });
+  var jsFl = benchGetBoardJS(80, 5000);
+  addRow('Flatten 80 boards → Float32', jsFl, 5000, -1, 0);
+
+  // --- MatMul: 80×400 × 400×256 (first NN layer) ---
+  setStatus('Benchmarking: matmul 80×400 × 400×256 (NN layer 1)...');
+  await new Promise(function(r) { setTimeout(r, 50); });
+  var jsMM1 = benchMatMulJS(80, 400, 256, 20);
+  var gpuMM1 = hasWebGPU ? await benchMatMulGPU(80, 400, 256, 500) : -1;
+  addRow('MatMul 80×400 × 400×256', jsMM1, 20, gpuMM1, 500);
+
+  // --- MatMul: 80×256 × 256×256 (second NN layer) ---
+  setStatus('Benchmarking: matmul 80×256 × 256×256 (NN layer 2)...');
+  await new Promise(function(r) { setTimeout(r, 50); });
+  var jsMM2 = benchMatMulJS(80, 256, 256, 30);
+  var gpuMM2 = hasWebGPU ? await benchMatMulGPU(80, 256, 256, 500) : -1;
+  addRow('MatMul 80×256 × 256×256', jsMM2, 30, gpuMM2, 500);
+
+  // --- MatMul: 80×256 × 256×400 (policy head) ---
+  setStatus('Benchmarking: matmul 80×256 × 256×400 (policy head)...');
+  await new Promise(function(r) { setTimeout(r, 50); });
+  var jsMM3 = benchMatMulJS(80, 256, 400, 20);
+  var gpuMM3 = hasWebGPU ? await benchMatMulGPU(80, 256, 400, 500) : -1;
+  addRow('MatMul 80×256 × 256×400', jsMM3, 20, gpuMM3, 500);
+
+  // --- Rendering ---
+  setStatus('Benchmarking: rendering (80 boards)...');
+  await new Promise(function(r) { setTimeout(r, 50); });
+  var fillMs = benchFillRect(80, 100);
+  addRenderRow('fillRect (80 × 20×20, 3px cells)', fillMs, 100, 'fill');
+
+  var imgMs = benchImageData(80, 500);
+  addRenderRow('ImageData + putImageData (80 boards)', imgMs, 500, 'img');
+
+  setStatus('Done! ' + (hasWebGPU ? 'WebGPU active ✓' : 'CPU only (no WebGPU in this environment)'));
+  btn.disabled = false;
+  btn.textContent = '↻ Run Again';
+}
+
+detectSystem();
+</script>
+</body>
+</html>

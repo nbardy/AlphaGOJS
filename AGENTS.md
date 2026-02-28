@@ -28,3 +28,13 @@ The app serves at `http://localhost:8080` with HMR enabled.
 - **No lockfile:** Both `yarn.lock` and `package-lock.json` are gitignored.
 - **No tests or linter configured.**
 - **TF.js CPU backend:** The cloud VM lacks WebGL. TF.js falls back to CPU automatically (warning in console is harmless). Game logic is pure JS so it works fine; only the NN model uses TF.js.
+
+### Production build & GitHub Pages
+
+```
+NODE_OPTIONS=--openssl-legacy-provider npx webpack --config webpack.prod.js
+```
+
+Outputs minified bundle to `docs/`. The `gh-pages` branch contains the built static files at root and is configured as the GitHub Pages source. Live at: https://nbardy.github.io/AlphaGOJS/
+
+A GitHub Actions workflow (`.github/workflows/deploy.yml`) is set up to auto-rebuild on push to `master`, but requires Actions to be enabled on the repo.
