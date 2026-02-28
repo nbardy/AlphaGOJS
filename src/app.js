@@ -2,9 +2,9 @@ import { PolicyNetwork } from './model';
 import { SelfPlayTrainer } from './trainer';
 import { UI } from './ui';
 
-var ROWS = 10;
-var COLS = 10;
-var NUM_GAMES = 40;
+var ROWS = 20;
+var COLS = 20;
+var NUM_GAMES = 80;
 
 function start() {
   var model = new PolicyNetwork(ROWS * COLS);
@@ -13,8 +13,11 @@ function start() {
     numGames: NUM_GAMES,
     rows: ROWS,
     cols: COLS,
-    trainBatchSize: 256,
-    trainInterval: 20
+    trainBatchSize: 512,
+    trainInterval: 30,
+    snapshotInterval: 50,
+    evalInterval: 100,
+    evalGames: 20
   });
 
   var ui = new UI(trainer, model);
@@ -22,9 +25,7 @@ function start() {
 }
 
 if (module.hot) {
-  if (window.__alphaPlague) {
-    window.__alphaPlague.destroy();
-  }
+  if (window.__alphaPlague) window.__alphaPlague.destroy();
   module.hot.accept();
 }
 
