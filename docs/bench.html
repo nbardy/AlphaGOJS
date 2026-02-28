@@ -18,83 +18,96 @@ button:disabled { background:#333; color:#666; cursor:default; }
 button.run { background:#008844; }
 button.run:hover:not(:disabled) { background:#00aa55; }
 #status { text-align:center; margin:10px 0; font-size:14px; color:#ffcc00; min-height:20px; }
-table { width:100%; max-width:1200px; margin:10px auto; border-collapse:collapse; font-size:13px; }
-th, td { padding:6px 10px; border:1px solid #2a2a5a; text-align:right; white-space:nowrap; }
+table { width:100%; max-width:1400px; margin:10px auto; border-collapse:collapse; font-size:12px; }
+th, td { padding:5px 8px; border:1px solid #2a2a5a; text-align:right; white-space:nowrap; }
 th { background:#151530; color:#6666aa; text-transform:uppercase; font-size:10px; letter-spacing:1px; }
+th.sub { font-size:9px; color:#556; }
 td:first-child { text-align:left; color:#aac; font-weight:bold; }
 tr.section-header td { background:#1a1a40; color:#4488ff; font-size:12px; text-align:left;
   letter-spacing:1px; text-transform:uppercase; }
 .fastest { color:#00ff88; font-weight:bold; }
 .slowest { color:#ff3366; }
 .na { color:#444; }
-.moe { color:#666; font-size:10px; }
-#results-wrap { max-width:1200px; margin:0 auto; }
+.moe { color:#555; font-size:10px; }
+.kernel-val { color:#88aaff; font-size:11px; }
+#results-wrap { max-width:1400px; margin:0 auto; overflow-x:auto; }
 #progress-bar { width:100%; max-width:600px; margin:10px auto; height:6px; background:#1a1a40;
   border-radius:3px; overflow:hidden; }
 #progress-fill { height:100%; width:0%; background:#00ff88; transition:width 0.3s; }
-#methodology { max-width:800px; margin:20px auto; padding:14px; background:#0e0e24;
-  border:1px solid #2a2a5a; border-radius:6px; font-size:11px; color:#667; line-height:1.5; }
+#methodology { max-width:900px; margin:20px auto; padding:14px; background:#0e0e24;
+  border:1px solid #2a2a5a; border-radius:6px; font-size:11px; color:#667; line-height:1.6; }
 #methodology b { color:#8888bb; }
+#methodology code { color:#88aaff; background:#151530; padding:1px 4px; border-radius:3px; }
 </style>
 </head>
 <body>
 
 <h1>AlphaPlague Benchmarks</h1>
-<div class="subtitle">TF.js backend comparison &mdash; CPU vs WASM vs WebGL vs WebGPU &mdash; across board and batch sizes</div>
+<div class="subtitle">TF.js backend comparison &mdash; CPU vs WASM vs WebGL vs WebGPU</div>
 
 <div id="controls">
-  <button class="run" id="run-btn" onclick="runAll()">Run All Benchmarks</button>
-  <button id="run-cpu" onclick="runSingle('cpu')">CPU Only</button>
-  <button id="run-wasm" onclick="runSingle('wasm')">WASM Only</button>
-  <button id="run-webgl" onclick="runSingle('webgl')">WebGL Only</button>
-  <button id="run-webgpu" onclick="runSingle('webgpu')">WebGPU Only</button>
+  <button class="run" onclick="runAll()">Run All Backends</button>
+  <button onclick="runSingle('cpu')">CPU</button>
+  <button onclick="runSingle('wasm')">WASM</button>
+  <button onclick="runSingle('webgl')">WebGL</button>
+  <button onclick="runSingle('webgpu')">WebGPU</button>
 </div>
 <div id="status"></div>
 <div id="progress-bar"><div id="progress-fill"></div></div>
 <div id="results-wrap"></div>
 
 <div id="methodology">
-  <b>Methodology:</b>
-  JIT warm-up (500 iters) before each measurement.
-  Each benchmark runs multiple sample rounds; we report <b>median</b> with <b>&plusmn; MAD</b> (median absolute deviation).
-  DCE prevention: all function results are accumulated into a global sink and logged after the run.
-  GC mitigation: async yield between every sample round so the browser can collect.
-  TF.js ops use <b>dataSync()</b> to force synchronous GPU/WASM completion before timing stops.
+  <b>Methodology:</b><br>
+  <b>CPU ops</b> (spread, softmax, render): timed with <code>performance.now()</code> after 500-iter
+  JIT warm-up. Auto-calibrated iteration count (min 50ms per round). 15 sample rounds,
+  reporting <b>median &plusmn; MAD</b>. All results flow into a global sink to prevent dead code elimination.<br>
+  <b>GPU ops</b> (forward, train, tick): timed with <code>tf.time()</code> which reports <b>kernel ms</b>
+  (pure GPU/WASM compute) and <b>wall ms</b> (total including JS dispatch + data transfer).
+  Table shows wall time as primary with kernel time annotated. Each iteration wrapped in
+  <code>tf.tidy()</code> to prevent VRAM leaks. Shader warm-up via initial dummy runs with matching tensor shapes.
+  15 async sample rounds with GC yield between each.
 </div>
 
 <script>
-// ═══════════════════════════════════════════════════════
-//  Benchmarking harness — proper statistical measurement
-// ═══════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
+//  Benchmarking harness
+//
+//  Two measurement modes:
+//    measureCPU(fn) — performance.now() for plain JS ops
+//    measureGPU(fn) — tf.time() for TF.js ops, gives kernel + wall
+// ═══════════════════════════════════════════════════════════
 
-// DCE prevention: all benchmark results accumulate here.
-// Logged at the end so V8 cannot prove the work is dead.
+// DCE sink — accumulated and logged at end so V8 can't eliminate work
 var __sink = 0;
-
 function sinkValue(v) {
-  // Accepts number, typed array, or object — extracts a scalar to defeat DCE
-  if (typeof v === 'number') { __sink += v; return; }
-  if (v && v.length !== undefined) { __sink += v[0]; return; }  // typed array
-  if (v && typeof v === 'object') { __sink += 1; return; }      // object
+  if (typeof v === 'number') { __sink += v; }
+  else if (v && v.length !== undefined) { __sink += v[0]; }
+  else if (v) { __sink += 1; }
 }
 
 function sleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
 function status(msg) { document.getElementById('status').textContent = msg; }
 function progress(pct) { document.getElementById('progress-fill').style.width = pct + '%'; }
 
-// ─── Statistical measurement ───
-// Returns { median, mad, samples } in milliseconds per operation.
-// Runs the function in sample rounds, each round measures `opsPerRound` executions.
-// Yields between rounds for GC.
 var WARMUP_ITERS = 500;
-var SAMPLE_ROUNDS = 15;      // number of independent timing samples
-var MIN_ROUND_MS = 50;       // each round runs at least this long
+var SAMPLE_ROUNDS = 15;
+var MIN_ROUND_MS = 50;
 
-async function measure(fn, label) {
-  // Warmup: run enough times for JIT to fully optimize
+function medianMad(arr) {
+  arr.sort(function(a, b) { return a - b; });
+  var med = arr[Math.floor(arr.length / 2)];
+  var devs = arr.map(function(v) { return Math.abs(v - med); });
+  devs.sort(function(a, b) { return a - b; });
+  var mad = devs[Math.floor(devs.length / 2)];
+  return { median: med, mad: mad };
+}
+
+// ─── CPU measurement (plain JS ops) ───
+// Returns { wall: { median, mad } }
+async function measureCPU(fn) {
   for (var i = 0; i < WARMUP_ITERS; i++) fn();
 
-  // Calibrate: figure out how many ops fit in MIN_ROUND_MS
+  // Calibrate ops per round
   var calStart = performance.now();
   var calOps = 0;
   while (performance.now() - calStart < MIN_ROUND_MS) {
@@ -102,28 +115,54 @@ async function measure(fn, label) {
     fn(); fn(); fn(); fn(); fn();
     calOps += 10;
   }
-  var calElapsed = performance.now() - calStart;
-  var opsPerRound = Math.max(10, Math.ceil(calOps * MIN_ROUND_MS / calElapsed));
+  var opsPerRound = Math.max(10, Math.ceil(calOps * MIN_ROUND_MS / (performance.now() - calStart)));
 
-  // Sample rounds
-  var samples = [];
+  var wallSamples = [];
   for (var round = 0; round < SAMPLE_ROUNDS; round++) {
-    // Yield to let GC run between rounds
-    await sleep(1);
+    await sleep(1); // GC yield
     var start = performance.now();
     for (var i = 0; i < opsPerRound; i++) fn();
-    var elapsed = performance.now() - start;
-    samples.push(elapsed / opsPerRound); // ms per op
+    wallSamples.push((performance.now() - start) / opsPerRound);
   }
 
-  // Compute median and MAD (median absolute deviation)
-  samples.sort(function(a, b) { return a - b; });
-  var median = samples[Math.floor(samples.length / 2)];
-  var deviations = samples.map(function(s) { return Math.abs(s - median); });
-  deviations.sort(function(a, b) { return a - b; });
-  var mad = deviations[Math.floor(deviations.length / 2)];
+  return { wall: medianMad(wallSamples), kernel: null };
+}
 
-  return { median: median, mad: mad, samples: samples };
+// ─── GPU measurement (TF.js ops) ───
+// Uses tf.time() to get kernelMs (actual GPU compute) + wallMs (total round-trip).
+// Each iteration wrapped in tf.tidy() to prevent VRAM leaks.
+// Returns { wall: { median, mad }, kernel: { median, mad } }
+async function measureGPU(fn) {
+  // Shader warm-up: run with matching shapes so shaders compile before timing
+  for (var i = 0; i < 5; i++) {
+    await tf.time(function() { tf.tidy(fn); });
+  }
+
+  // Calibrate: how many ops per round to fill MIN_ROUND_MS
+  var calStart = performance.now();
+  var calOps = 0;
+  while (performance.now() - calStart < MIN_ROUND_MS) {
+    tf.tidy(fn);
+    calOps++;
+  }
+  var opsPerRound = Math.max(3, Math.ceil(calOps * MIN_ROUND_MS / (performance.now() - calStart)));
+
+  var wallSamples = [];
+  var kernelSamples = [];
+  for (var round = 0; round < SAMPLE_ROUNDS; round++) {
+    await sleep(2); // GC + GPU queue drain
+    var roundWall = 0;
+    var roundKernel = 0;
+    for (var i = 0; i < opsPerRound; i++) {
+      var timing = await tf.time(function() { tf.tidy(fn); });
+      roundWall += timing.wallMs;
+      roundKernel += timing.kernelMs;
+    }
+    wallSamples.push(roundWall / opsPerRound);
+    kernelSamples.push(roundKernel / opsPerRound);
+  }
+
+  return { wall: medianMad(wallSamples), kernel: medianMad(kernelSamples) };
 }
 
 // ─── Board configs and batch sizes ───
@@ -133,7 +172,6 @@ var BOARD_CONFIGS = [
   { rows: 19, cols: 19, label: '19x19' },
 ];
 var BATCH_SIZES = [1, 10, 40, 100];
-
 var results = {};
 var running = false;
 
@@ -141,7 +179,6 @@ var running = false;
 //  Functions under test
 // ═══════════════════════════════════
 
-// ─── Plague Spread (plain JS) ───
 function spreadPlague(board, rows, cols) {
   var newBoard = Int8Array.from(board);
   for (var r = 0; r < rows; r++) {
@@ -159,7 +196,6 @@ function spreadPlague(board, rows, cols) {
   return newBoard;
 }
 
-// ─── Masked Softmax (plain JS) ───
 function maskedSoftmax(logits, mask) {
   var n = logits.length;
   var probs = new Float32Array(n);
@@ -170,16 +206,12 @@ function maskedSoftmax(logits, mask) {
   if (maxVal === -Infinity) return probs;
   var sum = 0;
   for (var i = 0; i < n; i++) {
-    if (mask[i] > 0) {
-      probs[i] = Math.exp(logits[i] - maxVal);
-      sum += probs[i];
-    }
+    if (mask[i] > 0) { probs[i] = Math.exp(logits[i] - maxVal); sum += probs[i]; }
   }
   if (sum > 1e-8) for (var i = 0; i < n; i++) probs[i] /= sum;
   return probs;
 }
 
-// ─── Canvas Render ───
 function renderBoard(canvas, board, rows, cols, cs) {
   var ctx = canvas.getContext('2d');
   ctx.fillStyle = '#0d0d22';
@@ -187,15 +219,12 @@ function renderBoard(canvas, board, rows, cols, cs) {
   for (var r = 0; r < rows; r++) {
     for (var c = 0; c < cols; c++) {
       var val = board[r * cols + c];
-      if (val === 1) ctx.fillStyle = '#00ff88';
-      else if (val === -1) ctx.fillStyle = '#ff3366';
-      else ctx.fillStyle = '#1e1e3a';
+      ctx.fillStyle = val === 1 ? '#00ff88' : val === -1 ? '#ff3366' : '#1e1e3a';
       ctx.fillRect(c * cs, r * cs, cs - 1, cs - 1);
     }
   }
 }
 
-// ─── Helpers ───
 function randomBoard(size) {
   var board = new Int8Array(size);
   for (var i = 0; i < size; i++) {
@@ -205,7 +234,6 @@ function randomBoard(size) {
   return board;
 }
 
-// ─── NN Model builders ───
 function buildDenseModel(boardSize) {
   var input = tf.input({ shape: [boardSize] });
   var x = tf.layers.dense({ units: 256, activation: 'relu' }).apply(input);
@@ -228,8 +256,7 @@ function buildSpatialModel(rows, cols) {
     x = tf.layers.activation({ activation: 'relu' }).apply(added);
   }
   var pConv = tf.layers.conv2d({ filters: 2, kernelSize: 1, padding: 'same', activation: 'relu' }).apply(x);
-  var pFlat = tf.layers.flatten().apply(pConv);
-  var pol = tf.layers.dense({ units: boardSize }).apply(pFlat);
+  var pol = tf.layers.dense({ units: boardSize }).apply(tf.layers.flatten().apply(pConv));
   var vConv = tf.layers.conv2d({ filters: 1, kernelSize: 1, padding: 'same', activation: 'relu' }).apply(x);
   var vFlat = tf.layers.flatten().apply(vConv);
   var vDense = tf.layers.dense({ units: 64, activation: 'relu' }).apply(vFlat);
@@ -238,16 +265,17 @@ function buildSpatialModel(rows, cols) {
   return tf.model({ inputs: input, outputs: combined });
 }
 
-// ═══════════════════════════════════════
-//  Benchmark wrappers (with DCE sinks)
-// ═══════════════════════════════════════
+// ═══════════════════════════════════════════════════
+//  Benchmark wrappers
+//  CPU ops: measureCPU + sinkValue for DCE
+//  GPU ops: measureGPU + tf.tidy inside each iter
+// ═══════════════════════════════════════════════════
 
 function benchSpread(rows, cols) {
-  var size = rows * cols;
-  var board = randomBoard(size);
-  return measure(function() {
+  var board = randomBoard(rows * cols);
+  return measureCPU(function() {
     board = spreadPlague(board, rows, cols);
-    sinkValue(board);  // DCE: force V8 to keep the result
+    sinkValue(board);
   });
 }
 
@@ -258,35 +286,32 @@ function benchSoftmax(boardSize) {
     logits[i] = Math.random() * 2 - 1;
     mask[i] = Math.random() > 0.3 ? 1 : 0;
   }
-  return measure(function() {
-    var probs = maskedSoftmax(logits, mask);
-    sinkValue(probs);  // DCE: use the result
+  return measureCPU(function() {
+    sinkValue(maskedSoftmax(logits, mask));
   });
 }
 
 function benchRender(rows, cols) {
-  var size = rows * cols;
   var cs = Math.max(2, Math.floor(200 / Math.max(rows, cols)));
   var canvas = document.createElement('canvas');
-  canvas.width = cols * cs;
-  canvas.height = rows * cs;
-  var board = randomBoard(size);
-  return measure(function() {
+  canvas.width = cols * cs; canvas.height = rows * cs;
+  var board = randomBoard(rows * cols);
+  return measureCPU(function() {
     renderBoard(canvas, board, rows, cols, cs);
-    sinkValue(1);  // DCE: canvas side-effects are real but be safe
   });
 }
 
 function benchForward(model, boardSize, batchSize) {
-  // Pre-allocate input to isolate model.predict timing from tensor creation
+  // Pre-allocate input data so we only measure model.predict
   var inputData = new Float32Array(batchSize * boardSize);
   for (var i = 0; i < inputData.length; i++) inputData[i] = Math.random() * 2 - 1;
 
-  return measure(function() {
+  return measureGPU(function() {
+    // tf.tidy handles intermediates inside predict.
+    // We create input + read output here because that's what the real app does.
     var input = tf.tensor2d(inputData, [batchSize, boardSize]);
     var out = model.predict(input);
-    var data = out.dataSync();  // force sync completion + DCE prevention
-    sinkValue(data);
+    sinkValue(out.dataSync()); // force GPU sync + DCE prevention
     out.dispose();
     input.dispose();
   });
@@ -294,7 +319,7 @@ function benchForward(model, boardSize, batchSize) {
 
 function benchTrain(model, boardSize, batchSize) {
   var optimizer = tf.train.adam(0.001);
-  var result = measure(function() {
+  var result = measureGPU(function() {
     var states = tf.randomNormal([batchSize, boardSize]);
     var actionMask = tf.zeros([batchSize, boardSize]);
     var rewards = tf.randomNormal([batchSize]);
@@ -308,13 +333,8 @@ function benchTrain(model, boardSize, batchSize) {
       var entropy = preds.add(tf.scalar(1e-8)).log().mul(preds).sum(1).mean().neg();
       return policyLoss.sub(entropy.mul(tf.scalar(0.01)));
     }, true);
-    if (loss) {
-      sinkValue(loss.dataSync()[0]);  // DCE: use loss value
-      loss.dispose();
-    }
-    states.dispose();
-    actionMask.dispose();
-    rewards.dispose();
+    if (loss) { sinkValue(loss.dataSync()[0]); loss.dispose(); }
+    states.dispose(); actionMask.dispose(); rewards.dispose();
   });
   optimizer.dispose();
   return result;
@@ -325,32 +345,26 @@ function benchFullTick(model, rows, cols, numGames) {
   var boards = [];
   for (var g = 0; g < numGames; g++) boards.push(randomBoard(size));
 
-  return measure(function() {
-    // Spread plague (JS)
+  // Full tick is mixed JS + GPU — use measureGPU so we get kernel vs wall breakdown
+  return measureGPU(function() {
     for (var g = 0; g < numGames; g++) boards[g] = spreadPlague(boards[g], rows, cols);
-    // Batched inference (TF.js)
     var flat = new Float32Array(numGames * size);
-    for (var g = 0; g < numGames; g++) {
+    for (var g = 0; g < numGames; g++)
       for (var i = 0; i < size; i++) flat[g * size + i] = boards[g][i];
-    }
     var input = tf.tensor2d(flat, [numGames, size]);
     var out = model.predict(input);
-    var data = out.dataSync();  // force completion + DCE
-    sinkValue(data);
-    out.dispose();
-    input.dispose();
-    // Spread again
+    sinkValue(out.dataSync());
+    out.dispose(); input.dispose();
     for (var g = 0; g < numGames; g++) boards[g] = spreadPlague(boards[g], rows, cols);
   });
 }
 
 // ═══════════════════════════════════
-//  Backend + orchestration
+//  Backend orchestration
 // ═══════════════════════════════════
 
 async function setBackend(name) {
-  if (name === 'webgpu' && !navigator.gpu)
-    throw new Error('WebGPU not available');
+  if (name === 'webgpu' && !navigator.gpu) throw new Error('WebGPU not available');
   await tf.setBackend(name);
   await tf.ready();
 }
@@ -373,7 +387,7 @@ async function benchmarkBackend(backend, onProgress) {
     var size = bc.rows * bc.cols;
     var key = bc.label;
 
-    // Game logic (plain JS — backend-independent, only measure once)
+    // CPU-only benchmarks (backend-independent, measure once)
     if (backend === 'cpu' || !results['cpu']) {
       status(backend + ' | ' + key + ' | plague spread...');
       await sleep(10);
@@ -396,7 +410,7 @@ async function benchmarkBackend(backend, onProgress) {
       step += 3; onProgress(step, totalSteps);
     }
 
-    // Dense model benchmarks
+    // Dense model
     status(backend + ' | ' + key + ' | building dense model...');
     await sleep(10);
     var denseModel = buildDenseModel(size);
@@ -419,7 +433,6 @@ async function benchmarkBackend(backend, onProgress) {
     r['dense_train_' + key + '_b256'] = await benchTrain(denseModel, size, 256);
     step++; onProgress(step, totalSteps);
 
-    // Full tick
     status(backend + ' | ' + key + ' | full tick (40 games)...');
     await sleep(10);
     r['tick_' + key] = await benchFullTick(denseModel, bc.rows, bc.cols, 40);
@@ -427,7 +440,7 @@ async function benchmarkBackend(backend, onProgress) {
 
     denseModel.dispose();
 
-    // Spatial model (skip 5x5 — too small for conv)
+    // Spatial model (skip 5x5)
     if (size >= 100) {
       status(backend + ' | ' + key + ' | building spatial model...');
       await sleep(10);
@@ -454,28 +467,17 @@ async function benchmarkBackend(backend, onProgress) {
 }
 
 // ═══════════════════════════════════
-//  Results table rendering
+//  Results table
 // ═══════════════════════════════════
 
-function fmtResult(stat) {
-  if (!stat) return '<span class="na">&mdash;</span>';
-  var ms = stat.median;
-  var mad = stat.mad;
-  var valStr, madStr;
-  if (ms < 0.01) {
-    valStr = (ms * 1000).toFixed(1) + ' &mu;s';
-    madStr = '&plusmn;' + (mad * 1000).toFixed(1);
-  } else if (ms < 1) {
-    valStr = ms.toFixed(3) + ' ms';
-    madStr = '&plusmn;' + mad.toFixed(3);
-  } else if (ms < 100) {
-    valStr = ms.toFixed(2) + ' ms';
-    madStr = '&plusmn;' + mad.toFixed(2);
-  } else {
-    valStr = ms.toFixed(0) + ' ms';
-    madStr = '&plusmn;' + mad.toFixed(0);
-  }
-  return valStr + ' <span class="moe">' + madStr + '</span>';
+function fmtMs(ms, mad) {
+  if (ms == null) return '<span class="na">&mdash;</span>';
+  var v, m;
+  if (ms < 0.01) { v = (ms*1000).toFixed(1) + '&mu;s'; m = (mad*1000).toFixed(1); }
+  else if (ms < 1) { v = ms.toFixed(3) + 'ms'; m = mad.toFixed(3); }
+  else if (ms < 100) { v = ms.toFixed(2) + 'ms'; m = mad.toFixed(2); }
+  else { v = ms.toFixed(0) + 'ms'; m = mad.toFixed(0); }
+  return v + ' <span class="moe">&plusmn;' + m + '</span>';
 }
 
 function renderResults() {
@@ -483,30 +485,47 @@ function renderResults() {
   var backends = Object.keys(results);
   if (backends.length === 0) { wrap.innerHTML = ''; return; }
 
+  // Each backend gets 2 sub-columns: wall | kernel
+  var html = '<table><thead>';
+  html += '<tr><th rowspan="2">Benchmark</th>';
+  backends.forEach(function(b) {
+    html += '<th colspan="2">' + b.toUpperCase() + '</th>';
+  });
+  html += '</tr><tr>';
+  backends.forEach(function() {
+    html += '<th class="sub">wall</th><th class="sub">kernel</th>';
+  });
+  html += '</tr></thead><tbody>';
+
+  var totalCols = 1 + backends.length * 2;
+
+  function sectionRow(label) {
+    return '<tr class="section-header"><td colspan="' + totalCols + '">' + label + '</td></tr>';
+  }
+
   function row(label, keyFn) {
     var stats = backends.map(function(b) { return results[b] ? keyFn(results[b]) : null; });
-    var medians = stats.map(function(s) { return s ? s.median : Infinity; });
-    var min = Math.min.apply(null, medians);
+    // Find fastest wall time for highlighting
+    var wallMedians = stats.map(function(s) { return s && s.wall ? s.wall.median : Infinity; });
+    var minWall = Math.min.apply(null, wallMedians);
+
     var s = '<tr><td>' + label + '</td>';
     for (var i = 0; i < stats.length; i++) {
-      var cls = '';
-      if (stats[i] && backends.length > 1) {
-        if (medians[i] === min) cls = 'fastest';
-        else if (medians[i] > min * 3) cls = 'slowest';
+      var st = stats[i];
+      var wallCls = '';
+      if (st && st.wall && backends.length > 1) {
+        if (wallMedians[i] === minWall) wallCls = 'fastest';
+        else if (wallMedians[i] > minWall * 3) wallCls = 'slowest';
       }
-      s += '<td class="' + cls + '">' + fmtResult(stats[i]) + '</td>';
+      // Wall column
+      var wallHtml = (st && st.wall) ? fmtMs(st.wall.median, st.wall.mad) : '<span class="na">&mdash;</span>';
+      s += '<td class="' + wallCls + '">' + wallHtml + '</td>';
+      // Kernel column
+      var kernelHtml = (st && st.kernel) ? '<span class="kernel-val">' + fmtMs(st.kernel.median, st.kernel.mad) + '</span>' : '<span class="na">&mdash;</span>';
+      s += '<td>' + kernelHtml + '</td>';
     }
     return s + '</tr>';
   }
-
-  var cols = backends.length + 1;
-  function sectionRow(label) {
-    return '<tr class="section-header"><td colspan="' + cols + '">' + label + '</td></tr>';
-  }
-
-  var html = '<table><thead><tr><th>Benchmark</th>';
-  backends.forEach(function(b) { html += '<th>' + b.toUpperCase() + '</th>'; });
-  html += '</tr></thead><tbody>';
 
   BOARD_CONFIGS.forEach(function(bc) {
     var key = bc.label;
@@ -514,26 +533,22 @@ function renderResults() {
 
     html += sectionRow('Board: ' + key + ' (' + size + ' cells)');
 
-    // Game logic
-    html += row('Plague spread', function(r) { return r['spread_' + key]; });
-    html += row('Masked softmax', function(r) { return r['softmax_' + key]; });
+    html += row('Plague spread (JS)', function(r) { return r['spread_' + key]; });
+    html += row('Masked softmax (JS)', function(r) { return r['softmax_' + key]; });
     html += row('Canvas render', function(r) { return r['render_' + key]; });
 
-    // Dense forward
     BATCH_SIZES.forEach(function(bs) {
-      html += row('Dense forward (batch=' + bs + ')', function(r) { return r['dense_fwd_' + key + '_b' + bs]; });
+      html += row('Dense forward (b=' + bs + ')', function(r) { return r['dense_fwd_' + key + '_b' + bs]; });
     });
-
-    html += row('Dense train (batch=64)', function(r) { return r['dense_train_' + key + '_b64']; });
-    html += row('Dense train (batch=256)', function(r) { return r['dense_train_' + key + '_b256']; });
+    html += row('Dense train (b=64)', function(r) { return r['dense_train_' + key + '_b64']; });
+    html += row('Dense train (b=256)', function(r) { return r['dense_train_' + key + '_b256']; });
     html += row('Full tick (40 games)', function(r) { return r['tick_' + key]; });
 
-    // Spatial
     if (size >= 100) {
       BATCH_SIZES.forEach(function(bs) {
-        html += row('Spatial forward (batch=' + bs + ')', function(r) { return r['spatial_fwd_' + key + '_b' + bs]; });
+        html += row('Spatial forward (b=' + bs + ')', function(r) { return r['spatial_fwd_' + key + '_b' + bs]; });
       });
-      html += row('Spatial train (batch=64)', function(r) { return r['spatial_train_' + key + '_b64']; });
+      html += row('Spatial train (b=64)', function(r) { return r['spatial_train_' + key + '_b64']; });
     }
   });
 
@@ -545,53 +560,37 @@ function renderResults() {
 //  Entry points
 // ═══════════════════════════════════
 
-function disableButtons(disabled) {
+function disableButtons(d) {
   var btns = document.querySelectorAll('button');
-  for (var i = 0; i < btns.length; i++) btns[i].disabled = disabled;
+  for (var i = 0; i < btns.length; i++) btns[i].disabled = d;
 }
 
 async function runSingle(backend) {
   if (running) return;
-  running = true;
-  disableButtons(true);
-  __sink = 0;
-  progress(0);
-
-  var r = await benchmarkBackend(backend, function(step, total) {
-    progress(Math.round(step / total * 100));
-  });
+  running = true; disableButtons(true); __sink = 0; progress(0);
+  var r = await benchmarkBackend(backend, function(s,t) { progress(Math.round(s/t*100)); });
   if (r) { results[backend] = r; renderResults(); }
-
-  console.log('DCE sink:', __sink);  // prevent DCE across entire run
+  console.log('DCE sink:', __sink);
   status('Done (' + backend + ')');
-  progress(100);
-  running = false;
-  disableButtons(false);
+  progress(100); running = false; disableButtons(false);
 }
 
 async function runAll() {
   if (running) return;
-  running = true;
-  disableButtons(true);
-  results = {};
-  __sink = 0;
-  progress(0);
+  running = true; disableButtons(true); results = {}; __sink = 0; progress(0);
 
-  // Detect available backends
   var backends = ['cpu'];
   try { await setBackend('wasm'); backends.push('wasm'); await setBackend('cpu'); } catch(e) {}
   try { await setBackend('webgl'); backends.push('webgl'); await setBackend('cpu'); } catch(e) {}
   if (navigator.gpu) {
     try { await setBackend('webgpu'); backends.push('webgpu'); await setBackend('cpu'); } catch(e) {}
   }
-  status('Backends found: ' + backends.join(', '));
+  status('Backends: ' + backends.join(', '));
   await sleep(500);
 
-  var totalBackends = backends.length;
   for (var i = 0; i < backends.length; i++) {
-    var r = await benchmarkBackend(backends[i], function(step, total) {
-      var overall = (i / totalBackends + step / total / totalBackends) * 100;
-      progress(Math.round(overall));
+    var r = await benchmarkBackend(backends[i], function(s,t) {
+      progress(Math.round((i/backends.length + s/t/backends.length)*100));
     });
     if (r) { results[backends[i]] = r; renderResults(); }
     await sleep(200);
@@ -599,9 +598,7 @@ async function runAll() {
 
   console.log('DCE sink:', __sink);
   status('All benchmarks complete.');
-  progress(100);
-  running = false;
-  disableButtons(false);
+  progress(100); running = false; disableButtons(false);
 }
 </script>
 </body>
