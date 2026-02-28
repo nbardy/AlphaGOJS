@@ -1,8 +1,12 @@
 import { Game } from './game';
 
+// SelfPlayTrainer orchestrates parallel self-play games.
+// It is algorithm-agnostic: it calls algo.selectActions() and algo.onGameFinished().
+// History stores full ActionResult metadata via Object.assign (no branching on algo type).
+
 export class SelfPlayTrainer {
-  constructor(model, config) {
-    this.model = model;
+  constructor(algo, config) {
+    this.algo = algo;
     this.numGames = config.numGames || 40;
     this.rows = config.rows || 10;
     this.cols = config.cols || 10;
@@ -11,8 +15,6 @@ export class SelfPlayTrainer {
     this.trainInterval = config.trainInterval || 20;
 
     this.games = [];
-    this.experienceBuffer = [];
-    this.maxBufferSize = 10000;
     this.gamesCompleted = 0;
     this.gamesSinceLastTrain = 0;
     this.generation = 0;
@@ -54,11 +56,14 @@ export class SelfPlayTrainer {
       idx1.push(i);
     }
     if (idx1.length > 0) {
-      var acts1 = this.model.getActions(s1, m1);
+      var results1 = this.algo.selectActions(s1, m1);
       for (j = 0; j < idx1.length; j++) {
         gi = idx1[j];
-        this.games[gi].game.makeMove(1, acts1[j]);
-        this.games[gi].history.push({ state: s1[j], action: acts1[j], player: 1 });
+        this.games[gi].game.makeMove(1, results1[j].action);
+        // Store state + player + all algo metadata (logProb, value for PPO, etc.)
+        var entry = { state: s1[j], player: 1 };
+        Object.assign(entry, results1[j]);
+        this.games[gi].history.push(entry);
       }
     }
 
@@ -75,11 +80,13 @@ export class SelfPlayTrainer {
       idx2.push(i);
     }
     if (idx2.length > 0) {
-      var acts2 = this.model.getActions(s2, m2);
+      var results2 = this.algo.selectActions(s2, m2);
       for (j = 0; j < idx2.length; j++) {
         gi = idx2[j];
-        this.games[gi].game.makeMove(-1, acts2[j]);
-        this.games[gi].history.push({ state: s2[j], action: acts2[j], player: -1 });
+        this.games[gi].game.makeMove(-1, results2[j].action);
+        var entry2 = { state: s2[j], player: -1 };
+        Object.assign(entry2, results2[j]);
+        this.games[gi].history.push(entry2);
       }
     }
 
@@ -103,15 +110,8 @@ export class SelfPlayTrainer {
     gs.doneTime = Date.now();
     gs.winner = gs.game.getWinner();
 
-    for (var k = 0; k < gs.history.length; k++) {
-      var exp = gs.history[k];
-      var reward = (exp.player === gs.winner) ? 1 : (gs.winner === 0 ? 0 : -1);
-      this.experienceBuffer.push({ state: exp.state, action: exp.action, reward: reward });
-    }
-
-    if (this.experienceBuffer.length > this.maxBufferSize) {
-      this.experienceBuffer = this.experienceBuffer.slice(-this.maxBufferSize);
-    }
+    // Delegate experience processing to the algorithm
+    this.algo.onGameFinished(gs.history, gs.winner);
 
     this.gamesCompleted++;
     this.gamesSinceLastTrain++;
@@ -124,9 +124,8 @@ export class SelfPlayTrainer {
   }
 
   _maybeTrainAndRestart() {
-    if (this.gamesSinceLastTrain >= this.trainInterval && this.experienceBuffer.length >= this.trainBatchSize) {
-      var batch = this.experienceBuffer.splice(0, this.trainBatchSize);
-      this.lastLoss = this.model.train(batch);
+    if (this.algo.shouldTrain(this.gamesSinceLastTrain, this.trainInterval, this.trainBatchSize)) {
+      this.lastLoss = this.algo.train(this.trainBatchSize);
       this.generation++;
       this.gamesSinceLastTrain = 0;
     }
@@ -154,7 +153,7 @@ export class SelfPlayTrainer {
       p2Wins: this.p2Wins,
       draws: this.draws,
       avgGameLength: avgLen,
-      bufferSize: this.experienceBuffer.length
+      bufferSize: this.algo.getBufferSize()
     };
   }
 }

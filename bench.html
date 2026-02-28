@@ -1,0 +1,608 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>AlphaPlague Benchmarks</title>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.22.0/dist/tf-backend-wasm.min.js"></script>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#0a0a1a; color:#c0c0e0; font-family:'Courier New',monospace; padding:20px; }
+h1 { color:#00ff88; text-align:center; margin-bottom:4px; }
+.subtitle { text-align:center; color:#556; font-size:12px; margin-bottom:20px; }
+#controls { display:flex; justify-content:center; gap:10px; margin-bottom:20px; flex-wrap:wrap; }
+button { background:#2244aa; color:#fff; border:none; padding:10px 20px; border-radius:6px;
+  cursor:pointer; font-family:inherit; font-size:14px; }
+button:hover { background:#3355cc; }
+button:disabled { background:#333; color:#666; cursor:default; }
+button.run { background:#008844; }
+button.run:hover:not(:disabled) { background:#00aa55; }
+#status { text-align:center; margin:10px 0; font-size:14px; color:#ffcc00; min-height:20px; }
+table { width:100%; max-width:1200px; margin:10px auto; border-collapse:collapse; font-size:13px; }
+th, td { padding:6px 10px; border:1px solid #2a2a5a; text-align:right; white-space:nowrap; }
+th { background:#151530; color:#6666aa; text-transform:uppercase; font-size:10px; letter-spacing:1px; }
+td:first-child { text-align:left; color:#aac; font-weight:bold; }
+tr.section-header td { background:#1a1a40; color:#4488ff; font-size:12px; text-align:left;
+  letter-spacing:1px; text-transform:uppercase; }
+.fastest { color:#00ff88; font-weight:bold; }
+.slowest { color:#ff3366; }
+.na { color:#444; }
+.moe { color:#666; font-size:10px; }
+#results-wrap { max-width:1200px; margin:0 auto; }
+#progress-bar { width:100%; max-width:600px; margin:10px auto; height:6px; background:#1a1a40;
+  border-radius:3px; overflow:hidden; }
+#progress-fill { height:100%; width:0%; background:#00ff88; transition:width 0.3s; }
+#methodology { max-width:800px; margin:20px auto; padding:14px; background:#0e0e24;
+  border:1px solid #2a2a5a; border-radius:6px; font-size:11px; color:#667; line-height:1.5; }
+#methodology b { color:#8888bb; }
+</style>
+</head>
+<body>
+
+<h1>AlphaPlague Benchmarks</h1>
+<div class="subtitle">TF.js backend comparison &mdash; CPU vs WASM vs WebGL vs WebGPU &mdash; across board and batch sizes</div>
+
+<div id="controls">
+  <button class="run" id="run-btn" onclick="runAll()">Run All Benchmarks</button>
+  <button id="run-cpu" onclick="runSingle('cpu')">CPU Only</button>
+  <button id="run-wasm" onclick="runSingle('wasm')">WASM Only</button>
+  <button id="run-webgl" onclick="runSingle('webgl')">WebGL Only</button>
+  <button id="run-webgpu" onclick="runSingle('webgpu')">WebGPU Only</button>
+</div>
+<div id="status"></div>
+<div id="progress-bar"><div id="progress-fill"></div></div>
+<div id="results-wrap"></div>
+
+<div id="methodology">
+  <b>Methodology:</b>
+  JIT warm-up (500 iters) before each measurement.
+  Each benchmark runs multiple sample rounds; we report <b>median</b> with <b>&plusmn; MAD</b> (median absolute deviation).
+  DCE prevention: all function results are accumulated into a global sink and logged after the run.
+  GC mitigation: async yield between every sample round so the browser can collect.
+  TF.js ops use <b>dataSync()</b> to force synchronous GPU/WASM completion before timing stops.
+</div>
+
+<script>
+// ═══════════════════════════════════════════════════════
+//  Benchmarking harness — proper statistical measurement
+// ═══════════════════════════════════════════════════════
+
+// DCE prevention: all benchmark results accumulate here.
+// Logged at the end so V8 cannot prove the work is dead.
+var __sink = 0;
+
+function sinkValue(v) {
+  // Accepts number, typed array, or object — extracts a scalar to defeat DCE
+  if (typeof v === 'number') { __sink += v; return; }
+  if (v && v.length !== undefined) { __sink += v[0]; return; }  // typed array
+  if (v && typeof v === 'object') { __sink += 1; return; }      // object
+}
+
+function sleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+function status(msg) { document.getElementById('status').textContent = msg; }
+function progress(pct) { document.getElementById('progress-fill').style.width = pct + '%'; }
+
+// ─── Statistical measurement ───
+// Returns { median, mad, samples } in milliseconds per operation.
+// Runs the function in sample rounds, each round measures `opsPerRound` executions.
+// Yields between rounds for GC.
+var WARMUP_ITERS = 500;
+var SAMPLE_ROUNDS = 15;      // number of independent timing samples
+var MIN_ROUND_MS = 50;       // each round runs at least this long
+
+async function measure(fn, label) {
+  // Warmup: run enough times for JIT to fully optimize
+  for (var i = 0; i < WARMUP_ITERS; i++) fn();
+
+  // Calibrate: figure out how many ops fit in MIN_ROUND_MS
+  var calStart = performance.now();
+  var calOps = 0;
+  while (performance.now() - calStart < MIN_ROUND_MS) {
+    fn(); fn(); fn(); fn(); fn();
+    fn(); fn(); fn(); fn(); fn();
+    calOps += 10;
+  }
+  var calElapsed = performance.now() - calStart;
+  var opsPerRound = Math.max(10, Math.ceil(calOps * MIN_ROUND_MS / calElapsed));
+
+  // Sample rounds
+  var samples = [];
+  for (var round = 0; round < SAMPLE_ROUNDS; round++) {
+    // Yield to let GC run between rounds
+    await sleep(1);
+    var start = performance.now();
+    for (var i = 0; i < opsPerRound; i++) fn();
+    var elapsed = performance.now() - start;
+    samples.push(elapsed / opsPerRound); // ms per op
+  }
+
+  // Compute median and MAD (median absolute deviation)
+  samples.sort(function(a, b) { return a - b; });
+  var median = samples[Math.floor(samples.length / 2)];
+  var deviations = samples.map(function(s) { return Math.abs(s - median); });
+  deviations.sort(function(a, b) { return a - b; });
+  var mad = deviations[Math.floor(deviations.length / 2)];
+
+  return { median: median, mad: mad, samples: samples };
+}
+
+// ─── Board configs and batch sizes ───
+var BOARD_CONFIGS = [
+  { rows: 5, cols: 5, label: '5x5' },
+  { rows: 10, cols: 10, label: '10x10' },
+  { rows: 19, cols: 19, label: '19x19' },
+];
+var BATCH_SIZES = [1, 10, 40, 100];
+
+var results = {};
+var running = false;
+
+// ═══════════════════════════════════
+//  Functions under test
+// ═══════════════════════════════════
+
+// ─── Plague Spread (plain JS) ───
+function spreadPlague(board, rows, cols) {
+  var newBoard = Int8Array.from(board);
+  for (var r = 0; r < rows; r++) {
+    for (var c = 0; c < cols; c++) {
+      var i = r * cols + c;
+      if (board[i] !== 0) continue;
+      var sum = 0;
+      if (r > 0) sum += board[(r - 1) * cols + c] * Math.random();
+      if (r < rows - 1) sum += board[(r + 1) * cols + c] * Math.random();
+      if (c > 0) sum += board[r * cols + (c - 1)] * Math.random();
+      if (c < cols - 1) sum += board[r * cols + (c + 1)] * Math.random();
+      newBoard[i] = Math.max(-1, Math.min(1, Math.trunc(sum * 2)));
+    }
+  }
+  return newBoard;
+}
+
+// ─── Masked Softmax (plain JS) ───
+function maskedSoftmax(logits, mask) {
+  var n = logits.length;
+  var probs = new Float32Array(n);
+  var maxVal = -Infinity;
+  for (var i = 0; i < n; i++) {
+    if (mask[i] > 0 && logits[i] > maxVal) maxVal = logits[i];
+  }
+  if (maxVal === -Infinity) return probs;
+  var sum = 0;
+  for (var i = 0; i < n; i++) {
+    if (mask[i] > 0) {
+      probs[i] = Math.exp(logits[i] - maxVal);
+      sum += probs[i];
+    }
+  }
+  if (sum > 1e-8) for (var i = 0; i < n; i++) probs[i] /= sum;
+  return probs;
+}
+
+// ─── Canvas Render ───
+function renderBoard(canvas, board, rows, cols, cs) {
+  var ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#0d0d22';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  for (var r = 0; r < rows; r++) {
+    for (var c = 0; c < cols; c++) {
+      var val = board[r * cols + c];
+      if (val === 1) ctx.fillStyle = '#00ff88';
+      else if (val === -1) ctx.fillStyle = '#ff3366';
+      else ctx.fillStyle = '#1e1e3a';
+      ctx.fillRect(c * cs, r * cs, cs - 1, cs - 1);
+    }
+  }
+}
+
+// ─── Helpers ───
+function randomBoard(size) {
+  var board = new Int8Array(size);
+  for (var i = 0; i < size; i++) {
+    var r = Math.random();
+    board[i] = r < 0.33 ? 1 : r < 0.66 ? -1 : 0;
+  }
+  return board;
+}
+
+// ─── NN Model builders ───
+function buildDenseModel(boardSize) {
+  var input = tf.input({ shape: [boardSize] });
+  var x = tf.layers.dense({ units: 256, activation: 'relu' }).apply(input);
+  x = tf.layers.dense({ units: 128, activation: 'relu' }).apply(x);
+  var policy = tf.layers.dense({ units: boardSize }).apply(x);
+  var value = tf.layers.dense({ units: 1, activation: 'tanh' }).apply(x);
+  var combined = tf.layers.concatenate().apply([policy, value]);
+  return tf.model({ inputs: input, outputs: combined });
+}
+
+function buildSpatialModel(rows, cols) {
+  var boardSize = rows * cols;
+  var input = tf.input({ shape: [boardSize] });
+  var reshaped = tf.layers.reshape({ targetShape: [rows, cols, 1] }).apply(input);
+  var x = tf.layers.conv2d({ filters: 32, kernelSize: 3, padding: 'same', activation: 'relu' }).apply(reshaped);
+  for (var b = 0; b < 3; b++) {
+    var c1 = tf.layers.conv2d({ filters: 32, kernelSize: 3, padding: 'same', activation: 'relu' }).apply(x);
+    var c2 = tf.layers.conv2d({ filters: 32, kernelSize: 3, padding: 'same' }).apply(c1);
+    var added = tf.layers.add().apply([x, c2]);
+    x = tf.layers.activation({ activation: 'relu' }).apply(added);
+  }
+  var pConv = tf.layers.conv2d({ filters: 2, kernelSize: 1, padding: 'same', activation: 'relu' }).apply(x);
+  var pFlat = tf.layers.flatten().apply(pConv);
+  var pol = tf.layers.dense({ units: boardSize }).apply(pFlat);
+  var vConv = tf.layers.conv2d({ filters: 1, kernelSize: 1, padding: 'same', activation: 'relu' }).apply(x);
+  var vFlat = tf.layers.flatten().apply(vConv);
+  var vDense = tf.layers.dense({ units: 64, activation: 'relu' }).apply(vFlat);
+  var val = tf.layers.dense({ units: 1, activation: 'tanh' }).apply(vDense);
+  var combined = tf.layers.concatenate().apply([pol, val]);
+  return tf.model({ inputs: input, outputs: combined });
+}
+
+// ═══════════════════════════════════════
+//  Benchmark wrappers (with DCE sinks)
+// ═══════════════════════════════════════
+
+function benchSpread(rows, cols) {
+  var size = rows * cols;
+  var board = randomBoard(size);
+  return measure(function() {
+    board = spreadPlague(board, rows, cols);
+    sinkValue(board);  // DCE: force V8 to keep the result
+  });
+}
+
+function benchSoftmax(boardSize) {
+  var logits = new Float32Array(boardSize);
+  var mask = new Float32Array(boardSize);
+  for (var i = 0; i < boardSize; i++) {
+    logits[i] = Math.random() * 2 - 1;
+    mask[i] = Math.random() > 0.3 ? 1 : 0;
+  }
+  return measure(function() {
+    var probs = maskedSoftmax(logits, mask);
+    sinkValue(probs);  // DCE: use the result
+  });
+}
+
+function benchRender(rows, cols) {
+  var size = rows * cols;
+  var cs = Math.max(2, Math.floor(200 / Math.max(rows, cols)));
+  var canvas = document.createElement('canvas');
+  canvas.width = cols * cs;
+  canvas.height = rows * cs;
+  var board = randomBoard(size);
+  return measure(function() {
+    renderBoard(canvas, board, rows, cols, cs);
+    sinkValue(1);  // DCE: canvas side-effects are real but be safe
+  });
+}
+
+function benchForward(model, boardSize, batchSize) {
+  // Pre-allocate input to isolate model.predict timing from tensor creation
+  var inputData = new Float32Array(batchSize * boardSize);
+  for (var i = 0; i < inputData.length; i++) inputData[i] = Math.random() * 2 - 1;
+
+  return measure(function() {
+    var input = tf.tensor2d(inputData, [batchSize, boardSize]);
+    var out = model.predict(input);
+    var data = out.dataSync();  // force sync completion + DCE prevention
+    sinkValue(data);
+    out.dispose();
+    input.dispose();
+  });
+}
+
+function benchTrain(model, boardSize, batchSize) {
+  var optimizer = tf.train.adam(0.001);
+  var result = measure(function() {
+    var states = tf.randomNormal([batchSize, boardSize]);
+    var actionMask = tf.zeros([batchSize, boardSize]);
+    var rewards = tf.randomNormal([batchSize]);
+    var loss = optimizer.minimize(function() {
+      var combined = model.predict(states);
+      var logits = combined.slice([0, 0], [-1, boardSize]);
+      var preds = logits.softmax();
+      var selected = preds.mul(actionMask).sum(1);
+      var logProbs = selected.add(tf.scalar(1e-8)).log();
+      var policyLoss = logProbs.mul(rewards).mean().neg();
+      var entropy = preds.add(tf.scalar(1e-8)).log().mul(preds).sum(1).mean().neg();
+      return policyLoss.sub(entropy.mul(tf.scalar(0.01)));
+    }, true);
+    if (loss) {
+      sinkValue(loss.dataSync()[0]);  // DCE: use loss value
+      loss.dispose();
+    }
+    states.dispose();
+    actionMask.dispose();
+    rewards.dispose();
+  });
+  optimizer.dispose();
+  return result;
+}
+
+function benchFullTick(model, rows, cols, numGames) {
+  var size = rows * cols;
+  var boards = [];
+  for (var g = 0; g < numGames; g++) boards.push(randomBoard(size));
+
+  return measure(function() {
+    // Spread plague (JS)
+    for (var g = 0; g < numGames; g++) boards[g] = spreadPlague(boards[g], rows, cols);
+    // Batched inference (TF.js)
+    var flat = new Float32Array(numGames * size);
+    for (var g = 0; g < numGames; g++) {
+      for (var i = 0; i < size; i++) flat[g * size + i] = boards[g][i];
+    }
+    var input = tf.tensor2d(flat, [numGames, size]);
+    var out = model.predict(input);
+    var data = out.dataSync();  // force completion + DCE
+    sinkValue(data);
+    out.dispose();
+    input.dispose();
+    // Spread again
+    for (var g = 0; g < numGames; g++) boards[g] = spreadPlague(boards[g], rows, cols);
+  });
+}
+
+// ═══════════════════════════════════
+//  Backend + orchestration
+// ═══════════════════════════════════
+
+async function setBackend(name) {
+  if (name === 'webgpu' && !navigator.gpu)
+    throw new Error('WebGPU not available');
+  await tf.setBackend(name);
+  await tf.ready();
+}
+
+async function benchmarkBackend(backend, onProgress) {
+  status('Setting backend: ' + backend + '...');
+  try { await setBackend(backend); } catch (e) {
+    status(backend + ': ' + e.message);
+    return null;
+  }
+  status('Running on ' + backend + '...');
+  await sleep(100);
+
+  var r = { backend: backend };
+  var totalSteps = BOARD_CONFIGS.length * (3 + BATCH_SIZES.length * 2 + 3);
+  var step = 0;
+
+  for (var bi = 0; bi < BOARD_CONFIGS.length; bi++) {
+    var bc = BOARD_CONFIGS[bi];
+    var size = bc.rows * bc.cols;
+    var key = bc.label;
+
+    // Game logic (plain JS — backend-independent, only measure once)
+    if (backend === 'cpu' || !results['cpu']) {
+      status(backend + ' | ' + key + ' | plague spread...');
+      await sleep(10);
+      r['spread_' + key] = await benchSpread(bc.rows, bc.cols);
+      step++; onProgress(step, totalSteps);
+
+      status(backend + ' | ' + key + ' | masked softmax...');
+      await sleep(10);
+      r['softmax_' + key] = await benchSoftmax(size);
+      step++; onProgress(step, totalSteps);
+
+      status(backend + ' | ' + key + ' | canvas render...');
+      await sleep(10);
+      r['render_' + key] = await benchRender(bc.rows, bc.cols);
+      step++; onProgress(step, totalSteps);
+    } else {
+      r['spread_' + key] = results['cpu']['spread_' + key];
+      r['softmax_' + key] = results['cpu']['softmax_' + key];
+      r['render_' + key] = results['cpu']['render_' + key];
+      step += 3; onProgress(step, totalSteps);
+    }
+
+    // Dense model benchmarks
+    status(backend + ' | ' + key + ' | building dense model...');
+    await sleep(10);
+    var denseModel = buildDenseModel(size);
+
+    for (var si = 0; si < BATCH_SIZES.length; si++) {
+      var bs = BATCH_SIZES[si];
+      status(backend + ' | ' + key + ' | dense forward batch=' + bs + '...');
+      await sleep(10);
+      r['dense_fwd_' + key + '_b' + bs] = await benchForward(denseModel, size, bs);
+      step++; onProgress(step, totalSteps);
+    }
+
+    status(backend + ' | ' + key + ' | dense train batch=64...');
+    await sleep(10);
+    r['dense_train_' + key + '_b64'] = await benchTrain(denseModel, size, 64);
+    step++; onProgress(step, totalSteps);
+
+    status(backend + ' | ' + key + ' | dense train batch=256...');
+    await sleep(10);
+    r['dense_train_' + key + '_b256'] = await benchTrain(denseModel, size, 256);
+    step++; onProgress(step, totalSteps);
+
+    // Full tick
+    status(backend + ' | ' + key + ' | full tick (40 games)...');
+    await sleep(10);
+    r['tick_' + key] = await benchFullTick(denseModel, bc.rows, bc.cols, 40);
+    step++; onProgress(step, totalSteps);
+
+    denseModel.dispose();
+
+    // Spatial model (skip 5x5 — too small for conv)
+    if (size >= 100) {
+      status(backend + ' | ' + key + ' | building spatial model...');
+      await sleep(10);
+      var spatialModel = buildSpatialModel(bc.rows, bc.cols);
+
+      for (var si = 0; si < BATCH_SIZES.length; si++) {
+        var bs = BATCH_SIZES[si];
+        status(backend + ' | ' + key + ' | spatial forward batch=' + bs + '...');
+        await sleep(10);
+        r['spatial_fwd_' + key + '_b' + bs] = await benchForward(spatialModel, size, bs);
+        step++; onProgress(step, totalSteps);
+      }
+
+      status(backend + ' | ' + key + ' | spatial train batch=64...');
+      await sleep(10);
+      r['spatial_train_' + key + '_b64'] = await benchTrain(spatialModel, size, 64);
+      step++; onProgress(step, totalSteps);
+
+      spatialModel.dispose();
+    }
+  }
+
+  return r;
+}
+
+// ═══════════════════════════════════
+//  Results table rendering
+// ═══════════════════════════════════
+
+function fmtResult(stat) {
+  if (!stat) return '<span class="na">&mdash;</span>';
+  var ms = stat.median;
+  var mad = stat.mad;
+  var valStr, madStr;
+  if (ms < 0.01) {
+    valStr = (ms * 1000).toFixed(1) + ' &mu;s';
+    madStr = '&plusmn;' + (mad * 1000).toFixed(1);
+  } else if (ms < 1) {
+    valStr = ms.toFixed(3) + ' ms';
+    madStr = '&plusmn;' + mad.toFixed(3);
+  } else if (ms < 100) {
+    valStr = ms.toFixed(2) + ' ms';
+    madStr = '&plusmn;' + mad.toFixed(2);
+  } else {
+    valStr = ms.toFixed(0) + ' ms';
+    madStr = '&plusmn;' + mad.toFixed(0);
+  }
+  return valStr + ' <span class="moe">' + madStr + '</span>';
+}
+
+function renderResults() {
+  var wrap = document.getElementById('results-wrap');
+  var backends = Object.keys(results);
+  if (backends.length === 0) { wrap.innerHTML = ''; return; }
+
+  function row(label, keyFn) {
+    var stats = backends.map(function(b) { return results[b] ? keyFn(results[b]) : null; });
+    var medians = stats.map(function(s) { return s ? s.median : Infinity; });
+    var min = Math.min.apply(null, medians);
+    var s = '<tr><td>' + label + '</td>';
+    for (var i = 0; i < stats.length; i++) {
+      var cls = '';
+      if (stats[i] && backends.length > 1) {
+        if (medians[i] === min) cls = 'fastest';
+        else if (medians[i] > min * 3) cls = 'slowest';
+      }
+      s += '<td class="' + cls + '">' + fmtResult(stats[i]) + '</td>';
+    }
+    return s + '</tr>';
+  }
+
+  var cols = backends.length + 1;
+  function sectionRow(label) {
+    return '<tr class="section-header"><td colspan="' + cols + '">' + label + '</td></tr>';
+  }
+
+  var html = '<table><thead><tr><th>Benchmark</th>';
+  backends.forEach(function(b) { html += '<th>' + b.toUpperCase() + '</th>'; });
+  html += '</tr></thead><tbody>';
+
+  BOARD_CONFIGS.forEach(function(bc) {
+    var key = bc.label;
+    var size = bc.rows * bc.cols;
+
+    html += sectionRow('Board: ' + key + ' (' + size + ' cells)');
+
+    // Game logic
+    html += row('Plague spread', function(r) { return r['spread_' + key]; });
+    html += row('Masked softmax', function(r) { return r['softmax_' + key]; });
+    html += row('Canvas render', function(r) { return r['render_' + key]; });
+
+    // Dense forward
+    BATCH_SIZES.forEach(function(bs) {
+      html += row('Dense forward (batch=' + bs + ')', function(r) { return r['dense_fwd_' + key + '_b' + bs]; });
+    });
+
+    html += row('Dense train (batch=64)', function(r) { return r['dense_train_' + key + '_b64']; });
+    html += row('Dense train (batch=256)', function(r) { return r['dense_train_' + key + '_b256']; });
+    html += row('Full tick (40 games)', function(r) { return r['tick_' + key]; });
+
+    // Spatial
+    if (size >= 100) {
+      BATCH_SIZES.forEach(function(bs) {
+        html += row('Spatial forward (batch=' + bs + ')', function(r) { return r['spatial_fwd_' + key + '_b' + bs]; });
+      });
+      html += row('Spatial train (batch=64)', function(r) { return r['spatial_train_' + key + '_b64']; });
+    }
+  });
+
+  html += '</tbody></table>';
+  wrap.innerHTML = html;
+}
+
+// ═══════════════════════════════════
+//  Entry points
+// ═══════════════════════════════════
+
+function disableButtons(disabled) {
+  var btns = document.querySelectorAll('button');
+  for (var i = 0; i < btns.length; i++) btns[i].disabled = disabled;
+}
+
+async function runSingle(backend) {
+  if (running) return;
+  running = true;
+  disableButtons(true);
+  __sink = 0;
+  progress(0);
+
+  var r = await benchmarkBackend(backend, function(step, total) {
+    progress(Math.round(step / total * 100));
+  });
+  if (r) { results[backend] = r; renderResults(); }
+
+  console.log('DCE sink:', __sink);  // prevent DCE across entire run
+  status('Done (' + backend + ')');
+  progress(100);
+  running = false;
+  disableButtons(false);
+}
+
+async function runAll() {
+  if (running) return;
+  running = true;
+  disableButtons(true);
+  results = {};
+  __sink = 0;
+  progress(0);
+
+  // Detect available backends
+  var backends = ['cpu'];
+  try { await setBackend('wasm'); backends.push('wasm'); await setBackend('cpu'); } catch(e) {}
+  try { await setBackend('webgl'); backends.push('webgl'); await setBackend('cpu'); } catch(e) {}
+  if (navigator.gpu) {
+    try { await setBackend('webgpu'); backends.push('webgpu'); await setBackend('cpu'); } catch(e) {}
+  }
+  status('Backends found: ' + backends.join(', '));
+  await sleep(500);
+
+  var totalBackends = backends.length;
+  for (var i = 0; i < backends.length; i++) {
+    var r = await benchmarkBackend(backends[i], function(step, total) {
+      var overall = (i / totalBackends + step / total / totalBackends) * 100;
+      progress(Math.round(overall));
+    });
+    if (r) { results[backends[i]] = r; renderResults(); }
+    await sleep(200);
+  }
+
+  console.log('DCE sink:', __sink);
+  status('All benchmarks complete.');
+  progress(100);
+  running = false;
+  disableButtons(false);
+}
+</script>
+</body>
+</html>

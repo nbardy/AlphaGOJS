@@ -1,9 +1,9 @@
 import { Game } from './game';
 
 export class UI {
-  constructor(trainer, model) {
+  constructor(trainer, algo) {
     this.trainer = trainer;
-    this.model = model;
+    this.algo = algo;
     this.rows = trainer.rows;
     this.cols = trainer.cols;
     this.boardSize = this.rows * this.cols;
@@ -245,7 +245,7 @@ export class UI {
     setTimeout(function () {
       var state = self.humanGame.getBoardForNN(-1);
       var mask = self.humanGame.getValidMovesMask();
-      var action = self.model.getAction(state, mask);
+      var action = self.algo.selectAction(state, mask);
       self.humanGame.makeMove(-1, action);
       self.humanGame.spreadPlague();
       self._renderHuman();
