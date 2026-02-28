@@ -1,4 +1,4 @@
-import { Game } from './game';
+import { createGame } from './games/registry';
 
 export class UI {
   constructor(trainer, model) {
@@ -7,6 +7,8 @@ export class UI {
     this.rows = trainer.rows;
     this.cols = trainer.cols;
     this.boardSize = this.rows * this.cols;
+    this.gameId = trainer.gameId;
+    this.renderer = trainer.renderer;
 
     this.gridCellSize = 3;
     this.gridCols = 10;
@@ -82,7 +84,7 @@ export class UI {
 
     var header = document.createElement('header');
     header.innerHTML = '<h1>AlphaPlague</h1>'
-      + '<div class="subtitle">A2C self-play RL \u2014 ' + this.rows + '\u00d7' + this.cols + ' board, ' + this.trainer.numGames + ' parallel games</div>'
+      + '<div class="subtitle">' + this.renderer.label + ' \u2014 A2C self-play RL \u2014 ' + this.rows + '\u00d7' + this.cols + ', ' + this.trainer.numGames + ' games</div>'
       + '<div id="stats">'
       + '<div class="stat"><div class="label">Games</div><div class="value" id="sg">0</div></div>'
       + '<div class="stat"><div class="label">Gen</div><div class="value" id="sgen">0</div></div>'
@@ -209,7 +211,7 @@ export class UI {
 
   _startHumanGame() {
     this.humanPlaying = true;
-    this.humanGame = new Game(this.rows, this.cols);
+    this.humanGame = createGame(this.gameId, this.rows, this.cols);
     this.humanTurn = true;
     this.humanGameOver = false;
     document.getElementById('training-section').style.display = 'none';
@@ -275,12 +277,11 @@ export class UI {
   _drawBoardFast(item, board) {
     var data = item.imgData.data;
     var size = this.boardSize;
+    var colorFn = this.renderer.cellColor;
     for (var i = 0; i < size; i++) {
       var off = i * 4;
-      var val = board[i];
-      if (val === 1) { data[off] = 0; data[off + 1] = 255; data[off + 2] = 136; }
-      else if (val === -1) { data[off] = 255; data[off + 1] = 51; data[off + 2] = 102; }
-      else { data[off] = 30; data[off + 1] = 30; data[off + 2] = 58; }
+      var rgb = colorFn(board[i]);
+      data[off] = rgb[0]; data[off + 1] = rgb[1]; data[off + 2] = rgb[2];
       data[off + 3] = 255;
     }
     item.ctx.putImageData(item.imgData, 0, 0);
@@ -288,14 +289,12 @@ export class UI {
 
   _drawBoardHuman(canvas, board, rows, cols, cs) {
     var ctx = canvas.getContext('2d');
+    var colorFn = this.renderer.humanCellColor;
     ctx.fillStyle = '#0d0d22';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     for (var r = 0; r < rows; r++) {
       for (var c = 0; c < cols; c++) {
-        var val = board[r * cols + c];
-        if (val === 1) ctx.fillStyle = '#00ff88';
-        else if (val === -1) ctx.fillStyle = '#ff3366';
-        else ctx.fillStyle = '#1e1e3a';
+        ctx.fillStyle = colorFn(board[r * cols + c]);
         ctx.fillRect(c * cs + 1, r * cs + 1, cs - 2, cs - 2);
       }
     }

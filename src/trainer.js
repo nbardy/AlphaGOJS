@@ -1,8 +1,9 @@
-import { Game } from './game';
+import { createGame, getRenderer } from './games/registry';
 
 export class SelfPlayTrainer {
   constructor(model, config) {
     this.model = model;
+    this.gameId = config.gameId || 'plague_classic';
     this.numGames = config.numGames || 80;
     this.rows = config.rows || 20;
     this.cols = config.cols || 20;
@@ -12,6 +13,8 @@ export class SelfPlayTrainer {
     this.snapshotInterval = config.snapshotInterval || 50;
     this.evalInterval = config.evalInterval || 100;
     this.evalGames = config.evalGames || 20;
+
+    this.renderer = getRenderer(this.gameId);
 
     this.games = [];
     this.experienceBuffer = [];
@@ -24,18 +27,24 @@ export class SelfPlayTrainer {
     this.p2Wins = 0;
     this.draws = 0;
     this.recentLengths = [];
-
-    // Snapshot trail
-    this.trail = []; // { gen, vsRandom }
+    this.trail = [];
     this.lastEvalGen = -1;
+
+    // NN input size depends on game channels
+    var sampleGame = this._createGame();
+    this.nnInputSize = sampleGame.getBoardForNN(1).length;
 
     for (var i = 0; i < this.numGames; i++) {
       this.games.push(this._newSlot());
     }
   }
 
+  _createGame() {
+    return createGame(this.gameId, this.rows, this.cols);
+  }
+
   _newSlot() {
-    return { game: new Game(this.rows, this.cols), history: [], turn: 0, done: false, winner: 0 };
+    return { game: this._createGame(), history: [], turn: 0, done: false, winner: 0 };
   }
 
   tick() {
@@ -83,10 +92,10 @@ export class SelfPlayTrainer {
       }
     }
 
-    // Spread plague and check game over
+    // Post-move step (plague spread) + check game over
     for (i = 0; i < this.numGames; i++) {
       if (this.games[i].done) continue;
-      this.games[i].game.spreadPlague();
+      this.games[i].game.step();
       this.games[i].turn++;
       if (this.games[i].game.isGameOver()) this._finish(i);
     }
@@ -106,7 +115,6 @@ export class SelfPlayTrainer {
 
     for (var k = 0; k < gs.history.length; k++) {
       var exp = gs.history[k];
-      // Margin-based reward from this player's perspective
       var margin = exp.player === 1
         ? (counts.p1 - counts.p2) / total
         : (counts.p2 - counts.p1) / total;
@@ -134,12 +142,10 @@ export class SelfPlayTrainer {
       this.generation++;
       this.gamesSinceLastTrain = 0;
 
-      // Snapshot
       if (this.generation % this.snapshotInterval === 0) {
         this.model.saveSnapshot(this.generation);
       }
 
-      // Evaluate vs random
       if (this.generation % this.evalInterval === 0 && this.generation !== this.lastEvalGen) {
         this.lastEvalGen = this.generation;
         var wr = this._evalVsRandom(this.evalGames);
@@ -148,7 +154,6 @@ export class SelfPlayTrainer {
       }
     }
 
-    // Immediately restart finished games (no dead slot wait)
     for (var i = 0; i < this.numGames; i++) {
       if (this.games[i].done) this.games[i] = this._newSlot();
     }
@@ -157,19 +162,17 @@ export class SelfPlayTrainer {
   _evalVsRandom(numGames) {
     var wins = 0;
     for (var g = 0; g < numGames; g++) {
-      var game = new Game(this.rows, this.cols);
+      var game = this._createGame();
       var modelPlayer = (g % 2 === 0) ? 1 : -1;
       var safety = 0;
       while (!game.isGameOver() && safety < 200) {
         safety++;
-        // Player 1
         var moves = game.getValidMoves();
         if (moves.length === 0) break;
         if (modelPlayer === 1) {
           var state = game.getBoardForNN(1);
           var mask = game.getValidMovesMask();
-          var action = this.model.getAction(state, mask);
-          game.makeMove(1, action);
+          game.makeMove(1, this.model.getAction(state, mask));
         } else {
           game.makeMove(1, moves[Math.floor(Math.random() * moves.length)]);
         }
@@ -178,17 +181,15 @@ export class SelfPlayTrainer {
         moves = game.getValidMoves();
         if (moves.length === 0) break;
 
-        // Player -1
         if (modelPlayer === -1) {
           var state2 = game.getBoardForNN(-1);
           var mask2 = game.getValidMovesMask();
-          var action2 = this.model.getAction(state2, mask2);
-          game.makeMove(-1, action2);
+          game.makeMove(-1, this.model.getAction(state2, mask2));
         } else {
           game.makeMove(-1, moves[Math.floor(Math.random() * moves.length)]);
         }
 
-        game.spreadPlague();
+        game.step();
       }
       if (game.getWinner() === modelPlayer) wins++;
     }
@@ -212,7 +213,8 @@ export class SelfPlayTrainer {
       avgGameLength: avgLen,
       bufferSize: this.experienceBuffer.length,
       trail: this.trail,
-      snapshots: this.model.snapshots.length
+      snapshots: this.model.snapshots.length,
+      gameLabel: this.renderer.label
     };
   }
 }

@@ -1,8 +1,9 @@
 import * as tf from '@tensorflow/tfjs';
 
 export class PolicyNetwork {
-  constructor(boardSize) {
-    this.boardSize = boardSize;
+  constructor(boardSize, nnInputSize) {
+    this.boardSize = boardSize;       // action space (number of cells)
+    this.inputSize = nnInputSize || boardSize; // NN input dim (may be larger for multi-channel)
     this.policyModel = this._buildPolicy();
     this.valueModel = this._buildValue();
     this.policyOptimizer = tf.train.adam(0.0003);
@@ -12,7 +13,7 @@ export class PolicyNetwork {
   }
 
   _buildPolicy() {
-    var input = tf.input({ shape: [this.boardSize] });
+    var input = tf.input({ shape: [this.inputSize] });
     var x = tf.layers.dense({ units: 256, activation: 'relu' }).apply(input);
     x = tf.layers.dense({ units: 256, activation: 'relu' }).apply(x);
     var output = tf.layers.dense({ units: this.boardSize, activation: 'softmax' }).apply(x);
@@ -20,7 +21,7 @@ export class PolicyNetwork {
   }
 
   _buildValue() {
-    var input = tf.input({ shape: [this.boardSize] });
+    var input = tf.input({ shape: [this.inputSize] });
     var x = tf.layers.dense({ units: 128, activation: 'relu' }).apply(input);
     x = tf.layers.dense({ units: 64, activation: 'relu' }).apply(x);
     var output = tf.layers.dense({ units: 1, activation: 'tanh' }).apply(x);
@@ -29,9 +30,9 @@ export class PolicyNetwork {
 
   _flattenStates(states) {
     var n = states.length;
-    var bs = this.boardSize;
-    var flat = new Float32Array(n * bs);
-    for (var i = 0; i < n; i++) flat.set(states[i], i * bs);
+    var is = this.inputSize;
+    var flat = new Float32Array(n * is);
+    for (var i = 0; i < n; i++) flat.set(states[i], i * is);
     return flat;
   }
 
@@ -40,7 +41,7 @@ export class PolicyNetwork {
     var n = states.length;
     if (n === 0) return { actions: [], values: [] };
 
-    var statesTensor = tf.tensor2d(this._flattenStates(states), [n, boardSize]);
+    var statesTensor = tf.tensor2d(this._flattenStates(states), [n, this.inputSize]);
     var preds = this.policyModel.predict(statesTensor);
     var predsData = preds.dataSync();
     var vals = this.valueModel.predict(statesTensor);
@@ -94,7 +95,7 @@ export class PolicyNetwork {
     var returnsArr = experiences.map(function (e) { return e.reward; });
     var oldValuesArr = experiences.map(function (e) { return e.value || 0; });
 
-    var statesTensor = tf.tensor2d(statesFlat, [batchSize, boardSize]);
+    var statesTensor = tf.tensor2d(statesFlat, [batchSize, this.inputSize]);
     var returnsTensor = tf.tensor1d(returnsArr);
 
     // Compute advantages: return - V(s) at time of play (detached)
