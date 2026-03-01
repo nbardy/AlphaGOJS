@@ -1,5 +1,6 @@
 import * as tf from '@tensorflow/tfjs';
 import { maskedSoftmax, sampleFromProbs, flattenStates } from './action';
+import { Game } from './game';
 
 // GPU-Native Trainer: entire game loop on GPU, ~320 bytes/tick transfer.
 //
@@ -49,6 +50,10 @@ export class GPUTrainer {
     // CPU experience buffer (same format as Reinforce)
     this.buffer = [];
     this.maxBufferSize = 10000;
+
+    // Checkpoint pool for Elo tracking (optional, injected from app.js)
+    this.checkpointPool = config.checkpointPool || null;
+    this._eloUpdateInFlight = false;
 
     // Stats
     this.gamesCompleted = 0;
@@ -318,6 +323,16 @@ export class GPUTrainer {
       this.lastLoss = this.train(this.trainBatchSize);
       this.generation++;
       this.gamesSinceLastTrain = 0;
+
+      // Checkpoint pool: save weights periodically, run async Elo eval
+      if (this.checkpointPool) {
+        if (this.checkpointPool.shouldSave(this.generation)) {
+          this.checkpointPool.save(this.model.model, this.generation);
+        }
+        if (this.checkpointPool.hasCheckpoints() && this.generation % 10 === 0) {
+          this._asyncEloUpdate();
+        }
+      }
     }
 
     // Restart finished games after 300ms idle
@@ -431,6 +446,56 @@ export class GPUTrainer {
     return this.trainSteps;
   }
 
+  // ── Async Elo: play 1 CPU-side game (current model vs checkpoint) via setTimeout ──
+  // Runs off the GPU hot path so it doesn't block tick().
+  // One game at a time (_eloUpdateInFlight gate) to avoid piling up work.
+
+  _asyncEloUpdate() {
+    if (this._eloUpdateInFlight) return;
+    this._eloUpdateInFlight = true;
+    var self = this;
+    var pool = this.checkpointPool;
+
+    pool.loadRandomOpponent();
+
+    setTimeout(function () {
+      try {
+        var game = new Game(self.rows, self.cols);
+        var boardSize = self.boardSize;
+        var maxTurns = boardSize * 2;
+
+        for (var turn = 0; turn < maxTurns; turn++) {
+          // P1 move (current model)
+          var mask1 = game.getValidMovesMask();
+          var hasValid1 = false;
+          for (var j = 0; j < boardSize; j++) { if (mask1[j] > 0) { hasValid1 = true; break; } }
+          if (!hasValid1) break;
+          var state1 = game.getBoardForNN(1);
+          var action1 = self.selectAction(state1, mask1);
+          game.makeMove(1, action1);
+
+          // P2 move (checkpoint opponent)
+          var mask2 = game.getValidMovesMask();
+          var hasValid2 = false;
+          for (var j = 0; j < boardSize; j++) { if (mask2[j] > 0) { hasValid2 = true; break; } }
+          if (!hasValid2) break;
+          var state2 = game.getBoardForNN(-1);
+          var results2 = pool.selectActions([state2], [mask2]);
+          game.makeMove(-1, results2[0].action);
+
+          game.spreadPlague();
+          if (game.isGameOver()) break;
+        }
+
+        var winner = game.getWinner();
+        pool.updateElo(winner === 1, winner === 0);
+      } catch (e) {
+        console.warn('Async Elo update error:', e.message);
+      }
+      self._eloUpdateInFlight = false;
+    }, 0);
+  }
+
   // ── Stats interface (same shape as SelfPlayTrainer.getStats) ──
 
   getStats() {
@@ -448,7 +513,9 @@ export class GPUTrainer {
       p2Wins: this.p2Wins,
       draws: this.draws,
       avgGameLength: avgLen,
-      bufferSize: this.buffer.length
+      bufferSize: this.buffer.length,
+      elo: this.checkpointPool ? this.checkpointPool.getCurrentElo() : 0,
+      checkpointWinRate: this.checkpointPool ? this.checkpointPool.getRecentWinRate() : 0
     };
   }
 

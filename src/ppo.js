@@ -10,7 +10,8 @@ import { flattenStates, maskedSoftmax, sampleFromProbs, logProbOfAction } from '
 // - train() does K epochs of minibatch updates with clipped surrogate loss
 //
 // Loss: -clipped_surrogate + 0.5 * value_MSE - 0.01 * entropy
-// Hyperparams: epsilon=0.2, gamma=0.99, lambda=0.95, lr=0.0003, K=4, minibatch=64
+// Hyperparams: epsilon=0.2, gamma=0.99, lambda=0.95, lr=0.0003, K=2, minibatch=128
+// Tuned for speed: 2 epochs x 2 minibatches = 4 gradient steps/gen (was 16).
 
 export class PPO {
   constructor(model) {
@@ -24,8 +25,8 @@ export class PPO {
     this.epsilon = 0.2;
     this.gamma = 0.99;
     this.lambda = 0.95;
-    this.epochs = 4;
-    this.minibatchSize = 64;
+    this.epochs = 2;          // Tuned: 2 epochs (was 4) — halves training cost per generation
+    this.minibatchSize = 128;  // Tuned: 128 (was 64) — fewer, larger gradient steps
     this.valueLossCoeff = 0.5;
     this.entropyCoeff = 0.01;
     this.lastEntropy = 0;

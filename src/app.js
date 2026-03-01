@@ -49,16 +49,20 @@ function createCPUPipeline(modelType, algoType, rows, cols, numGames) {
 
 function createGPUPipeline(modelType, rows, cols, numGames) {
   var model = createModel(modelType, rows, cols);
-  // GPU trainer has no checkpoint pool — Elo stats will show '--' in UI.
-  // GPUTrainer implements selectAction directly for human play.
+  var pool = new CheckpointPool(function () {
+    return createModel(modelType, rows, cols);
+  });
+  // GPUTrainer owns its game loop on GPU; checkpoint pool runs async CPU-side
+  // Elo eval (1 game every 10 gens) so the Elo chart is no longer flat.
   var trainer = new GPUTrainer(model, {
     numGames: numGames,
     rows: rows,
     cols: cols,
     trainBatchSize: 256,
-    trainInterval: 20
+    trainInterval: 20,
+    checkpointPool: pool
   });
-  return { trainer: trainer, algo: null, pool: null, pipelineType: 'gpu' };
+  return { trainer: trainer, algo: null, pool: pool, pipelineType: 'gpu' };
 }
 
 export function createPipeline(modelType, algoType, rows, cols, numGames, pipelineType) {
