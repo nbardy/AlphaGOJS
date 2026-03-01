@@ -97,17 +97,37 @@ export function drawLineChart(canvas, data, options) {
     ctx.setLineDash([]);
   }
 
-  // Draw data line
-  ctx.strokeStyle = color;
-  ctx.lineWidth = 1.5;
-  ctx.beginPath();
-  for (var i = 0; i < data.length; i++) {
-    var dx = plotX + (i / Math.max(data.length - 1, 1)) * plotW;
-    var dy = plotY + plotH - ((data[i] - minY) / (maxY - minY)) * plotH;
-    if (i === 0) ctx.moveTo(dx, dy);
-    else ctx.lineTo(dx, dy);
+  // Draw data line(s) — supports single array or multi-series via options.series
+  var series = options.series || [{ data: data, color: color }];
+  for (var si = 0; si < series.length; si++) {
+    var sd = series[si].data;
+    var sc = series[si].color || color;
+    if (!sd || sd.length === 0) continue;
+    ctx.strokeStyle = sc;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    for (var i = 0; i < sd.length; i++) {
+      var dx = plotX + (i / Math.max(sd.length - 1, 1)) * plotW;
+      var dy = plotY + plotH - ((sd[i] - minY) / (maxY - minY)) * plotH;
+      if (i === 0) ctx.moveTo(dx, dy);
+      else ctx.lineTo(dx, dy);
+    }
+    ctx.stroke();
   }
-  ctx.stroke();
+
+  // Legend for multi-series
+  if (options.series && options.series.length > 1) {
+    ctx.font = '9px "Courier New", monospace';
+    ctx.textAlign = 'left';
+    var lx = plotX + 4;
+    for (var si = 0; si < series.length; si++) {
+      var ly = plotY + 4 + si * 12;
+      ctx.fillStyle = series[si].color;
+      ctx.fillRect(lx, ly, 8, 8);
+      ctx.fillStyle = CHART_TEXT;
+      ctx.fillText(series[si].label || '', lx + 12, ly + 7);
+    }
+  }
 
   // Title
   _drawTitle(ctx, title, w);

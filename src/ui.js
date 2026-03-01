@@ -513,6 +513,8 @@ export class UI {
     var entropy = (this.algo && this.algo.lastEntropy) ? this.algo.lastEntropy : 0;
     var totalSelf = stats.p1Wins + stats.p2Wins + stats.draws;
     var selfP1Rate = totalSelf > 0 ? stats.p1Wins / totalSelf : 0.5;
+    var selfP2Rate = totalSelf > 0 ? stats.p2Wins / totalSelf : 0.5;
+    var selfDrawRate = totalSelf > 0 ? stats.draws / totalSelf : 0;
 
     this.metrics.push({
       generation: stats.generation,
@@ -520,6 +522,8 @@ export class UI {
       elo: stats.elo || 1000,
       checkpointWinRate: stats.checkpointWinRate || 0,
       selfPlayP1Rate: selfP1Rate,
+      selfPlayP2Rate: selfP2Rate,
+      selfPlayDrawRate: selfDrawRate,
       entropy: entropy,
       avgGameLength: stats.avgGameLength,
       bufferSize: stats.bufferSize
@@ -556,13 +560,17 @@ export class UI {
       title: 'Avg Game Length',
       color: '#66ccff'
     });
-    drawLineChart(this.charts.selfPlay, data ? this.metrics.getSeries('selfPlayP1Rate').map(function (v) { return v * 100; }) : [], {
-      title: 'Self-Play P1 Win%',
-      color: '#4488ff',
+    drawLineChart(this.charts.selfPlay, [], {
+      title: 'P1 / P2 / Draw %',
       minY: 0,
       maxY: 100,
       refLine: 50,
-      refColor: '#444466'
+      refColor: '#444466',
+      series: data ? [
+        { data: this.metrics.getSeries('selfPlayP1Rate').map(function (v) { return v * 100; }), color: '#00ff88', label: 'P1' },
+        { data: this.metrics.getSeries('selfPlayP2Rate').map(function (v) { return v * 100; }), color: '#ff3366', label: 'P2' },
+        { data: this.metrics.getSeries('selfPlayDrawRate').map(function (v) { return v * 100; }), color: '#888888', label: 'Draw' }
+      ] : []
     });
   }
 
