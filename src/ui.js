@@ -8,12 +8,13 @@ export class UI {
     this.algo = algo;
     this.config = config || {};
     this.pipelineType = this.config.pipelineType || 'cpu';
+    this.gameType = this.config.gameType || 'advanced';
     this.rows = trainer.rows;
     this.cols = trainer.cols;
     this.boardSize = this.rows * this.cols;
 
-    this.gridCellSize = 6;
-    this.humanCellSize = 30;
+    this.gridCellSize = 4;
+    this.humanCellSize = 24;
 
     this.gridCanvases = [];
     this.humanCanvas = null;
@@ -40,15 +41,17 @@ export class UI {
     this._destroyed = true;
   }
 
-  _restart(modelType, algoType, pipelineType) {
+  _restart(modelType, algoType, pipelineType, gameType) {
     if (!this.config.createPipeline) return;
     this.pipelineType = pipelineType || 'cpu';
+    this.gameType = gameType || 'advanced';
     var pipeline = this.config.createPipeline(
       modelType, algoType,
       this.config.rows || this.rows,
       this.config.cols || this.cols,
       this.config.numGames || this.trainer.numGames,
-      this.pipelineType
+      this.pipelineType,
+      this.gameType
     );
     this.trainer = pipeline.trainer;
     this.algo = pipeline.algo;
@@ -140,7 +143,7 @@ export class UI {
     // Header
     var header = document.createElement('header');
     header.innerHTML = '<h1>AlphaPlague</h1>'
-      + '<div class="subtitle">Self-play RL on a plague territory game &mdash; watch 80 games train live</div>'
+      + '<div class="subtitle">Self-play RL &mdash; plague territory with random walls &mdash; 80 games live</div>'
       + '<div id="stats">'
       + '<div class="stat"><div class="label">Games</div><div class="value" id="sg">0</div></div>'
       + '<div class="stat"><div class="label">Gen</div><div class="value" id="sgen">0</div></div>'
@@ -192,12 +195,19 @@ export class UI {
     pipeSel.innerHTML = '<option value="cpu">CPU</option><option value="gpu">GPU (fast)</option>';
     controls.appendChild(pipeSel);
 
+    // Game type select (walls vs classic)
+    var gameSel = document.createElement('select');
+    gameSel.id = 'game-sel';
+    gameSel.className = 'cfg-select';
+    gameSel.innerHTML = '<option value="advanced">Walls</option><option value="classic">Classic</option>';
+    controls.appendChild(gameSel);
+
     // Restart button
     var restartBtn = document.createElement('button');
     restartBtn.className = 'restart-btn';
     restartBtn.textContent = 'Restart';
     restartBtn.onclick = function () {
-      self._restart(modelSel.value, algoSel.value, pipeSel.value);
+      self._restart(modelSel.value, algoSel.value, pipeSel.value, gameSel.value);
     };
     controls.appendChild(restartBtn);
 
@@ -317,7 +327,7 @@ export class UI {
 
   _startHumanGame() {
     this.humanPlaying = true;
-    this.humanGame = new Game(this.rows, this.cols);
+    this.humanGame = new Game(this.rows, this.cols, this.gameType !== 'classic');
     this.humanTurn = true;
     this.humanGameOver = false;
 
@@ -408,6 +418,7 @@ export class UI {
           var R, G, B;
           if (val === 1) { R = 0; G = 255; B = 136; }
           else if (val === -1) { R = 255; G = 51; B = 102; }
+          else if (val === 2) { R = 80; G = 70; B = 90; }  // wall: dark purple
           else { R = 30; G = 30; B = 58; }
           // Fill cs×cs pixel block
           for (var py = 0; py < cs; py++) {
@@ -433,6 +444,7 @@ export class UI {
           var val = board[r * cols + c];
           if (val === 1) ctx.fillStyle = '#00ff88';
           else if (val === -1) ctx.fillStyle = '#ff3366';
+          else if (val === 2) ctx.fillStyle = '#504660';  // wall
           else ctx.fillStyle = '#1e1e3a';
           ctx.fillRect(c * cs + gap, r * cs + gap, cs - gap * 2, cs - gap * 2);
         }

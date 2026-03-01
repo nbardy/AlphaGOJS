@@ -17,6 +17,7 @@ export class SelfPlayTrainer {
     this.boardSize = this.rows * this.cols;
     this.trainBatchSize = config.trainBatchSize || 256;
     this.trainInterval = config.trainInterval || 20;
+    this.walls = config.walls !== false;
     this.checkpointPool = config.checkpointPool || null;
 
     this.games = [];
@@ -37,7 +38,7 @@ export class SelfPlayTrainer {
   _newSlot() {
     var vs = this.checkpointPool && this.checkpointPool.shouldBeCheckpointGame();
     return {
-      game: new Game(this.rows, this.cols),
+      game: new Game(this.rows, this.cols, this.walls),
       history: [],
       turn: 0,
       done: false,

@@ -23,6 +23,7 @@ export class GPUTrainer {
     this.boardSize = this.rows * this.cols;
     this.trainBatchSize = config.trainBatchSize || 256;
     this.trainInterval = config.trainInterval || 20;
+    this.walls = config.walls !== false;
 
     // GPU state tensor [N, boardSize] — the core of zero-transfer
     this.state = tf.zeros([this.numGames, this.boardSize]);
@@ -501,7 +502,7 @@ export class GPUTrainer {
 
     setTimeout(function () {
       try {
-        var game = new Game(self.rows, self.cols);
+        var game = new Game(self.rows, self.cols, self.walls);
         var boardSize = self.boardSize;
         var maxTurns = boardSize * 2;
 

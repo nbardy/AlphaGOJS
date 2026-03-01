@@ -8,8 +8,8 @@ import { CheckpointPool } from './checkpoint_pool';
 import { UI } from './ui';
 
 // --- Configuration ---
-var ROWS = 10;
-var COLS = 10;
+var ROWS = 20;
+var COLS = 20;
 var NUM_GAMES = 80;
 
 // --- Thin dispatchers (One Clean Path: one handler per type, exhaustive) ---
@@ -30,7 +30,7 @@ function createAlgorithm(type, model) {
 // 'gpu' uses GPUTrainer (all game state on GPU, ~320 bytes/tick transfer).
 // GPU pipeline bypasses the algo abstraction — GPUTrainer owns its own training loop
 // and exposes selectAction directly for human play.
-function createCPUPipeline(modelType, algoType, rows, cols, numGames) {
+function createCPUPipeline(modelType, algoType, rows, cols, numGames, walls) {
   var model = createModel(modelType, rows, cols);
   var algo = createAlgorithm(algoType, model);
   var pool = new CheckpointPool(function () {
@@ -40,6 +40,7 @@ function createCPUPipeline(modelType, algoType, rows, cols, numGames) {
     numGames: numGames,
     rows: rows,
     cols: cols,
+    walls: walls,
     trainBatchSize: 512,
     trainInterval: 30,
     checkpointPool: pool
@@ -47,7 +48,7 @@ function createCPUPipeline(modelType, algoType, rows, cols, numGames) {
   return { trainer: trainer, algo: algo, pool: pool, pipelineType: 'cpu' };
 }
 
-function createGPUPipeline(modelType, rows, cols, numGames) {
+function createGPUPipeline(modelType, rows, cols, numGames, walls) {
   var model = createModel(modelType, rows, cols);
   var pool = new CheckpointPool(function () {
     return createModel(modelType, rows, cols);
@@ -58,6 +59,7 @@ function createGPUPipeline(modelType, rows, cols, numGames) {
     numGames: numGames,
     rows: rows,
     cols: cols,
+    walls: walls,
     trainBatchSize: 512,
     trainInterval: 30,
     checkpointPool: pool
@@ -65,9 +67,10 @@ function createGPUPipeline(modelType, rows, cols, numGames) {
   return { trainer: trainer, algo: null, pool: pool, pipelineType: 'gpu' };
 }
 
-export function createPipeline(modelType, algoType, rows, cols, numGames, pipelineType) {
-  if (pipelineType === 'gpu') return createGPUPipeline(modelType, rows, cols, numGames);
-  if (pipelineType === 'cpu' || !pipelineType) return createCPUPipeline(modelType, algoType, rows, cols, numGames);
+export function createPipeline(modelType, algoType, rows, cols, numGames, pipelineType, gameType) {
+  var walls = gameType !== 'classic'; // 'advanced' (default) = walls, 'classic' = no walls
+  if (pipelineType === 'gpu') return createGPUPipeline(modelType, rows, cols, numGames, walls);
+  if (pipelineType === 'cpu' || !pipelineType) return createCPUPipeline(modelType, algoType, rows, cols, numGames, walls);
   throw new Error('Unknown pipeline type: ' + pipelineType);
 }
 

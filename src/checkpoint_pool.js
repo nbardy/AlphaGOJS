@@ -60,12 +60,29 @@ export class CheckpointPool {
     }
   }
 
-  // Load a random checkpoint into the opponent model.
-  // Call once per generation/batch, not per game.
+  // Load a checkpoint into the opponent model, biased toward recent (harder) ones.
+  // Uses exponential decay: P(i) ∝ exp(decay * i) where i=0 is oldest.
+  // With decay=3 and 20 checkpoints, the newest is ~20x more likely than oldest.
   loadRandomOpponent() {
     if (this.checkpoints.length === 0) return -1;
     this._ensureOpponent();
-    var idx = Math.floor(Math.random() * this.checkpoints.length);
+    var n = this.checkpoints.length;
+    // Exponential weights: w(i) = exp(decay * i/n), newest (i=n-1) gets highest weight.
+    // With decay=3 and 20 checkpoints, newest is ~20x more likely than oldest.
+    var decay = 3;
+    var weights = new Float64Array(n);
+    var total = 0;
+    for (var i = 0; i < n; i++) {
+      weights[i] = Math.exp(decay * i / n);
+      total += weights[i];
+    }
+    var r = Math.random() * total;
+    var cumul = 0;
+    var idx = n - 1;
+    for (var i = 0; i < n; i++) {
+      cumul += weights[i];
+      if (r <= cumul) { idx = i; break; }
+    }
     var ckpt = this.checkpoints[idx];
     var tensors = ckpt.weights.map(function (w) {
       return tf.tensor(w.data, w.shape);
