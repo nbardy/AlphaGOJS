@@ -3,10 +3,19 @@ import { MetricsLog } from './metrics';
 import { evaluateVsRandom } from './eval';
 import { createChartCanvas, drawLineChart } from './charts';
 
+// Elo from win rate vs a fixed-strength opponent (random = Elo 0).
+// Elo_diff = -400 * log10(1/winRate - 1)
+function winRateToElo(wr) {
+  if (wr <= 0.01) return -800;
+  if (wr >= 0.99) return 800;
+  return -400 * Math.log10(1 / wr - 1);
+}
+
 export class UI {
-  constructor(trainer, algo) {
+  constructor(trainer, algo, config) {
     this.trainer = trainer;
     this.algo = algo;
+    this.config = config || {};
     this.rows = trainer.rows;
     this.cols = trainer.cols;
     this.boardSize = this.rows * this.cols;
@@ -38,6 +47,47 @@ export class UI {
     this._destroyed = true;
   }
 
+  _restart(modelType, algoType) {
+    if (!this.config.createPipeline) return;
+    var pipeline = this.config.createPipeline(
+      modelType, algoType,
+      this.config.rows || this.rows,
+      this.config.cols || this.cols,
+      this.config.numGames || this.trainer.numGames
+    );
+    this.trainer = pipeline.trainer;
+    this.algo = pipeline.algo;
+    this.rows = this.trainer.rows;
+    this.cols = this.trainer.cols;
+    this.boardSize = this.rows * this.cols;
+    this.metrics = new MetricsLog(500);
+    this.lastGeneration = -1;
+    this._chartsDirty = true;
+    this.humanPlaying = false;
+
+    // Rebuild grid canvases
+    var grid = document.getElementById('game-grid');
+    grid.innerHTML = '';
+    var cw = this.cols * this.gridCellSize;
+    var ch = this.rows * this.gridCellSize;
+    this.gridCanvases = [];
+    for (var i = 0; i < this.trainer.numGames; i++) {
+      var cell = document.createElement('div');
+      cell.className = 'gcell';
+      var canvas = document.createElement('canvas');
+      canvas.width = cw;
+      canvas.height = ch;
+      canvas.style.display = 'block';
+      cell.appendChild(canvas);
+      grid.appendChild(cell);
+      this.gridCanvases.push({ canvas: canvas, cell: cell });
+    }
+
+    document.getElementById('training-section').style.display = 'block';
+    document.getElementById('human-section').style.display = 'none';
+    this._renderCharts();
+  }
+
   _injectStyles() {
     var style = document.createElement('style');
     style.textContent = [
@@ -56,8 +106,11 @@ export class UI {
       'button:hover { background:#3355cc; }',
       'button.play-btn { background:#008844; }',
       'button.play-btn:hover { background:#00aa55; }',
+      'button.restart-btn { background:#aa4422; }',
+      'button.restart-btn:hover { background:#cc5533; }',
       '.speed-ctrl { display:flex; align-items:center; gap:6px; font-size:12px; }',
       '.speed-ctrl input { width:100px; accent-color:#4488ff; }',
+      'select.cfg-select { background:#151530; color:#c0c0e0; border:1px solid #2a2a5a; padding:6px 10px; border-radius:6px; font-family:inherit; font-size:12px; }',
       '#training-section h2, #human-section h2 { font-size:15px; color:#4488ff; margin-bottom:10px; text-align:center; }',
       '#game-grid { display:flex; flex-wrap:wrap; justify-content:center; gap:3px; background:#0d0d22; padding:10px; border-radius:8px; border:1px solid #1a1a40; }',
       '.gcell { border:2px solid #1a1a40; border-radius:3px; transition:border-color 0.3s; }',
@@ -99,7 +152,7 @@ export class UI {
       + '<div class="stat"><div class="label">Loss</div><div class="value" id="sloss">&mdash;</div></div>'
       + '<div class="stat"><div class="label">Avg Len</div><div class="value" id="slen">&mdash;</div></div>'
       + '<div class="stat"><div class="label">vs Random</div><div class="value sg" id="srand">&mdash;</div></div>'
-      + '<div class="stat"><div class="label">Self P1%</div><div class="value" id="sp1pct">&mdash;</div></div>'
+      + '<div class="stat"><div class="label">Elo</div><div class="value" id="selo">&mdash;</div></div>'
       + '<div class="stat"><div class="label">Entropy</div><div class="value" id="sentr">&mdash;</div></div>'
       + '</div>';
     app.appendChild(header);
@@ -107,11 +160,11 @@ export class UI {
     // Controls
     var controls = document.createElement('div');
     controls.id = 'controls';
+    var self = this;
 
     var pauseBtn = document.createElement('button');
     pauseBtn.id = 'pbtn';
     pauseBtn.textContent = 'Pause';
-    var self = this;
     pauseBtn.onclick = function () {
       self.paused = !self.paused;
       pauseBtn.textContent = self.paused ? 'Resume' : 'Pause';
@@ -122,6 +175,29 @@ export class UI {
     speedDiv.className = 'speed-ctrl';
     speedDiv.innerHTML = '<span>Speed:</span><input type="range" id="sspeed" min="1" max="50" value="1"><span id="sval">1x</span>';
     controls.appendChild(speedDiv);
+
+    // Model select
+    var modelSel = document.createElement('select');
+    modelSel.id = 'model-sel';
+    modelSel.className = 'cfg-select';
+    modelSel.innerHTML = '<option value="dense">Dense</option><option value="spatial">Spatial (slow)</option>';
+    controls.appendChild(modelSel);
+
+    // Algo select
+    var algoSel = document.createElement('select');
+    algoSel.id = 'algo-sel';
+    algoSel.className = 'cfg-select';
+    algoSel.innerHTML = '<option value="ppo">PPO</option><option value="reinforce">REINFORCE</option>';
+    controls.appendChild(algoSel);
+
+    // Restart button
+    var restartBtn = document.createElement('button');
+    restartBtn.className = 'restart-btn';
+    restartBtn.textContent = 'Restart';
+    restartBtn.onclick = function () {
+      self._restart(modelSel.value, algoSel.value);
+    };
+    controls.appendChild(restartBtn);
 
     var playBtn = document.createElement('button');
     playBtn.className = 'play-btn';
@@ -176,10 +252,11 @@ export class UI {
 
     var chartDefs = [
       { key: 'winRate', title: 'Win Rate vs Random' },
-      { key: 'selfPlay', title: 'Self-Play P1 Win%' },
+      { key: 'elo', title: 'Elo vs Random' },
       { key: 'loss', title: 'Training Loss' },
       { key: 'entropy', title: 'Policy Entropy' },
-      { key: 'avgLen', title: 'Avg Game Length' }
+      { key: 'avgLen', title: 'Avg Game Length' },
+      { key: 'selfPlay', title: 'Self-Play P1 Win%' }
     ];
     this.charts = {};
     for (var ci = 0; ci < chartDefs.length; ci++) {
@@ -190,7 +267,7 @@ export class UI {
     chartsSection.appendChild(chartsGrid);
     app.appendChild(chartsSection);
 
-    // Draw initial empty state on all charts
+    // Draw initial empty state
     this._renderCharts();
 
     // Human play section
@@ -386,10 +463,9 @@ export class UI {
     var last = this.metrics.last();
     if (last) {
       document.getElementById('srand').textContent = (last.winRateVsRandom * 100).toFixed(0) + '%';
+      var elo = winRateToElo(last.winRateVsRandom);
+      document.getElementById('selo').textContent = elo > 0 ? '+' + elo.toFixed(0) : elo.toFixed(0);
       document.getElementById('sentr').textContent = last.entropy.toFixed(3);
-      var totalSelf = s.p1Wins + s.p2Wins + s.draws;
-      var p1Pct = totalSelf > 0 ? (s.p1Wins / totalSelf * 100).toFixed(0) : '\u2014';
-      document.getElementById('sp1pct').textContent = p1Pct + '%';
     }
   }
 
@@ -397,12 +473,12 @@ export class UI {
     var entropy = this.algo.lastEntropy || 0;
     var totalSelf = stats.p1Wins + stats.p2Wins + stats.draws;
     var selfP1Rate = totalSelf > 0 ? stats.p1Wins / totalSelf : 0.5;
+    var prevWr = this.metrics.length > 0 ? this.metrics.last().winRateVsRandom : 0.5;
 
-    // Snapshot without eval first (non-blocking)
     var entry = {
       generation: stats.generation,
       loss: stats.loss,
-      winRateVsRandom: this.metrics.length > 0 ? this.metrics.last().winRateVsRandom : 0,
+      winRateVsRandom: prevWr,
       selfPlayP1Rate: selfP1Rate,
       entropy: entropy,
       avgGameLength: stats.avgGameLength,
@@ -435,12 +511,10 @@ export class UI {
       refLine: 50,
       refColor: '#444466'
     });
-    drawLineChart(this.charts.selfPlay, data ? this.metrics.getSeries('selfPlayP1Rate').map(function (v) { return v * 100; }) : [], {
-      title: 'Self-Play P1 Win% (expect ~50%)',
-      color: '#4488ff',
-      minY: 0,
-      maxY: 100,
-      refLine: 50,
+    drawLineChart(this.charts.elo, data ? this.metrics.getSeries('winRateVsRandom').map(winRateToElo) : [], {
+      title: 'Elo vs Random',
+      color: '#ffaa00',
+      refLine: 0,
       refColor: '#444466'
     });
     drawLineChart(this.charts.loss, data ? this.metrics.getSeries('loss') : [], {
@@ -454,6 +528,14 @@ export class UI {
     drawLineChart(this.charts.avgLen, data ? this.metrics.getSeries('avgGameLength') : [], {
       title: 'Avg Game Length',
       color: '#66ccff'
+    });
+    drawLineChart(this.charts.selfPlay, data ? this.metrics.getSeries('selfPlayP1Rate').map(function (v) { return v * 100; }) : [], {
+      title: 'Self-Play P1 Win% (expect ~50%)',
+      color: '#4488ff',
+      minY: 0,
+      maxY: 100,
+      refLine: 50,
+      refColor: '#444466'
     });
   }
 
