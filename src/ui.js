@@ -296,6 +296,14 @@ export class UI {
   }
 
   _renderGrid() {
+    if (this.trainer.getBoardsForRender) {
+      this._renderGridGPU();
+    } else {
+      this._renderGridCPU();
+    }
+  }
+
+  _renderGridCPU() {
     for (var i = 0; i < this.trainer.numGames; i++) {
       var gs = this.trainer.games[i];
       var item = this.gridCanvases[i];
@@ -304,6 +312,20 @@ export class UI {
       if (gs.done) {
         if (gs.winner === 1) item.cell.className = 'gcell won1';
         else if (gs.winner === -1) item.cell.className = 'gcell won2';
+      }
+    }
+  }
+
+  _renderGridGPU() {
+    var renderData = this.trainer.getBoardsForRender();
+    for (var i = 0; i < this.trainer.numGames; i++) {
+      var item = this.gridCanvases[i];
+      var boardView = renderData.boards.subarray(i * this.boardSize, (i + 1) * this.boardSize);
+      this._drawBoard(item.canvas, boardView, this.rows, this.cols, this.gridCellSize);
+      item.cell.className = 'gcell';
+      if (renderData.done[i]) {
+        if (renderData.winners[i] === 1) item.cell.className = 'gcell won1';
+        else if (renderData.winners[i] === -1) item.cell.className = 'gcell won2';
       }
     }
   }

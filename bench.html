@@ -172,6 +172,7 @@ var BOARD_CONFIGS = [
   { rows: 19, cols: 19, label: '19x19' },
 ];
 var BATCH_SIZES = [1, 10, 40, 100];
+var PIPELINE_BATCHES = [1, 40]; // representative batch sizes for pipeline decomposition
 var results = {};
 var running = false;
 
@@ -359,6 +360,390 @@ function benchFullTick(model, rows, cols, numGames) {
   });
 }
 
+// ═══════════════════════════════════════════════════
+//  Architecture benchmarks
+//  Pipeline decomposition, GPU game ops, rendering,
+//  and full architecture end-to-end comparison
+// ═══════════════════════════════════════════════════
+
+function fmtBytes(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+// ─── Pipeline Decomposition ───
+
+function benchUpload(boardSize, batchSize) {
+  var data = new Float32Array(batchSize * boardSize);
+  for (var i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+  return measureGPU(function() {
+    var t = tf.tensor2d(data, [batchSize, boardSize]);
+    t.dispose();
+  });
+}
+
+function benchForwardNoSync(model, boardSize, batchSize) {
+  var inputData = new Float32Array(batchSize * boardSize);
+  for (var i = 0; i < inputData.length; i++) inputData[i] = Math.random() * 2 - 1;
+  var input = tf.tensor2d(inputData, [batchSize, boardSize]);
+  var result = measureGPU(function() {
+    var out = model.predict(input);
+    out.dispose();
+  });
+  input.dispose();
+  return result;
+}
+
+function benchReadback(boardSize, batchSize) {
+  // Readback output-sized tensor (boardSize+1 combined output)
+  var t = tf.randomNormal([batchSize, boardSize + 1]);
+  var result = measureGPU(function() {
+    sinkValue(t.dataSync());
+  });
+  t.dispose();
+  return result;
+}
+
+function benchActionSelectJS(boardSize, batchSize) {
+  // CPU masked softmax + sampling for a batch
+  var logitsAll = new Float32Array(batchSize * boardSize);
+  var masks = [];
+  for (var i = 0; i < batchSize; i++) {
+    var mask = new Float32Array(boardSize);
+    for (var j = 0; j < boardSize; j++) {
+      logitsAll[i * boardSize + j] = Math.random() * 2 - 1;
+      mask[j] = Math.random() > 0.3 ? 1 : 0;
+    }
+    masks.push(mask);
+  }
+  return measureCPU(function() {
+    for (var i = 0; i < batchSize; i++) {
+      var logits = logitsAll.subarray(i * boardSize, (i + 1) * boardSize);
+      var probs = maskedSoftmax(logits, masks[i]);
+      sinkValue(probs);
+    }
+  });
+}
+
+function benchGPUActionPipeline(model, boardSize, batchSize) {
+  // GPU softmax + multinomial, dataSync indices only
+  var inputData = new Float32Array(batchSize * boardSize);
+  var maskData = new Float32Array(batchSize * boardSize);
+  for (var i = 0; i < batchSize * boardSize; i++) {
+    inputData[i] = Math.random() * 2 - 1;
+    maskData[i] = Math.random() > 0.3 ? 1 : 0;
+  }
+  var input = tf.tensor2d(inputData, [batchSize, boardSize]);
+  var mask = tf.tensor2d(maskData, [batchSize, boardSize]);
+
+  var result = measureGPU(function() {
+    var combined = model.predict(input);
+    var logits = combined.slice([0, 0], [-1, boardSize]);
+    var maskedLogits = logits.add(mask.sub(1).mul(1e9));
+    // tf.multinomial WebGPU bug workaround: request 2, take second
+    var actions = tf.multinomial(maskedLogits, 2).slice([0, 1], [-1, 1]).squeeze([1]);
+    sinkValue(actions.dataSync()); // Only indices back (~160B for batch=40)
+    combined.dispose();
+    logits.dispose();
+    maskedLogits.dispose();
+    actions.dispose();
+  });
+  input.dispose();
+  mask.dispose();
+  return result;
+}
+
+// ─── GPU Plague Spread ───
+
+function benchSpreadGPU(rows, cols, numGames) {
+  var boardSize = rows * cols;
+  var kernel = tf.tensor4d([0, 1, 0, 1, 0, 1, 0, 1, 0], [3, 3, 1, 1]);
+  var state = tf.randomUniform([numGames, boardSize], -1, 1).sign();
+
+  var result = measureGPU(function() {
+    var grid = state.reshape([numGames, rows, cols, 1]);
+    var neighborSum = tf.conv2d(grid, kernel, 1, 'same');
+    var rand = tf.randomUniform(neighborSum.shape);
+    var weighted = neighborSum.mul(rand).mul(2);
+    var emptyMask = grid.equal(0).cast('float32');
+    var newVals = weighted.sign().mul(emptyMask);
+    var occupied = grid.mul(tf.scalar(1).sub(emptyMask));
+    var newState = occupied.add(newVals).reshape([numGames, boardSize]);
+    newState.dispose();
+  });
+  state.dispose();
+  kernel.dispose();
+  return result;
+}
+
+// ─── Rendering Comparison ───
+
+function benchRenderBrowserDraw(rows, cols) {
+  var boardSize = rows * cols;
+  var cs = Math.max(2, Math.floor(200 / Math.max(rows, cols)));
+  var canvas = document.createElement('canvas');
+  canvas.width = cols * cs;
+  canvas.height = rows * cs;
+
+  // tf.browser.draw needs a 3D or 4D tensor with values 0-255
+  // We'll create a [rows, cols, 3] uint8 tensor from board data
+  var boardData = new Float32Array(boardSize);
+  for (var i = 0; i < boardSize; i++) {
+    var r = Math.random();
+    boardData[i] = r < 0.33 ? 1 : r < 0.66 ? -1 : 0;
+  }
+
+  // Build RGB pixel data from board
+  var rgbData = new Int32Array(rows * cols * 3);
+  for (var i = 0; i < boardSize; i++) {
+    if (boardData[i] === 1) { rgbData[i*3] = 0; rgbData[i*3+1] = 255; rgbData[i*3+2] = 136; }
+    else if (boardData[i] === -1) { rgbData[i*3] = 255; rgbData[i*3+1] = 51; rgbData[i*3+2] = 102; }
+    else { rgbData[i*3] = 30; rgbData[i*3+1] = 30; rgbData[i*3+2] = 58; }
+  }
+  var rgbTensor = tf.tensor3d(rgbData, [rows, cols, 3], 'int32');
+
+  var result = measureGPU(function() {
+    tf.browser.draw(rgbTensor, canvas);
+  });
+  rgbTensor.dispose();
+  return result;
+}
+
+async function benchRenderWebGPU(rows, cols) {
+  if (tf.getBackend() !== 'webgpu') return null;
+
+  var boardSize = rows * cols;
+  var cs = 6;
+  var canvas = document.createElement('canvas');
+  canvas.width = cols * cs;
+  canvas.height = rows * cs;
+
+  var device;
+  try {
+    // Get GPUDevice from TF.js WebGPU backend
+    device = tf.backend().device;
+    if (!device) return null;
+  } catch (e) { return null; }
+
+  // WGSL shader for board rendering
+  var shaderCode = '\
+struct Uniforms { cols: u32, rows: u32, cellSize: u32 }\n\
+@group(0) @binding(0) var<storage, read> board: array<f32>;\n\
+@group(0) @binding(1) var<uniform> u: Uniforms;\n\
+\n\
+struct VSOut { @builtin(position) pos: vec4f, @location(0) color: vec3f }\n\
+\n\
+@vertex fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VSOut {\n\
+  let col = ii % u.cols;\n\
+  let row = ii / u.cols;\n\
+  let cs = f32(u.cellSize);\n\
+  let w = f32(u.cols) * cs;\n\
+  let h = f32(u.rows) * cs;\n\
+  var corners = array<vec2f, 6>(\n\
+    vec2f(0,0), vec2f(1,0), vec2f(0,1),\n\
+    vec2f(1,0), vec2f(1,1), vec2f(0,1)\n\
+  );\n\
+  let c = corners[vi];\n\
+  let px = (f32(col) + c.x) * cs;\n\
+  let py = (f32(row) + c.y) * cs;\n\
+  let ndc = vec2f(px / w * 2.0 - 1.0, 1.0 - py / h * 2.0);\n\
+  var out: VSOut;\n\
+  out.pos = vec4f(ndc, 0.0, 1.0);\n\
+  let val = board[ii];\n\
+  if (val > 0.5) { out.color = vec3f(0.0, 1.0, 0.533); }\n\
+  else if (val < -0.5) { out.color = vec3f(1.0, 0.2, 0.4); }\n\
+  else { out.color = vec3f(0.118, 0.118, 0.227); }\n\
+  return out;\n\
+}\n\
+\n\
+@fragment fn fs(@location(0) color: vec3f) -> @location(0) vec4f {\n\
+  return vec4f(color, 1.0);\n\
+}\n';
+
+  var shaderModule = device.createShaderModule({ code: shaderCode });
+
+  var context = canvas.getContext('webgpu');
+  if (!context) return null;
+  var format = navigator.gpu.getPreferredCanvasFormat();
+  context.configure({ device: device, format: format, alphaMode: 'opaque' });
+
+  var uniformBuffer = device.createBuffer({
+    size: 12,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+  });
+  device.queue.writeBuffer(uniformBuffer, 0, new Uint32Array([cols, rows, cs]));
+
+  var bindGroupLayout = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
+      { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform' } }
+    ]
+  });
+
+  var pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] });
+
+  var pipeline = device.createRenderPipeline({
+    layout: pipelineLayout,
+    vertex: { module: shaderModule, entryPoint: 'vs' },
+    fragment: {
+      module: shaderModule,
+      entryPoint: 'fs',
+      targets: [{ format: format }]
+    },
+    primitive: { topology: 'triangle-list' }
+  });
+
+  // Pre-create a GPU tensor
+  var stateTensor = tf.randomUniform([1, boardSize], -1, 1).sign();
+
+  var result = await measureGPU(function() {
+    var gpuData = stateTensor.dataToGPU();
+    var buffer = gpuData.buffer;
+
+    var bindGroup = device.createBindGroup({
+      layout: bindGroupLayout,
+      entries: [
+        { binding: 0, resource: { buffer: buffer } },
+        { binding: 1, resource: { buffer: uniformBuffer } }
+      ]
+    });
+
+    var encoder = device.createCommandEncoder();
+    var pass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: context.getCurrentTexture().createView(),
+        loadOp: 'clear',
+        clearValue: { r: 0.04, g: 0.04, b: 0.1, a: 1 },
+        storeOp: 'store'
+      }]
+    });
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.draw(6, boardSize);
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+
+    gpuData.tensorRef.dispose();
+  });
+
+  stateTensor.dispose();
+  uniformBuffer.destroy();
+  return result;
+}
+
+// ─── Full Architecture End-to-End ───
+
+function benchArchCPU(model, rows, cols, numGames) {
+  // Current CPU pipeline: JS spread + upload + predict + dataSync + JS softmax + apply
+  var size = rows * cols;
+  var boards = [];
+  for (var g = 0; g < numGames; g++) boards.push(randomBoard(size));
+
+  return measureGPU(function() {
+    // Spread (JS)
+    for (var g = 0; g < numGames; g++) boards[g] = spreadPlague(boards[g], rows, cols);
+    // Upload
+    var flat = new Float32Array(numGames * size);
+    for (var g = 0; g < numGames; g++)
+      for (var i = 0; i < size; i++) flat[g * size + i] = boards[g][i];
+    var input = tf.tensor2d(flat, [numGames, size]);
+    // Forward
+    var out = model.predict(input);
+    // Readback
+    var logitsAll = out.dataSync();
+    out.dispose(); input.dispose();
+    // JS action select
+    for (var g = 0; g < numGames; g++) {
+      var logits = logitsAll.subarray(g * (size + 1), g * (size + 1) + size);
+      var mask = new Float32Array(size);
+      for (var i = 0; i < size; i++) mask[i] = boards[g][i] === 0 ? 1 : 0;
+      var probs = maskedSoftmax(logits, mask);
+      sinkValue(probs);
+    }
+    // Second spread
+    for (var g = 0; g < numGames; g++) boards[g] = spreadPlague(boards[g], rows, cols);
+  });
+}
+
+function benchArchGPUAction(model, rows, cols, numGames) {
+  // JS spread + upload + predict + GPU softmax+argmax + dataSync indices only
+  var size = rows * cols;
+  var boards = [];
+  for (var g = 0; g < numGames; g++) boards.push(randomBoard(size));
+
+  return measureGPU(function() {
+    // Spread (JS)
+    for (var g = 0; g < numGames; g++) boards[g] = spreadPlague(boards[g], rows, cols);
+    // Upload
+    var flat = new Float32Array(numGames * size);
+    var maskData = new Float32Array(numGames * size);
+    for (var g = 0; g < numGames; g++) {
+      for (var i = 0; i < size; i++) {
+        flat[g * size + i] = boards[g][i];
+        maskData[g * size + i] = boards[g][i] === 0 ? 1 : 0;
+      }
+    }
+    var input = tf.tensor2d(flat, [numGames, size]);
+    var mask = tf.tensor2d(maskData, [numGames, size]);
+    // Forward
+    var combined = model.predict(input);
+    var logits = combined.slice([0, 0], [-1, size]);
+    // GPU action select
+    var maskedLogits = logits.add(mask.sub(1).mul(1e9));
+    var actions = tf.multinomial(maskedLogits, 2).slice([0, 1], [-1, 1]).squeeze([1]);
+    sinkValue(actions.dataSync()); // Only indices (~160B)
+    combined.dispose(); logits.dispose(); maskedLogits.dispose();
+    actions.dispose(); input.dispose(); mask.dispose();
+    // Second spread (JS)
+    for (var g = 0; g < numGames; g++) boards[g] = spreadPlague(boards[g], rows, cols);
+  });
+}
+
+function benchArchFullGPU(model, rows, cols, numGames) {
+  // All GPU: conv2d spread + predict + GPU action + oneHot apply (no dataSync except game-over)
+  var size = rows * cols;
+  var kernel = tf.tensor4d([0, 1, 0, 1, 0, 1, 0, 1, 0], [3, 3, 1, 1]);
+  var state = tf.randomUniform([numGames, size], -1, 1).sign();
+
+  var result = measureGPU(function() {
+    // GPU spread
+    var grid = state.reshape([numGames, rows, cols, 1]);
+    var neighborSum = tf.conv2d(grid, kernel, 1, 'same');
+    var rand = tf.randomUniform(neighborSum.shape);
+    var weighted = neighborSum.mul(rand).mul(2);
+    var emptyMask = grid.equal(0).cast('float32');
+    var newVals = weighted.sign().mul(emptyMask);
+    var occupied = grid.mul(tf.scalar(1).sub(emptyMask));
+    var newState = occupied.add(newVals).reshape([numGames, size]);
+
+    // Forward (state already on GPU)
+    var combined = model.predict(newState);
+    var logits = combined.slice([0, 0], [-1, size]);
+
+    // GPU action select
+    var moveMask = newState.equal(0).cast('float32');
+    var maskedLogits = logits.add(moveMask.sub(1).mul(1e9));
+    var actions = tf.multinomial(maskedLogits, 2).slice([0, 1], [-1, 1]).squeeze([1]);
+
+    // Apply move (oneHot scatter)
+    var moveOneHot = tf.oneHot(actions.cast('int32'), size);
+    var finalState = newState.add(moveOneHot);
+
+    // Game-over check: only transfer (~160B)
+    var emptyCounts = finalState.equal(0).cast('float32').sum(1);
+    sinkValue(emptyCounts.dataSync());
+
+    newState.dispose(); combined.dispose(); logits.dispose();
+    moveMask.dispose(); maskedLogits.dispose(); actions.dispose();
+    moveOneHot.dispose(); finalState.dispose(); emptyCounts.dispose();
+  });
+
+  state.dispose();
+  kernel.dispose();
+  return result;
+}
+
 // ═══════════════════════════════════
 //  Backend orchestration
 // ═══════════════════════════════════
@@ -379,7 +764,8 @@ async function benchmarkBackend(backend, onProgress) {
   await sleep(100);
 
   var r = { backend: backend };
-  var totalSteps = BOARD_CONFIGS.length * (3 + BATCH_SIZES.length * 2 + 3);
+  // Original steps + architecture benchmark steps
+  var totalSteps = BOARD_CONFIGS.length * (3 + BATCH_SIZES.length * 2 + 3 + 12);
   var step = 0;
 
   for (var bi = 0; bi < BOARD_CONFIGS.length; bi++) {
@@ -436,6 +822,74 @@ async function benchmarkBackend(backend, onProgress) {
     status(backend + ' | ' + key + ' | full tick (40 games)...');
     await sleep(10);
     r['tick_' + key] = await benchFullTick(denseModel, bc.rows, bc.cols, 40);
+    step++; onProgress(step, totalSteps);
+
+    // ─── Pipeline Decomposition (per batch size) ───
+    for (var pi = 0; pi < PIPELINE_BATCHES.length; pi++) {
+      var pb = PIPELINE_BATCHES[pi];
+
+      status(backend + ' | ' + key + ' | upload b=' + pb + '...');
+      await sleep(10);
+      r['pipe_upload_' + key + '_b' + pb] = await benchUpload(size, pb);
+      step++; onProgress(step, totalSteps);
+
+      status(backend + ' | ' + key + ' | forward-only b=' + pb + '...');
+      await sleep(10);
+      r['pipe_fwdonly_' + key + '_b' + pb] = await benchForwardNoSync(denseModel, size, pb);
+      step++; onProgress(step, totalSteps);
+
+      status(backend + ' | ' + key + ' | readback b=' + pb + '...');
+      await sleep(10);
+      r['pipe_readback_' + key + '_b' + pb] = await benchReadback(size, pb);
+      step++; onProgress(step, totalSteps);
+    }
+
+    if (backend === 'cpu' || !results['cpu']) {
+      status(backend + ' | ' + key + ' | JS action select b=40...');
+      await sleep(10);
+      r['pipe_jsaction_' + key] = await benchActionSelectJS(size, 40);
+      step++; onProgress(step, totalSteps);
+    } else {
+      r['pipe_jsaction_' + key] = results['cpu']['pipe_jsaction_' + key];
+      step++; onProgress(step, totalSteps);
+    }
+
+    status(backend + ' | ' + key + ' | GPU action pipeline b=40...');
+    await sleep(10);
+    r['pipe_gpuaction_' + key] = await benchGPUActionPipeline(denseModel, size, 40);
+    step++; onProgress(step, totalSteps);
+
+    // ─── GPU Game Ops ───
+    status(backend + ' | ' + key + ' | GPU plague spread (conv2d, 40 games)...');
+    await sleep(10);
+    r['spread_gpu_' + key] = await benchSpreadGPU(bc.rows, bc.cols, 40);
+    step++; onProgress(step, totalSteps);
+
+    // ─── Rendering Comparison ───
+    status(backend + ' | ' + key + ' | tf.browser.draw...');
+    await sleep(10);
+    r['render_browserdraw_' + key] = await benchRenderBrowserDraw(bc.rows, bc.cols);
+    step++; onProgress(step, totalSteps);
+
+    status(backend + ' | ' + key + ' | WebGPU render...');
+    await sleep(10);
+    r['render_webgpu_' + key] = await benchRenderWebGPU(bc.rows, bc.cols);
+    step++; onProgress(step, totalSteps);
+
+    // ─── Full Architecture End-to-End ───
+    status(backend + ' | ' + key + ' | Arch: CPU pipeline...');
+    await sleep(10);
+    r['arch_cpu_' + key] = await benchArchCPU(denseModel, bc.rows, bc.cols, 40);
+    step++; onProgress(step, totalSteps);
+
+    status(backend + ' | ' + key + ' | Arch: GPU action only...');
+    await sleep(10);
+    r['arch_gpuaction_' + key] = await benchArchGPUAction(denseModel, bc.rows, bc.cols, 40);
+    step++; onProgress(step, totalSteps);
+
+    status(backend + ' | ' + key + ' | Arch: Full GPU...');
+    await sleep(10);
+    r['arch_fullgpu_' + key] = await benchArchFullGPU(denseModel, bc.rows, bc.cols, 40);
     step++; onProgress(step, totalSteps);
 
     denseModel.dispose();
@@ -550,6 +1004,36 @@ function renderResults() {
       });
       html += row('Spatial train (b=64)', function(r) { return r['spatial_train_' + key + '_b64']; });
     }
+
+    // ─── Pipeline Decomposition ───
+    html += sectionRow('Pipeline Decomposition: ' + key);
+
+    PIPELINE_BATCHES.forEach(function(pb) {
+      var bytes = pb * size * 4;
+      html += row('Upload CPU\u2192GPU (' + fmtBytes(bytes) + ', b=' + pb + ')', function(r) { return r['pipe_upload_' + key + '_b' + pb]; });
+      html += row('Forward kernel (no sync, b=' + pb + ')', function(r) { return r['pipe_fwdonly_' + key + '_b' + pb]; });
+      var outBytes = pb * (size + 1) * 4;
+      html += row('Readback GPU\u2192CPU (' + fmtBytes(outBytes) + ', b=' + pb + ')', function(r) { return r['pipe_readback_' + key + '_b' + pb]; });
+    });
+    html += row('JS action select (CPU, b=40)', function(r) { return r['pipe_jsaction_' + key]; });
+    html += row('GPU softmax+argmax (' + fmtBytes(40 * 4) + ' back, b=40)', function(r) { return r['pipe_gpuaction_' + key]; });
+
+    // ─── GPU Game Ops ───
+    html += sectionRow('GPU Game Ops: ' + key + ' (40 games)');
+    html += row('Plague spread (JS, per game)', function(r) { return r['spread_' + key]; });
+    html += row('Plague spread (GPU conv2d, 40)', function(r) { return r['spread_gpu_' + key]; });
+
+    // ─── Rendering ───
+    html += sectionRow('Rendering: ' + key);
+    html += row('Canvas 2D (CPU)', function(r) { return r['render_' + key]; });
+    html += row('tf.browser.draw (GPU direct)', function(r) { return r['render_browserdraw_' + key]; });
+    html += row('dataToGPU + WebGPU render', function(r) { return r['render_webgpu_' + key]; });
+
+    // ─── Full Architecture ───
+    html += sectionRow('Full Architecture: ' + key + ' (40 games)');
+    html += row('Arch: CPU game + GPU NN', function(r) { return r['arch_cpu_' + key]; });
+    html += row('Arch: GPU action select', function(r) { return r['arch_gpuaction_' + key]; });
+    html += row('Arch: Full GPU pipeline', function(r) { return r['arch_fullgpu_' + key]; });
   });
 
   html += '</tbody></table>';
