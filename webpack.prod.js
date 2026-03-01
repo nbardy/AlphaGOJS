@@ -1,33 +1,23 @@
 const path = require('path');
 const HtmlWebpackPlugin = require('html-webpack-plugin');
-const CleanWebpackPlugin = require('clean-webpack-plugin');
-const webpack = require('webpack');
+const CopyPlugin = require('copy-webpack-plugin');
 
 module.exports = {
-  entry: ["babel-polyfill", './src/app.js'],
+  entry: './src/app.js',
   output: {
     path: path.resolve(__dirname, 'docs'),
-    filename: 'app.bundle.js'
+    filename: 'app.bundle.js',
+    clean: true
   },
   plugins: [
-    new CleanWebpackPlugin(['docs']),
     new HtmlWebpackPlugin({
       title: 'AlphaPlague - Self-Play RL'
+    }),
+    new CopyPlugin({
+      patterns: [
+        { from: 'bench.html', to: 'bench.html' }
+      ]
     })
   ],
-  mode: 'production',
-  module: {
-    rules: [
-      {
-        test: /\.js$/,
-        exclude: /(node_modules|bower_components)/,
-        use: {
-          loader: 'babel-loader',
-          options: {
-            presets: ['es2017']
-          }
-        }
-      }
-    ]
-  }
+  mode: 'production'
 };

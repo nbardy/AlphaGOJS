@@ -22,15 +22,13 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '18'
+          node-version: '22'
 
       - name: Install dependencies
-        run: |
-          yarn install
-          npm install webpack@4.19.1 --no-save
+        run: npm ci
 
       - name: Build
-        run: NODE_OPTIONS=--openssl-legacy-provider npx webpack --config webpack.prod.js
+        run: npm run build
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
