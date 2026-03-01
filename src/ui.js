@@ -27,6 +27,7 @@ export class UI {
 
     this.metrics = new MetricsLog(500);
     this.lastGeneration = -1;
+    this._chartsDirty = true;
     this.charts = {};
 
     this._buildDOM();
@@ -375,7 +376,7 @@ export class UI {
     document.getElementById('sloss').textContent = s.loss ? s.loss.toFixed(4) : '\u2014';
     document.getElementById('slen').textContent = s.avgGameLength ? s.avgGameLength.toFixed(1) : '\u2014';
 
-    // Detect generation change → snapshot metrics + run eval
+    // Detect generation change → snapshot metrics (eval runs async)
     if (s.generation > this.lastGeneration && s.generation > 0) {
       this.lastGeneration = s.generation;
       this._snapshotMetrics(s);
@@ -390,25 +391,35 @@ export class UI {
       var p1Pct = totalSelf > 0 ? (s.p1Wins / totalSelf * 100).toFixed(0) : '\u2014';
       document.getElementById('sp1pct').textContent = p1Pct + '%';
     }
-
-    this._renderCharts();
   }
 
   _snapshotMetrics(stats) {
-    var evalResult = evaluateVsRandom(this.algo, this.rows, this.cols, 10);
     var entropy = this.algo.lastEntropy || 0;
     var totalSelf = stats.p1Wins + stats.p2Wins + stats.draws;
     var selfP1Rate = totalSelf > 0 ? stats.p1Wins / totalSelf : 0.5;
 
-    this.metrics.push({
+    // Snapshot without eval first (non-blocking)
+    var entry = {
       generation: stats.generation,
       loss: stats.loss,
-      winRateVsRandom: evalResult.winRate,
+      winRateVsRandom: this.metrics.length > 0 ? this.metrics.last().winRateVsRandom : 0,
       selfPlayP1Rate: selfP1Rate,
       entropy: entropy,
       avgGameLength: stats.avgGameLength,
       bufferSize: stats.bufferSize
-    });
+    };
+    this.metrics.push(entry);
+    this._chartsDirty = true;
+
+    // Run eval every 5 generations, async via setTimeout to not block training
+    if (stats.generation % 5 === 0) {
+      var self = this;
+      setTimeout(function () {
+        var evalResult = evaluateVsRandom(self.algo, self.rows, self.cols, 4);
+        entry.winRateVsRandom = evalResult.winRate;
+        self._chartsDirty = true;
+      }, 0);
+    }
   }
 
   _renderCharts() {
@@ -459,6 +470,10 @@ export class UI {
           self._renderGrid();
         }
         self._updateStats();
+        if (self._chartsDirty) {
+          self._chartsDirty = false;
+          self._renderCharts();
+        }
         errorCount = 0;
       } catch (e) {
         errorCount++;
