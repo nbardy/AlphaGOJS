@@ -28,6 +28,7 @@ export class PPO {
     this.minibatchSize = 64;
     this.valueLossCoeff = 0.5;
     this.entropyCoeff = 0.01;
+    this.lastEntropy = 0;
   }
 
   /**
@@ -117,7 +118,8 @@ export class PPO {
         action: steps[t].action,
         oldLogProb: steps[t].logProb,
         advantage: advantages[t],
-        returnVal: returns[t]
+        returnVal: returns[t],
+        mask: steps[t].mask
       });
     }
 
@@ -148,6 +150,7 @@ export class PPO {
     var oldLogProbsArr = new Float32Array(n);
     var advantagesArr = new Float32Array(n);
     var returnsArr = new Float32Array(n);
+    var masksArr = [];
 
     for (var i = 0; i < n; i++) {
       statesArr.push(batch[i].state);
@@ -155,6 +158,7 @@ export class PPO {
       oldLogProbsArr[i] = batch[i].oldLogProb;
       advantagesArr[i] = batch[i].advantage;
       returnsArr[i] = batch[i].returnVal;
+      masksArr.push(batch[i].mask);
     }
 
     // Normalize advantages
@@ -195,6 +199,7 @@ export class PPO {
         var mbReturns = new Float32Array(mbSize);
         var mbGatherIndices = new Int32Array(mbSize);
 
+        var mbValidMask = new Float32Array(mbSize * boardSize);
         for (var mi = 0; mi < mbSize; mi++) {
           var idx = mbIndices[mi];
           mbActionMask[mi * boardSize + actionsArr[idx]] = 1;
@@ -202,6 +207,9 @@ export class PPO {
           mbAdvantages[mi] = advantagesArr[idx];
           mbReturns[mi] = returnsArr[idx];
           mbGatherIndices[mi] = idx;
+          for (var mj = 0; mj < boardSize; mj++) {
+            mbValidMask[mi * boardSize + mj] = masksArr[idx][mj];
+          }
         }
 
         // Gather states for this minibatch
@@ -210,6 +218,7 @@ export class PPO {
         var oldLogProbsT = tf.tensor1d(mbOldLogProbs);
         var advantagesT = tf.tensor1d(mbAdvantages);
         var returnsT = tf.tensor1d(mbReturns);
+        var validMaskT = tf.tensor2d(mbValidMask, [mbSize, boardSize]);
 
         try {
           var loss = self.optimizer.minimize(function () {
@@ -219,7 +228,10 @@ export class PPO {
             var combined = self.model.model.predict(mbStates);
             var policyLogits = combined.slice([0, 0], [-1, boardSize]);
             var valuesPred = combined.slice([0, boardSize], [-1, 1]).squeeze([1]);
-            var probs = policyLogits.softmax();
+            // Mask invalid moves: set their logits to -1e9 before softmax
+            // so training matches inference (which uses maskedSoftmax).
+            var maskedLogits = policyLogits.add(validMaskT.sub(1).mul(1e9));
+            var probs = maskedLogits.softmax();
             var selectedProbs = probs.mul(actionMaskT).sum(1);
             var newLogProbs = selectedProbs.add(tf.scalar(1e-8)).log();
 
@@ -232,8 +244,9 @@ export class PPO {
             // Value loss (MSE)
             var valueLoss = returnsT.sub(valuesPred).square().mean();
 
-            // Entropy bonus
+            // Entropy bonus (only over valid moves, already masked)
             var entropy = probs.add(tf.scalar(1e-8)).log().mul(probs).sum(1).mean().neg();
+            self.lastEntropy = entropy.dataSync()[0];
 
             return policyLoss
               .add(valueLoss.mul(tf.scalar(self.valueLossCoeff)))
@@ -254,6 +267,7 @@ export class PPO {
         oldLogProbsT.dispose();
         advantagesT.dispose();
         returnsT.dispose();
+        validMaskT.dispose();
       }
     }
 

@@ -61,7 +61,7 @@ export class SelfPlayTrainer {
         gi = idx1[j];
         this.games[gi].game.makeMove(1, results1[j].action);
         // Store state + player + all algo metadata (logProb, value for PPO, etc.)
-        var entry = { state: s1[j], player: 1 };
+        var entry = { state: s1[j], player: 1, mask: m1[j] };
         Object.assign(entry, results1[j]);
         this.games[gi].history.push(entry);
       }
@@ -84,7 +84,7 @@ export class SelfPlayTrainer {
       for (j = 0; j < idx2.length; j++) {
         gi = idx2[j];
         this.games[gi].game.makeMove(-1, results2[j].action);
-        var entry2 = { state: s2[j], player: -1 };
+        var entry2 = { state: s2[j], player: -1, mask: m2[j] };
         Object.assign(entry2, results2[j]);
         this.games[gi].history.push(entry2);
       }

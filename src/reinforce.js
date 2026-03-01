@@ -14,6 +14,7 @@ export class Reinforce {
     this.trainSteps = 0;
     this.buffer = [];
     this.maxBufferSize = 10000;
+    this.lastEntropy = 0;
   }
 
   /**
@@ -61,7 +62,7 @@ export class Reinforce {
     for (var k = 0; k < trajectory.length; k++) {
       var step = trajectory[k];
       var reward = (step.player === winner) ? 1 : (winner === 0 ? 0 : -1);
-      this.buffer.push({ state: step.state, action: step.action, reward: reward });
+      this.buffer.push({ state: step.state, action: step.action, reward: reward, mask: step.mask });
     }
     if (this.buffer.length > this.maxBufferSize) {
       this.buffer = this.buffer.slice(-this.maxBufferSize);
@@ -87,10 +88,12 @@ export class Reinforce {
     var statesArr = [];
     var actionsArr = [];
     var rewardsArr = [];
+    var masksArr = [];
     for (var i = 0; i < n; i++) {
       statesArr.push(batch[i].state);
       actionsArr.push(batch[i].action);
       rewardsArr.push(batch[i].reward);
+      masksArr.push(batch[i].mask);
     }
 
     var statesTensor = tf.tensor2d(flattenStates(statesArr, boardSize), [n, boardSize]);
@@ -101,6 +104,15 @@ export class Reinforce {
     }
     var actionMaskTensor = tf.tensor2d(actionMaskData, [n, boardSize]);
     var rewardsTensor = tf.tensor1d(rewardsArr);
+
+    // Build valid-move mask tensor: invalid moves get logit = -1e9
+    var validMaskData = new Float32Array(n * boardSize);
+    for (var i = 0; i < n; i++) {
+      for (var j = 0; j < boardSize; j++) {
+        validMaskData[i * boardSize + j] = masksArr[i][j];
+      }
+    }
+    var validMaskTensor = tf.tensor2d(validMaskData, [n, boardSize]);
 
     var lossVal = 0;
     var self = this;
@@ -113,11 +125,15 @@ export class Reinforce {
         // will clean them up automatically after gradients are computed.
         var combined = self.model.model.predict(statesTensor);
         var policyLogits = combined.slice([0, 0], [-1, boardSize]);
-        var preds = policyLogits.softmax();
+        // Mask invalid moves: set their logits to -1e9 before softmax
+        // so training matches inference (which uses maskedSoftmax).
+        var maskedLogits = policyLogits.add(validMaskTensor.sub(1).mul(1e9));
+        var preds = maskedLogits.softmax();
         var selectedProbs = preds.mul(actionMaskTensor).sum(1);
         var logProbs = selectedProbs.add(tf.scalar(1e-8)).log();
         var policyLoss = logProbs.mul(rewardsTensor).mean().neg();
         var entropy = preds.add(tf.scalar(1e-8)).log().mul(preds).sum(1).mean().neg();
+        self.lastEntropy = entropy.dataSync()[0];
         return policyLoss.sub(entropy.mul(tf.scalar(0.01)));
       }, true);
 
@@ -132,6 +148,7 @@ export class Reinforce {
     statesTensor.dispose();
     actionMaskTensor.dispose();
     rewardsTensor.dispose();
+    validMaskTensor.dispose();
     self.trainSteps++;
     return lossVal;
   }

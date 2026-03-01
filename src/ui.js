@@ -1,4 +1,7 @@
 import { Game } from './game';
+import { MetricsLog } from './metrics';
+import { evaluateVsRandom } from './eval';
+import { createChartCanvas, drawLineChart } from './charts';
 
 export class UI {
   constructor(trainer, algo) {
@@ -21,6 +24,10 @@ export class UI {
     this.ticksPerFrame = 1;
     this.paused = false;
     this._destroyed = false;
+
+    this.metrics = new MetricsLog(500);
+    this.lastGeneration = -1;
+    this.charts = {};
 
     this._buildDOM();
     this._startLoop();
@@ -65,7 +72,11 @@ export class UI {
       '.sg { color:#00ff88; }',
       '.sr { color:#ff3366; }',
       '.controls-row { margin-top:12px; }',
-      '.controls-row button { margin:0 5px; }'
+      '.controls-row button { margin:0 5px; }',
+      '#charts-section { margin-top:20px; }',
+      '#charts-section h2 { font-size:15px; color:#4488ff; margin-bottom:10px; text-align:center; }',
+      '#charts-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; max-width:820px; margin:0 auto; }',
+      '@media (max-width:600px) { #charts-grid { grid-template-columns:1fr; } }'
     ].join('\n');
     document.head.appendChild(style);
   }
@@ -86,8 +97,9 @@ export class UI {
       + '<div class="stat"><div class="label">Gen</div><div class="value" id="sgen">0</div></div>'
       + '<div class="stat"><div class="label">Loss</div><div class="value" id="sloss">&mdash;</div></div>'
       + '<div class="stat"><div class="label">Avg Len</div><div class="value" id="slen">&mdash;</div></div>'
-      + '<div class="stat"><div class="label">P1 Wins</div><div class="value sg" id="sp1">0</div></div>'
-      + '<div class="stat"><div class="label">P2 Wins</div><div class="value sr" id="sp2">0</div></div>'
+      + '<div class="stat"><div class="label">vs Random</div><div class="value sg" id="srand">&mdash;</div></div>'
+      + '<div class="stat"><div class="label">Self P1%</div><div class="value" id="sp1pct">&mdash;</div></div>'
+      + '<div class="stat"><div class="label">Entropy</div><div class="value" id="sentr">&mdash;</div></div>'
       + '</div>';
     app.appendChild(header);
 
@@ -153,6 +165,29 @@ export class UI {
     }
     trainSection.appendChild(grid);
     app.appendChild(trainSection);
+
+    // Charts section
+    var chartsSection = document.createElement('div');
+    chartsSection.id = 'charts-section';
+    chartsSection.innerHTML = '<h2>Training Metrics</h2>';
+    var chartsGrid = document.createElement('div');
+    chartsGrid.id = 'charts-grid';
+
+    var chartDefs = [
+      { key: 'winRate', title: 'Win Rate vs Random' },
+      { key: 'selfPlay', title: 'Self-Play P1 Win%' },
+      { key: 'loss', title: 'Training Loss' },
+      { key: 'entropy', title: 'Policy Entropy' },
+      { key: 'avgLen', title: 'Avg Game Length' }
+    ];
+    this.charts = {};
+    for (var ci = 0; ci < chartDefs.length; ci++) {
+      var cc = createChartCanvas();
+      chartsGrid.appendChild(cc);
+      this.charts[chartDefs[ci].key] = cc;
+    }
+    chartsSection.appendChild(chartsGrid);
+    app.appendChild(chartsSection);
 
     // Human play section
     var humanSection = document.createElement('div');
@@ -336,8 +371,74 @@ export class UI {
     document.getElementById('sgen').textContent = s.generation;
     document.getElementById('sloss').textContent = s.loss ? s.loss.toFixed(4) : '\u2014';
     document.getElementById('slen').textContent = s.avgGameLength ? s.avgGameLength.toFixed(1) : '\u2014';
-    document.getElementById('sp1').textContent = s.p1Wins;
-    document.getElementById('sp2').textContent = s.p2Wins;
+
+    // Detect generation change → snapshot metrics + run eval
+    if (s.generation > this.lastGeneration && s.generation > 0) {
+      this.lastGeneration = s.generation;
+      this._snapshotMetrics(s);
+    }
+
+    // Update stat bar from latest metrics
+    var last = this.metrics.last();
+    if (last) {
+      document.getElementById('srand').textContent = (last.winRateVsRandom * 100).toFixed(0) + '%';
+      document.getElementById('sentr').textContent = last.entropy.toFixed(3);
+      var totalSelf = s.p1Wins + s.p2Wins + s.draws;
+      var p1Pct = totalSelf > 0 ? (s.p1Wins / totalSelf * 100).toFixed(0) : '\u2014';
+      document.getElementById('sp1pct').textContent = p1Pct + '%';
+    }
+
+    this._renderCharts();
+  }
+
+  _snapshotMetrics(stats) {
+    var evalResult = evaluateVsRandom(this.algo, this.rows, this.cols, 10);
+    var entropy = this.algo.lastEntropy || 0;
+    var totalSelf = stats.p1Wins + stats.p2Wins + stats.draws;
+    var selfP1Rate = totalSelf > 0 ? stats.p1Wins / totalSelf : 0.5;
+
+    this.metrics.push({
+      generation: stats.generation,
+      loss: stats.loss,
+      winRateVsRandom: evalResult.winRate,
+      selfPlayP1Rate: selfP1Rate,
+      entropy: entropy,
+      avgGameLength: stats.avgGameLength,
+      bufferSize: stats.bufferSize
+    });
+  }
+
+  _renderCharts() {
+    if (this.metrics.length === 0) return;
+
+    drawLineChart(this.charts.winRate, this.metrics.getSeries('winRateVsRandom').map(function (v) { return v * 100; }), {
+      title: 'Win Rate vs Random (%)',
+      color: '#00ff88',
+      minY: 0,
+      maxY: 100,
+      refLine: 50,
+      refColor: '#444466'
+    });
+    drawLineChart(this.charts.selfPlay, this.metrics.getSeries('selfPlayP1Rate').map(function (v) { return v * 100; }), {
+      title: 'Self-Play P1 Win% (expect ~50%)',
+      color: '#4488ff',
+      minY: 0,
+      maxY: 100,
+      refLine: 50,
+      refColor: '#444466'
+    });
+    drawLineChart(this.charts.loss, this.metrics.getSeries('loss'), {
+      title: 'Training Loss',
+      color: '#ffcc00'
+    });
+    drawLineChart(this.charts.entropy, this.metrics.getSeries('entropy'), {
+      title: 'Policy Entropy',
+      color: '#ff66aa'
+    });
+    drawLineChart(this.charts.avgLen, this.metrics.getSeries('avgGameLength'), {
+      title: 'Avg Game Length',
+      color: '#66ccff'
+    });
   }
 
   _startLoop() {
