@@ -15,8 +15,11 @@ export function createChartCanvas() {
   canvas.width = CHART_WIDTH;
   canvas.height = CHART_HEIGHT;
   canvas.style.display = 'block';
+  canvas.style.width = '100%';
+  canvas.style.height = 'auto';
   canvas.style.borderRadius = '6px';
   canvas.style.border = '1px solid ' + CHART_BORDER;
+  canvas.style.background = CHART_BG;
   return canvas;
 }
 

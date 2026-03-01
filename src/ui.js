@@ -189,6 +189,9 @@ export class UI {
     chartsSection.appendChild(chartsGrid);
     app.appendChild(chartsSection);
 
+    // Draw initial empty state on all charts
+    this._renderCharts();
+
     // Human play section
     var humanSection = document.createElement('div');
     humanSection.id = 'human-section';
@@ -409,9 +412,9 @@ export class UI {
   }
 
   _renderCharts() {
-    if (this.metrics.length === 0) return;
+    var data = this.metrics.length > 0;
 
-    drawLineChart(this.charts.winRate, this.metrics.getSeries('winRateVsRandom').map(function (v) { return v * 100; }), {
+    drawLineChart(this.charts.winRate, data ? this.metrics.getSeries('winRateVsRandom').map(function (v) { return v * 100; }) : [], {
       title: 'Win Rate vs Random (%)',
       color: '#00ff88',
       minY: 0,
@@ -419,7 +422,7 @@ export class UI {
       refLine: 50,
       refColor: '#444466'
     });
-    drawLineChart(this.charts.selfPlay, this.metrics.getSeries('selfPlayP1Rate').map(function (v) { return v * 100; }), {
+    drawLineChart(this.charts.selfPlay, data ? this.metrics.getSeries('selfPlayP1Rate').map(function (v) { return v * 100; }) : [], {
       title: 'Self-Play P1 Win% (expect ~50%)',
       color: '#4488ff',
       minY: 0,
@@ -427,15 +430,15 @@ export class UI {
       refLine: 50,
       refColor: '#444466'
     });
-    drawLineChart(this.charts.loss, this.metrics.getSeries('loss'), {
+    drawLineChart(this.charts.loss, data ? this.metrics.getSeries('loss') : [], {
       title: 'Training Loss',
       color: '#ffcc00'
     });
-    drawLineChart(this.charts.entropy, this.metrics.getSeries('entropy'), {
+    drawLineChart(this.charts.entropy, data ? this.metrics.getSeries('entropy') : [], {
       title: 'Policy Entropy',
       color: '#ff66aa'
     });
-    drawLineChart(this.charts.avgLen, this.metrics.getSeries('avgGameLength'), {
+    drawLineChart(this.charts.avgLen, data ? this.metrics.getSeries('avgGameLength') : [], {
       title: 'Avg Game Length',
       color: '#66ccff'
     });
