@@ -174,9 +174,9 @@ export class SelfPlayTrainer {
       }
     }
 
-    var now = Date.now();
+    // Immediate restart — no dead-slot delay (was 300ms, bottleneck at scale).
     for (var i = 0; i < this.numGames; i++) {
-      if (this.games[i].done && now - this.games[i].doneTime > 300) {
+      if (this.games[i].done) {
         this.games[i] = this._newSlot();
       }
     }

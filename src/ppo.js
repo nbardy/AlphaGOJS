@@ -19,7 +19,7 @@ export class PPO {
     this.optimizer = tf.train.adam(0.0003);
     this.trainSteps = 0;
     this.buffer = [];
-    this.maxBufferSize = 10000;
+    this.maxBufferSize = 20000;
 
     // PPO hyperparameters
     this.epsilon = 0.2;

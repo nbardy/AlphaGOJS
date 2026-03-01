@@ -10,7 +10,7 @@ import { UI } from './ui';
 // --- Configuration ---
 var ROWS = 10;
 var COLS = 10;
-var NUM_GAMES = 40;
+var NUM_GAMES = 80;
 
 // --- Thin dispatchers (One Clean Path: one handler per type, exhaustive) ---
 
@@ -40,8 +40,8 @@ function createCPUPipeline(modelType, algoType, rows, cols, numGames) {
     numGames: numGames,
     rows: rows,
     cols: cols,
-    trainBatchSize: 256,
-    trainInterval: 20,
+    trainBatchSize: 512,
+    trainInterval: 30,
     checkpointPool: pool
   });
   return { trainer: trainer, algo: algo, pool: pool, pipelineType: 'cpu' };
@@ -58,8 +58,8 @@ function createGPUPipeline(modelType, rows, cols, numGames) {
     numGames: numGames,
     rows: rows,
     cols: cols,
-    trainBatchSize: 256,
-    trainInterval: 20,
+    trainBatchSize: 512,
+    trainInterval: 30,
     checkpointPool: pool
   });
   return { trainer: trainer, algo: null, pool: pool, pipelineType: 'gpu' };

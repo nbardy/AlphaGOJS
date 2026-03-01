@@ -2,7 +2,7 @@ import * as tf from '@tensorflow/tfjs';
 
 // Dense (MLP) model for the plague game.
 // Pure forward pass — no optimizer, no training logic.
-// Architecture: [boardSize] → Dense(256,relu) → Dense(128,relu) → policy(boardSize) + value(1)
+// Architecture: [boardSize] → Dense(256,relu) → Dense(256,relu) → policy(boardSize) + value(1)
 //
 // Policy + value are concatenated into a single output and split in forward().
 // Output layout: [boardSize logits, 1 value] = boardSize + 1 total units.
@@ -16,7 +16,7 @@ export class DenseModel {
   _build() {
     var input = tf.input({ shape: [this.boardSize] });
     var x = tf.layers.dense({ units: 256, activation: 'relu' }).apply(input);
-    x = tf.layers.dense({ units: 128, activation: 'relu' }).apply(x);
+    x = tf.layers.dense({ units: 256, activation: 'relu' }).apply(x);
 
     // Policy head: raw logits (no activation) for maskedSoftmax in algorithm
     var policy = tf.layers.dense({ units: this.boardSize }).apply(x);

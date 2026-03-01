@@ -25,6 +25,7 @@ export class UI {
     this.ticksPerFrame = 1;
     this.paused = false;
     this._destroyed = false;
+    this._frameCount = 0;  // For stats throttling and render-skipping
 
     this.metrics = new MetricsLog(500);
     this.lastGeneration = -1;
@@ -139,7 +140,7 @@ export class UI {
     // Header
     var header = document.createElement('header');
     header.innerHTML = '<h1>AlphaPlague</h1>'
-      + '<div class="subtitle">Self-play RL on a plague territory game &mdash; watch 40 games train live</div>'
+      + '<div class="subtitle">Self-play RL on a plague territory game &mdash; watch 80 games train live</div>'
       + '<div id="stats">'
       + '<div class="stat"><div class="label">Games</div><div class="value" id="sg">0</div></div>'
       + '<div class="stat"><div class="label">Gen</div><div class="value" id="sgen">0</div></div>'
@@ -392,16 +393,49 @@ export class UI {
 
   _drawBoard(canvas, board, rows, cols, cs) {
     var ctx = canvas.getContext('2d');
-    ctx.fillStyle = '#0d0d22';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    var gap = cs > 10 ? 1 : 0;
-    for (var r = 0; r < rows; r++) {
-      for (var c = 0; c < cols; c++) {
-        var val = board[r * cols + c];
-        if (val === 1) ctx.fillStyle = '#00ff88';
-        else if (val === -1) ctx.fillStyle = '#ff3366';
-        else ctx.fillStyle = '#1e1e3a';
-        ctx.fillRect(c * cs + gap, r * cs + gap, cs - gap * 2, cs - gap * 2);
+    if (cs <= 10) {
+      // Fast path: ImageData for small cells (training grid).
+      // Single putImageData vs rows*cols fillRect calls.
+      var w = cols * cs;
+      var h = rows * cs;
+      if (!canvas._imgData || canvas._imgData.width !== w) {
+        canvas._imgData = ctx.createImageData(w, h);
+      }
+      var data = canvas._imgData.data;
+      for (var r = 0; r < rows; r++) {
+        for (var c = 0; c < cols; c++) {
+          var val = board[r * cols + c];
+          var R, G, B;
+          if (val === 1) { R = 0; G = 255; B = 136; }
+          else if (val === -1) { R = 255; G = 51; B = 102; }
+          else { R = 30; G = 30; B = 58; }
+          // Fill cs×cs pixel block
+          for (var py = 0; py < cs; py++) {
+            var rowOffset = ((r * cs + py) * w + c * cs) * 4;
+            for (var px = 0; px < cs; px++) {
+              var idx = rowOffset + px * 4;
+              data[idx] = R;
+              data[idx + 1] = G;
+              data[idx + 2] = B;
+              data[idx + 3] = 255;
+            }
+          }
+        }
+      }
+      ctx.putImageData(canvas._imgData, 0, 0);
+    } else {
+      // Slow path for human play board (large cells, gap between cells)
+      ctx.fillStyle = '#0d0d22';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      var gap = 1;
+      for (var r = 0; r < rows; r++) {
+        for (var c = 0; c < cols; c++) {
+          var val = board[r * cols + c];
+          if (val === 1) ctx.fillStyle = '#00ff88';
+          else if (val === -1) ctx.fillStyle = '#ff3366';
+          else ctx.fillStyle = '#1e1e3a';
+          ctx.fillRect(c * cs + gap, r * cs + gap, cs - gap * 2, cs - gap * 2);
+        }
       }
     }
   }
@@ -543,10 +577,20 @@ export class UI {
             self.trainer.tick();
           }
         }
-        if (!self.humanPlaying) {
+        self._frameCount++;
+
+        // Adaptive render-skipping: at high speed, render grid less often.
+        // At 1x render every frame; at 10x+ render every 4th frame.
+        var renderSkip = self.ticksPerFrame > 5 ? 4 : 1;
+        if (!self.humanPlaying && (self._frameCount % renderSkip === 0)) {
           self._renderGrid();
         }
-        self._updateStats();
+
+        // Throttle stats DOM updates to every 10 frames
+        if (self._frameCount % 10 === 0) {
+          self._updateStats();
+        }
+
         if (self._chartsDirty) {
           self._chartsDirty = false;
           self._renderCharts();

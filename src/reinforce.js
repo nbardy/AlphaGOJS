@@ -13,7 +13,7 @@ export class Reinforce {
     this.optimizer = tf.train.adam(0.001);
     this.trainSteps = 0;
     this.buffer = [];
-    this.maxBufferSize = 10000;
+    this.maxBufferSize = 20000;
     this.lastEntropy = 0;
   }
 
