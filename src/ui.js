@@ -411,11 +411,13 @@ export class UI {
     this.metrics.push(entry);
     this._chartsDirty = true;
 
-    // Run eval every 5 generations, async via setTimeout to not block training
-    if (stats.generation % 5 === 0) {
+    // Run eval every 10 generations, async via setTimeout to not block training.
+    // Budget: ~1% of training compute. 2 games (1/side) ≈ 50 forward passes
+    // every 10 gens = 5/gen avg. Training ≈ 3000/gen. Cost: ~0.2%.
+    if (stats.generation % 10 === 0) {
       var self = this;
       setTimeout(function () {
-        var evalResult = evaluateVsRandom(self.algo, self.rows, self.cols, 4);
+        var evalResult = evaluateVsRandom(self.algo, self.rows, self.cols, 1);
         entry.winRateVsRandom = evalResult.winRate;
         self._chartsDirty = true;
       }, 0);
