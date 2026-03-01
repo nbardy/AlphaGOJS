@@ -49,7 +49,7 @@ export class GPUTrainer {
 
     // CPU experience buffer (same format as Reinforce)
     this.buffer = [];
-    this.maxBufferSize = 10000;
+    this.maxBufferSize = 20000;
 
     // Checkpoint pool for Elo tracking (optional, injected from app.js)
     this.checkpointPool = config.checkpointPool || null;
@@ -94,6 +94,11 @@ export class GPUTrainer {
     var canPlayArr = new Float32Array(N);
     for (var i = 0; i < N; i++) canPlayArr[i] = this.done[i] ? 0 : 1;
 
+    // Record PRE-MOVE state for trajectory — this is the state the agent sees
+    // when deciding. Must be captured before tidy applies the move.
+    var preMoveState = tf.keep(this.state.clone());
+
+    var actionsKept;
     var oldState = this.state;
     this.state = tf.tidy(function () {
       var canPlay = tf.tensor1d(canPlayArr);
@@ -113,6 +118,9 @@ export class GPUTrainer {
       // tf.multinomial WebGPU bug: first sample always 0. Request 2, take second.
       var actions = tf.multinomial(maskedLogits, 2).slice([0, 1], [-1, 1]).squeeze([1]);
 
+      // Keep action indices for trajectory recording (~320 bytes, not disposed by tidy)
+      actionsKept = tf.keep(actions.clone());
+
       // Apply move: oneHot scatter, only for active games with valid moves
       var moveOneHot = tf.oneHot(actions.cast('int32'), boardSize).mul(player);
       var newState = oldState.add(moveOneHot.mul(activeAndValid.expandDims(1)));
@@ -121,8 +129,8 @@ export class GPUTrainer {
     });
     oldState.dispose();
 
-    // Record snapshot for trajectory (outside tidy so we can tf.keep)
-    this._recordStep(player);
+    // Record pre-move state + actions for trajectory (outside tidy)
+    this._recordStep(player, preMoveState, actionsKept);
   }
 
   // ── GPU plague spread: conv2d neighbor sum + random ──
@@ -175,10 +183,13 @@ export class GPUTrainer {
 
   // ── Trajectory recording: GPU snapshots, CPU buffer ──
 
-  _recordStep(player) {
-    // Keep a clone of current state and record which generation each game is in
+  _recordStep(player, preMoveState, actions) {
+    // Store pre-move state + action indices for correct REINFORCE training.
+    // Pre-move state = what the agent saw when deciding (not post-move).
+    // Actions tensor = actual indices chosen by tf.multinomial.
     var snap = {
-      state: tf.keep(this.state.clone()),
+      state: preMoveState,
+      actions: actions,
       player: player,
       generations: Int32Array.from(this._gameGenerations)
     };
@@ -201,12 +212,25 @@ export class GPUTrainer {
       var stateData = stateSlice.dataSync();
       stateSlice.dispose();
 
+      // Apply perspective transform: model expects own pieces as positive.
+      // Raw board has P1=+1, P2=-1. Multiply by player so the agent's
+      // own pieces are always +1 (matches how inference does it).
       var state = new Float32Array(boardSize);
-      for (var j = 0; j < boardSize; j++) state[j] = stateData[j];
+      var mask = new Float32Array(boardSize);
+      for (var j = 0; j < boardSize; j++) {
+        state[j] = stateData[j] * snap.player;
+        mask[j] = stateData[j] === 0 ? 1 : 0;
+      }
+
+      // Download actual action index from the actions tensor
+      var actionData = snap.actions.dataSync();
+      var action = actionData[gameIndex];
 
       trajectory.push({
         state: state,
-        player: snap.player
+        action: action,
+        player: snap.player,
+        mask: mask
       });
     }
 
@@ -237,6 +261,7 @@ export class GPUTrainer {
         kept.push(snap);
       } else {
         snap.state.dispose();
+        if (snap.actions) snap.actions.dispose();
       }
     }
     this._stepSnapshots = kept;
@@ -266,12 +291,13 @@ export class GPUTrainer {
       var winner = p1 > p2 ? 1 : (p2 > p1 ? -1 : 0);
       this.winners[i] = winner;
 
-      // Download trajectory and push to CPU buffer
+      // Download trajectory and push to CPU buffer with real actions + masks.
+      // Bug fix: previously hardcoded action: 0, corrupting REINFORCE gradient.
       var trajectory = this._downloadTrajectory(i);
       for (var t = 0; t < trajectory.length; t++) {
         var step = trajectory[t];
         var reward = (step.player === winner) ? 1 : (winner === 0 ? 0 : -1);
-        this.buffer.push({ state: step.state, action: 0, reward: reward });
+        this.buffer.push({ state: step.state, action: step.action, reward: reward, mask: step.mask });
       }
       if (this.buffer.length > this.maxBufferSize) {
         this.buffer = this.buffer.slice(-this.maxBufferSize);
@@ -335,11 +361,10 @@ export class GPUTrainer {
       }
     }
 
-    // Restart finished games after 300ms idle
-    var now = Date.now();
+    // Immediate restart — no dead-slot delay (was 300ms, bottleneck at scale).
     var toRestart = [];
     for (var i = 0; i < this.numGames; i++) {
-      if (this.done[i] && now - this.doneTimes[i] > 300) {
+      if (this.done[i]) {
         toRestart.push(i);
       }
     }
@@ -358,10 +383,12 @@ export class GPUTrainer {
     var statesArr = [];
     var actionsArr = [];
     var rewardsArr = [];
+    var masksArr = [];
     for (var i = 0; i < n; i++) {
       statesArr.push(batch[i].state);
       actionsArr.push(batch[i].action);
       rewardsArr.push(batch[i].reward);
+      masksArr.push(batch[i].mask);
     }
 
     var statesTensor = tf.tensor2d(flattenStates(statesArr, boardSize), [n, boardSize]);
@@ -373,13 +400,26 @@ export class GPUTrainer {
     var actionMaskTensor = tf.tensor2d(actionMaskData, [n, boardSize]);
     var rewardsTensor = tf.tensor1d(rewardsArr);
 
+    // Build valid-move mask tensor: invalid moves get logit = -1e9 before softmax.
+    // Matches inference path (which uses maskedSoftmax). Previously missing,
+    // causing train/inference mismatch that pushed probability onto occupied cells.
+    var validMaskData = new Float32Array(n * boardSize);
+    for (var i = 0; i < n; i++) {
+      for (var j = 0; j < boardSize; j++) {
+        validMaskData[i * boardSize + j] = masksArr[i][j];
+      }
+    }
+    var validMaskTensor = tf.tensor2d(validMaskData, [n, boardSize]);
+
     var lossVal = 0;
     var self = this;
     try {
       var loss = self.optimizer.minimize(function () {
         var combined = self.model.model.predict(statesTensor);
         var policyLogits = combined.slice([0, 0], [-1, boardSize]);
-        var preds = policyLogits.softmax();
+        // Mask invalid moves before softmax so training matches inference
+        var maskedLogits = policyLogits.add(validMaskTensor.sub(1).mul(1e9));
+        var preds = maskedLogits.softmax();
         var selectedProbs = preds.mul(actionMaskTensor).sum(1);
         var logProbs = selectedProbs.add(tf.scalar(1e-8)).log();
         var policyLoss = logProbs.mul(rewardsTensor).mean().neg();
@@ -398,6 +438,7 @@ export class GPUTrainer {
     statesTensor.dispose();
     actionMaskTensor.dispose();
     rewardsTensor.dispose();
+    validMaskTensor.dispose();
     self.trainSteps++;
     return lossVal;
   }
@@ -526,6 +567,7 @@ export class GPUTrainer {
     if (this.neighborKernel) { this.neighborKernel.dispose(); this.neighborKernel = null; }
     for (var s = 0; s < this._stepSnapshots.length; s++) {
       this._stepSnapshots[s].state.dispose();
+      if (this._stepSnapshots[s].actions) this._stepSnapshots[s].actions.dispose();
     }
     this._stepSnapshots = [];
     if (this.optimizer) { this.optimizer.dispose(); this.optimizer = null; }
