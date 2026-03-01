@@ -1,15 +1,6 @@
 import { Game } from './game';
 import { MetricsLog } from './metrics';
-import { evaluateVsRandom } from './eval';
 import { createChartCanvas, drawLineChart } from './charts';
-
-// Elo from win rate vs a fixed-strength opponent (random = Elo 0).
-// Elo_diff = -400 * log10(1/winRate - 1)
-function winRateToElo(wr) {
-  if (wr <= 0.01) return -800;
-  if (wr >= 0.99) return 800;
-  return -400 * Math.log10(1 / wr - 1);
-}
 
 export class UI {
   constructor(trainer, algo, config) {
@@ -151,8 +142,8 @@ export class UI {
       + '<div class="stat"><div class="label">Gen</div><div class="value" id="sgen">0</div></div>'
       + '<div class="stat"><div class="label">Loss</div><div class="value" id="sloss">&mdash;</div></div>'
       + '<div class="stat"><div class="label">Avg Len</div><div class="value" id="slen">&mdash;</div></div>'
-      + '<div class="stat"><div class="label">vs Random</div><div class="value sg" id="srand">&mdash;</div></div>'
-      + '<div class="stat"><div class="label">Elo</div><div class="value" id="selo">&mdash;</div></div>'
+      + '<div class="stat"><div class="label">Elo</div><div class="value" id="selo">1000</div></div>'
+      + '<div class="stat"><div class="label">vs Ckpt</div><div class="value sg" id="sckpt">&mdash;</div></div>'
       + '<div class="stat"><div class="label">Entropy</div><div class="value" id="sentr">&mdash;</div></div>'
       + '</div>';
     app.appendChild(header);
@@ -251,8 +242,8 @@ export class UI {
     chartsGrid.id = 'charts-grid';
 
     var chartDefs = [
-      { key: 'winRate', title: 'Win Rate vs Random' },
-      { key: 'elo', title: 'Elo vs Random' },
+      { key: 'elo', title: 'Elo Rating' },
+      { key: 'ckptWin', title: 'Win% vs Checkpoints' },
       { key: 'loss', title: 'Training Loss' },
       { key: 'entropy', title: 'Policy Entropy' },
       { key: 'avgLen', title: 'Avg Game Length' },
@@ -459,12 +450,12 @@ export class UI {
       this._snapshotMetrics(s);
     }
 
-    // Update stat bar from latest metrics
+    // Update stat bar from trainer stats (Elo is live, not per-snapshot)
+    document.getElementById('selo').textContent = s.elo ? s.elo.toFixed(0) : '1000';
+    var ckptWr = s.checkpointWinRate;
+    document.getElementById('sckpt').textContent = ckptWr > 0 ? (ckptWr * 100).toFixed(0) + '%' : '\u2014';
     var last = this.metrics.last();
     if (last) {
-      document.getElementById('srand').textContent = (last.winRateVsRandom * 100).toFixed(0) + '%';
-      var elo = winRateToElo(last.winRateVsRandom);
-      document.getElementById('selo').textContent = elo > 0 ? '+' + elo.toFixed(0) : elo.toFixed(0);
       document.getElementById('sentr').textContent = last.entropy.toFixed(3);
     }
   }
@@ -473,48 +464,35 @@ export class UI {
     var entropy = this.algo.lastEntropy || 0;
     var totalSelf = stats.p1Wins + stats.p2Wins + stats.draws;
     var selfP1Rate = totalSelf > 0 ? stats.p1Wins / totalSelf : 0.5;
-    var prevWr = this.metrics.length > 0 ? this.metrics.last().winRateVsRandom : 0.5;
 
-    var entry = {
+    this.metrics.push({
       generation: stats.generation,
       loss: stats.loss,
-      winRateVsRandom: prevWr,
+      elo: stats.elo || 1000,
+      checkpointWinRate: stats.checkpointWinRate || 0,
       selfPlayP1Rate: selfP1Rate,
       entropy: entropy,
       avgGameLength: stats.avgGameLength,
       bufferSize: stats.bufferSize
-    };
-    this.metrics.push(entry);
+    });
     this._chartsDirty = true;
-
-    // Run eval every 10 generations, async via setTimeout to not block training.
-    // Budget: ~1% of training compute. 2 games (1/side) ≈ 50 forward passes
-    // every 10 gens = 5/gen avg. Training ≈ 3000/gen. Cost: ~0.2%.
-    if (stats.generation % 10 === 0) {
-      var self = this;
-      setTimeout(function () {
-        var evalResult = evaluateVsRandom(self.algo, self.rows, self.cols, 1);
-        entry.winRateVsRandom = evalResult.winRate;
-        self._chartsDirty = true;
-      }, 0);
-    }
   }
 
   _renderCharts() {
     var data = this.metrics.length > 0;
 
-    drawLineChart(this.charts.winRate, data ? this.metrics.getSeries('winRateVsRandom').map(function (v) { return v * 100; }) : [], {
-      title: 'Win Rate vs Random (%)',
+    drawLineChart(this.charts.elo, data ? this.metrics.getSeries('elo') : [], {
+      title: 'Elo Rating',
+      color: '#ffaa00',
+      refLine: 1000,
+      refColor: '#444466'
+    });
+    drawLineChart(this.charts.ckptWin, data ? this.metrics.getSeries('checkpointWinRate').map(function (v) { return v * 100; }) : [], {
+      title: 'Win% vs Checkpoints',
       color: '#00ff88',
       minY: 0,
       maxY: 100,
       refLine: 50,
-      refColor: '#444466'
-    });
-    drawLineChart(this.charts.elo, data ? this.metrics.getSeries('winRateVsRandom').map(winRateToElo) : [], {
-      title: 'Elo vs Random',
-      color: '#ffaa00',
-      refLine: 0,
       refColor: '#444466'
     });
     drawLineChart(this.charts.loss, data ? this.metrics.getSeries('loss') : [], {
@@ -530,7 +508,7 @@ export class UI {
       color: '#66ccff'
     });
     drawLineChart(this.charts.selfPlay, data ? this.metrics.getSeries('selfPlayP1Rate').map(function (v) { return v * 100; }) : [], {
-      title: 'Self-Play P1 Win% (expect ~50%)',
+      title: 'Self-Play P1 Win%',
       color: '#4488ff',
       minY: 0,
       maxY: 100,

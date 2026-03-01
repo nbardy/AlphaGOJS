@@ -3,7 +3,7 @@ import { SpatialModel } from './spatial_model';
 import { Reinforce } from './reinforce';
 import { PPO } from './ppo';
 import { SelfPlayTrainer } from './trainer';
-import { GPUTrainer } from './gpu_trainer';
+import { CheckpointPool } from './checkpoint_pool';
 import { UI } from './ui';
 
 // --- Configuration ---
@@ -28,14 +28,18 @@ function createAlgorithm(type, model) {
 export function createPipeline(modelType, algoType, rows, cols, numGames) {
   var model = createModel(modelType, rows, cols);
   var algo = createAlgorithm(algoType, model);
+  var pool = new CheckpointPool(function () {
+    return createModel(modelType, rows, cols);
+  });
   var trainer = new SelfPlayTrainer(algo, {
     numGames: numGames,
     rows: rows,
     cols: cols,
     trainBatchSize: 256,
-    trainInterval: 20
+    trainInterval: 20,
+    checkpointPool: pool
   });
-  return { trainer: trainer, algo: algo };
+  return { trainer: trainer, algo: algo, pool: pool };
 }
 
 // --- Wiring ---
