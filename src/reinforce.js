@@ -36,13 +36,21 @@ export class Reinforce {
     statesTensor.dispose();
 
     var results = [];
+    var entropySum = 0;
     for (var i = 0; i < n; i++) {
       var logits = new Float32Array(boardSize);
       for (var j = 0; j < boardSize; j++) logits[j] = logitsData[i * boardSize + j];
       var probs = maskedSoftmax(logits, masks[i]);
       var action = sampleFromProbs(probs);
+      // Compute entropy from inference probs (CPU, zero GPU cost)
+      var ent = 0;
+      for (var j = 0; j < boardSize; j++) {
+        if (probs[j] > 1e-8) ent -= probs[j] * Math.log(probs[j]);
+      }
+      entropySum += ent;
       results.push({ action: action });
     }
+    this.lastEntropy = n > 0 ? entropySum / n : 0;
     return results;
   }
 
@@ -133,7 +141,6 @@ export class Reinforce {
         var logProbs = selectedProbs.add(tf.scalar(1e-8)).log();
         var policyLoss = logProbs.mul(rewardsTensor).mean().neg();
         var entropy = preds.add(tf.scalar(1e-8)).log().mul(preds).sum(1).mean().neg();
-        self.lastEntropy = entropy.dataSync()[0];
         return policyLoss.sub(entropy.mul(tf.scalar(0.01)));
       }, true);
 
