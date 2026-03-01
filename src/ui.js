@@ -7,6 +7,7 @@ export class UI {
     this.trainer = trainer;
     this.algo = algo;
     this.config = config || {};
+    this.pipelineType = this.config.pipelineType || 'cpu';
     this.rows = trainer.rows;
     this.cols = trainer.cols;
     this.boardSize = this.rows * this.cols;
@@ -38,13 +39,15 @@ export class UI {
     this._destroyed = true;
   }
 
-  _restart(modelType, algoType) {
+  _restart(modelType, algoType, pipelineType) {
     if (!this.config.createPipeline) return;
+    this.pipelineType = pipelineType || 'cpu';
     var pipeline = this.config.createPipeline(
       modelType, algoType,
       this.config.rows || this.rows,
       this.config.cols || this.cols,
-      this.config.numGames || this.trainer.numGames
+      this.config.numGames || this.trainer.numGames,
+      this.pipelineType
     );
     this.trainer = pipeline.trainer;
     this.algo = pipeline.algo;
@@ -181,12 +184,19 @@ export class UI {
     algoSel.innerHTML = '<option value="ppo">PPO</option><option value="reinforce">REINFORCE</option>';
     controls.appendChild(algoSel);
 
+    // Pipeline select (CPU vs GPU)
+    var pipeSel = document.createElement('select');
+    pipeSel.id = 'pipe-sel';
+    pipeSel.className = 'cfg-select';
+    pipeSel.innerHTML = '<option value="cpu">CPU</option><option value="gpu">GPU (fast)</option>';
+    controls.appendChild(pipeSel);
+
     // Restart button
     var restartBtn = document.createElement('button');
     restartBtn.className = 'restart-btn';
     restartBtn.textContent = 'Restart';
     restartBtn.onclick = function () {
-      self._restart(modelSel.value, algoSel.value);
+      self._restart(modelSel.value, algoSel.value, pipeSel.value);
     };
     controls.appendChild(restartBtn);
 
@@ -352,7 +362,9 @@ export class UI {
     setTimeout(function () {
       var state = self.humanGame.getBoardForNN(-1);
       var mask = self.humanGame.getValidMovesMask();
-      var action = self.algo.selectAction(state, mask);
+      // GPU trainer implements selectAction directly; CPU uses algo wrapper.
+      var actionSource = self.algo || self.trainer;
+      var action = actionSource.selectAction(state, mask);
       self.humanGame.makeMove(-1, action);
       self.humanGame.spreadPlague();
       self._renderHuman();
@@ -450,8 +462,10 @@ export class UI {
       this._snapshotMetrics(s);
     }
 
-    // Update stat bar from trainer stats (Elo is live, not per-snapshot)
-    document.getElementById('selo').textContent = s.elo ? s.elo.toFixed(0) : '1000';
+    // Update stat bar from trainer stats (Elo is live, not per-snapshot).
+    // GPU pipeline has no checkpoint pool, so elo/checkpointWinRate are undefined.
+    var hasElo = typeof s.elo === 'number' && s.elo > 0;
+    document.getElementById('selo').textContent = hasElo ? s.elo.toFixed(0) : (this.pipelineType === 'gpu' ? '--' : '1000');
     var ckptWr = s.checkpointWinRate;
     document.getElementById('sckpt').textContent = ckptWr > 0 ? (ckptWr * 100).toFixed(0) + '%' : '\u2014';
     var last = this.metrics.last();
@@ -461,7 +475,8 @@ export class UI {
   }
 
   _snapshotMetrics(stats) {
-    var entropy = this.algo.lastEntropy || 0;
+    // GPU pipeline has no algo object; entropy unavailable (reported as 0).
+    var entropy = (this.algo && this.algo.lastEntropy) ? this.algo.lastEntropy : 0;
     var totalSelf = stats.p1Wins + stats.p2Wins + stats.draws;
     var selfP1Rate = totalSelf > 0 ? stats.p1Wins / totalSelf : 0.5;
 

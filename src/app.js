@@ -3,6 +3,7 @@ import { SpatialModel } from './spatial_model';
 import { Reinforce } from './reinforce';
 import { PPO } from './ppo';
 import { SelfPlayTrainer } from './trainer';
+import { GPUTrainer } from './gpu_trainer';
 import { CheckpointPool } from './checkpoint_pool';
 import { UI } from './ui';
 
@@ -25,7 +26,11 @@ function createAlgorithm(type, model) {
   throw new Error('Unknown algorithm type: ' + type);
 }
 
-export function createPipeline(modelType, algoType, rows, cols, numGames) {
+// Pipeline type dispatcher: 'cpu' uses SelfPlayTrainer (model+algo abstraction),
+// 'gpu' uses GPUTrainer (all game state on GPU, ~320 bytes/tick transfer).
+// GPU pipeline bypasses the algo abstraction — GPUTrainer owns its own training loop
+// and exposes selectAction directly for human play.
+function createCPUPipeline(modelType, algoType, rows, cols, numGames) {
   var model = createModel(modelType, rows, cols);
   var algo = createAlgorithm(algoType, model);
   var pool = new CheckpointPool(function () {
@@ -39,17 +44,38 @@ export function createPipeline(modelType, algoType, rows, cols, numGames) {
     trainInterval: 20,
     checkpointPool: pool
   });
-  return { trainer: trainer, algo: algo, pool: pool };
+  return { trainer: trainer, algo: algo, pool: pool, pipelineType: 'cpu' };
+}
+
+function createGPUPipeline(modelType, rows, cols, numGames) {
+  var model = createModel(modelType, rows, cols);
+  // GPU trainer has no checkpoint pool — Elo stats will show '--' in UI.
+  // GPUTrainer implements selectAction directly for human play.
+  var trainer = new GPUTrainer(model, {
+    numGames: numGames,
+    rows: rows,
+    cols: cols,
+    trainBatchSize: 256,
+    trainInterval: 20
+  });
+  return { trainer: trainer, algo: null, pool: null, pipelineType: 'gpu' };
+}
+
+export function createPipeline(modelType, algoType, rows, cols, numGames, pipelineType) {
+  if (pipelineType === 'gpu') return createGPUPipeline(modelType, rows, cols, numGames);
+  if (pipelineType === 'cpu' || !pipelineType) return createCPUPipeline(modelType, algoType, rows, cols, numGames);
+  throw new Error('Unknown pipeline type: ' + pipelineType);
 }
 
 // --- Wiring ---
 
 function start() {
-  var pipeline = createPipeline('dense', 'ppo', ROWS, COLS, NUM_GAMES);
+  var pipeline = createPipeline('dense', 'ppo', ROWS, COLS, NUM_GAMES, 'cpu');
   var ui = new UI(pipeline.trainer, pipeline.algo, {
     rows: ROWS,
     cols: COLS,
     numGames: NUM_GAMES,
+    pipelineType: pipeline.pipelineType,
     createPipeline: createPipeline
   });
   window.__alphaPlague = ui;
