@@ -10,7 +10,7 @@ import { UI } from './ui';
 var ROWS = 10;
 var COLS = 10;
 var NUM_GAMES = 40;
-var MODEL_TYPE = 'spatial';    // 'dense' | 'spatial'
+var MODEL_TYPE = 'dense';      // 'dense' | 'spatial' (spatial is 10-20x slower but better inductive bias)
 var ALGO_TYPE = 'ppo';         // 'reinforce' | 'ppo'
 var PIPELINE_TYPE = 'cpu';     // 'cpu' | 'gpu'
 
