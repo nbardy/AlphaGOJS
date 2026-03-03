@@ -5,7 +5,12 @@ import { flattenStates, maskedSoftmax, sampleFromProbs } from './action';
 // Owns optimizer, experience buffer, and training loop.
 // Uses model.forward() for the neural network forward pass.
 //
-// Loss: -mean(log(pi(a|s)) * R) - 0.01 * entropy
+// Loss: -mean(log(pi(a|s)) * R) - entropyCoeff * entropy
+//
+// Adaptive entropy: coefficient adjusts toward a target entropy level to
+// prevent policy collapse (entropy too low) without excessive randomness
+// (entropy too high). Target = 50% of max entropy at ~30% valid moves.
+// Adaptation runs OUTSIDE minimize() to avoid GPU pipeline stalls.
 
 export class Reinforce {
   constructor(model) {
@@ -15,6 +20,12 @@ export class Reinforce {
     this.buffer = [];
     this.maxBufferSize = 20000;
     this.lastEntropy = 0;
+
+    // Adaptive entropy regularization — prevents spatial model collapse at 10-30k samples.
+    // Initial coeff 0.03 is 3x the old hardcoded 0.01 for stronger early exploration.
+    this.entropyCoeff = 0.03;
+    this.targetEntropy = 0.5 * Math.log(model.boardSize * 0.3);
+    this.entropyAlpha = 0.0005;
   }
 
   /**
@@ -141,7 +152,7 @@ export class Reinforce {
         var logProbs = selectedProbs.add(tf.scalar(1e-8)).log();
         var policyLoss = logProbs.mul(rewardsTensor).mean().neg();
         var entropy = preds.add(tf.scalar(1e-8)).log().mul(preds).sum(1).mean().neg();
-        return policyLoss.sub(entropy.mul(tf.scalar(0.01)));
+        return policyLoss.sub(entropy.mul(tf.scalar(self.entropyCoeff)));
       }, true);
 
       if (loss) {
@@ -156,6 +167,16 @@ export class Reinforce {
     actionMaskTensor.dispose();
     rewardsTensor.dispose();
     validMaskTensor.dispose();
+
+    // Adapt entropy coefficient toward target using lastEntropy from inference (CPU-side).
+    // OUTSIDE minimize() — never put adaptation/dataSync inside the gradient tape.
+    // If entropy < target, increase coeff to encourage exploration;
+    // if entropy > target, decrease coeff to allow exploitation.
+    if (self.lastEntropy > 0) {
+      var entropyError = self.targetEntropy - self.lastEntropy;
+      self.entropyCoeff = Math.max(0.001, Math.min(0.1, self.entropyCoeff + self.entropyAlpha * entropyError));
+    }
+
     self.trainSteps++;
     return lossVal;
   }

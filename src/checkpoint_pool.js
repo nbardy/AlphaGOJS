@@ -9,12 +9,16 @@ import { maskedSoftmax, sampleFromProbs } from './action';
 // Weights stored as CPU Float32Arrays to avoid GPU memory pressure.
 
 export class CheckpointPool {
-  constructor(createModelFn) {
+  constructor(createModelFn, config) {
+    config = config || {};
     this.checkpoints = [];       // { weights: [{shape,data}], elo, gen }
     this.currentElo = 1000;
-    this.maxCheckpoints = 20;
-    this.saveInterval = 20;      // save checkpoint every N generations
-    this.checkpointFraction = 0.1; // 10% of game slots play vs checkpoint
+    this.maxCheckpoints = config.maxCheckpoints || 50;
+    this.saveInterval = config.saveInterval || 20;      // save checkpoint every N generations
+    this.checkpointFraction = typeof config.checkpointFraction === 'number' ? config.checkpointFraction : 0.25;
+    this.sampleMode = config.sampleMode || 'uniform_recent';
+    this.recentWindow = config.recentWindow || 50;
+    this.recentBiasDecay = typeof config.recentBiasDecay === 'number' ? config.recentBiasDecay : 3;
     this.eloK = 32;
     this.createModelFn = createModelFn;
     this.opponentModel = null;
@@ -60,29 +64,50 @@ export class CheckpointPool {
     }
   }
 
-  // Load a checkpoint into the opponent model, biased toward recent (harder) ones.
-  // Uses exponential decay: P(i) ∝ exp(decay * i) where i=0 is oldest.
-  // With decay=3 and 20 checkpoints, the newest is ~20x more likely than oldest.
+  _pickCheckpointIndex() {
+    var n = this.checkpoints.length;
+    if (n === 0) return -1;
+
+    if (this.sampleMode === 'uniform_all') {
+      return Math.floor(Math.random() * n);
+    }
+
+    // League-style: uniformly sample from a recent opponent window.
+    // This prevents catastrophic forgetting against older strategies while
+    // keeping difficulty close to the current policy.
+    if (this.sampleMode === 'uniform_recent') {
+      var window = Math.max(1, Math.min(this.recentWindow, n));
+      var start = n - window;
+      return start + Math.floor(Math.random() * window);
+    }
+
+    // Legacy option: recency-biased exponential sampling.
+    if (this.sampleMode === 'recent_bias') {
+      var weights = new Float64Array(n);
+      var total = 0;
+      for (var i = 0; i < n; i++) {
+        weights[i] = Math.exp(this.recentBiasDecay * i / n);
+        total += weights[i];
+      }
+      var r = Math.random() * total;
+      var cumul = 0;
+      var idx = n - 1;
+      for (var i = 0; i < n; i++) {
+        cumul += weights[i];
+        if (r <= cumul) { idx = i; break; }
+      }
+      return idx;
+    }
+
+    // Fallback: uniform over entire pool.
+    return Math.floor(Math.random() * n);
+  }
+
+  // Load a checkpoint into the opponent model.
   loadRandomOpponent() {
     if (this.checkpoints.length === 0) return -1;
     this._ensureOpponent();
-    var n = this.checkpoints.length;
-    // Exponential weights: w(i) = exp(decay * i/n), newest (i=n-1) gets highest weight.
-    // With decay=3 and 20 checkpoints, newest is ~20x more likely than oldest.
-    var decay = 3;
-    var weights = new Float64Array(n);
-    var total = 0;
-    for (var i = 0; i < n; i++) {
-      weights[i] = Math.exp(decay * i / n);
-      total += weights[i];
-    }
-    var r = Math.random() * total;
-    var cumul = 0;
-    var idx = n - 1;
-    for (var i = 0; i < n; i++) {
-      cumul += weights[i];
-      if (r <= cumul) { idx = i; break; }
-    }
+    var idx = this._pickCheckpointIndex();
     var ckpt = this.checkpoints[idx];
     var tensors = ckpt.weights.map(function (w) {
       return tf.tensor(w.data, w.shape);

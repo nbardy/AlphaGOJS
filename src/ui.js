@@ -1,4 +1,4 @@
-import { Game } from './game';
+import { createGame, getRenderer, listGames } from './game';
 import { MetricsLog } from './metrics';
 import { createChartCanvas, drawLineChart } from './charts';
 
@@ -8,7 +8,7 @@ export class UI {
     this.algo = algo;
     this.config = config || {};
     this.pipelineType = this.config.pipelineType || 'cpu';
-    this.gameType = this.config.gameType || 'advanced';
+    this.gameType = this.config.gameType || 'plague_walls';
     this.rows = trainer.rows;
     this.cols = trainer.cols;
     this.boardSize = this.rows * this.cols;
@@ -44,7 +44,7 @@ export class UI {
   _restart(modelType, algoType, pipelineType, gameType) {
     if (!this.config.createPipeline) return;
     this.pipelineType = pipelineType || 'cpu';
-    this.gameType = gameType || 'advanced';
+    this.gameType = gameType || 'plague_walls';
     var pipeline = this.config.createPipeline(
       modelType, algoType,
       this.config.rows || this.rows,
@@ -53,6 +53,7 @@ export class UI {
       this.pipelineType,
       this.gameType
     );
+    this.pipelineType = pipeline.pipelineType || this.pipelineType;
     this.trainer = pipeline.trainer;
     this.algo = pipeline.algo;
     this.rows = this.trainer.rows;
@@ -62,6 +63,8 @@ export class UI {
     this.lastGeneration = -1;
     this._chartsDirty = true;
     this.humanPlaying = false;
+    var pipeSelEl = document.getElementById('pipe-sel');
+    if (pipeSelEl) pipeSelEl.value = this.pipelineType;
 
     // Rebuild grid canvases
     var grid = document.getElementById('game-grid');
@@ -178,14 +181,38 @@ export class UI {
     var modelSel = document.createElement('select');
     modelSel.id = 'model-sel';
     modelSel.className = 'cfg-select';
-    modelSel.innerHTML = '<option value="dense">Dense</option><option value="spatial">Spatial (slow)</option>';
+    var modelTypes = this.config.listModelTypes ? this.config.listModelTypes() : [
+      { id: 'dense', label: 'Dense' },
+      { id: 'spatial', label: 'Spatial (slow)' }
+    ];
+    var modelOptionsHTML = '';
+    var hasDense = false;
+    for (var mi = 0; mi < modelTypes.length; mi++) {
+      if (modelTypes[mi].id === 'dense') hasDense = true;
+      modelOptionsHTML += '<option value="' + modelTypes[mi].id + '">' + modelTypes[mi].label + '</option>';
+    }
+    modelSel.innerHTML = modelOptionsHTML;
+    if (hasDense) modelSel.value = 'dense';
+    else if (modelTypes.length > 0) modelSel.value = modelTypes[0].id;
     controls.appendChild(modelSel);
 
     // Algo select
     var algoSel = document.createElement('select');
     algoSel.id = 'algo-sel';
     algoSel.className = 'cfg-select';
-    algoSel.innerHTML = '<option value="ppo">PPO</option><option value="reinforce">REINFORCE</option>';
+    var algoTypes = this.config.listAlgorithmTypes ? this.config.listAlgorithmTypes() : [
+      { id: 'ppo', label: 'PPO' },
+      { id: 'reinforce', label: 'REINFORCE' }
+    ];
+    var algoOptionsHTML = '';
+    var hasPPO = false;
+    for (var ai = 0; ai < algoTypes.length; ai++) {
+      if (algoTypes[ai].id === 'ppo') hasPPO = true;
+      algoOptionsHTML += '<option value="' + algoTypes[ai].id + '">' + algoTypes[ai].label + '</option>';
+    }
+    algoSel.innerHTML = algoOptionsHTML;
+    if (hasPPO) algoSel.value = 'ppo';
+    else if (algoTypes.length > 0) algoSel.value = algoTypes[0].id;
     controls.appendChild(algoSel);
 
     // Pipeline select (CPU vs GPU)
@@ -193,13 +220,20 @@ export class UI {
     pipeSel.id = 'pipe-sel';
     pipeSel.className = 'cfg-select';
     pipeSel.innerHTML = '<option value="cpu">CPU</option><option value="gpu">GPU (fast)</option>';
+    pipeSel.value = this.pipelineType;
     controls.appendChild(pipeSel);
 
-    // Game type select (walls vs classic)
+    // Game type select — dynamically built from the game registry
     var gameSel = document.createElement('select');
     gameSel.id = 'game-sel';
     gameSel.className = 'cfg-select';
-    gameSel.innerHTML = '<option value="advanced">Walls</option><option value="classic">Classic</option>';
+    var registeredGames = listGames();
+    var gameOptionsHTML = '';
+    for (var gi = 0; gi < registeredGames.length; gi++) {
+      gameOptionsHTML += '<option value="' + registeredGames[gi].id + '">' + registeredGames[gi].label + '</option>';
+    }
+    gameSel.innerHTML = gameOptionsHTML;
+    gameSel.value = this.gameType;
     controls.appendChild(gameSel);
 
     // Restart button
@@ -327,7 +361,7 @@ export class UI {
 
   _startHumanGame() {
     this.humanPlaying = true;
-    this.humanGame = new Game(this.rows, this.cols, this.gameType !== 'classic');
+    this.humanGame = createGame(this.gameType, this.rows, this.cols);
     this.humanTurn = true;
     this.humanGameOver = false;
 
@@ -403,9 +437,11 @@ export class UI {
 
   _drawBoard(canvas, board, rows, cols, cs) {
     var ctx = canvas.getContext('2d');
+    var renderer = getRenderer(this.gameType);
     if (cs <= 10) {
       // Fast path: ImageData for small cells (training grid).
       // Single putImageData vs rows*cols fillRect calls.
+      // Colors delegated to renderer.cellColor(val) => [R, G, B].
       var w = cols * cs;
       var h = rows * cs;
       if (!canvas._imgData || canvas._imgData.width !== w) {
@@ -415,19 +451,15 @@ export class UI {
       for (var r = 0; r < rows; r++) {
         for (var c = 0; c < cols; c++) {
           var val = board[r * cols + c];
-          var R, G, B;
-          if (val === 1) { R = 0; G = 255; B = 136; }
-          else if (val === -1) { R = 255; G = 51; B = 102; }
-          else if (val === 2) { R = 80; G = 70; B = 90; }  // wall: dark purple
-          else { R = 30; G = 30; B = 58; }
-          // Fill cs×cs pixel block
+          var rgb = renderer.cellColor(val);
+          // Fill cs x cs pixel block
           for (var py = 0; py < cs; py++) {
             var rowOffset = ((r * cs + py) * w + c * cs) * 4;
             for (var px = 0; px < cs; px++) {
               var idx = rowOffset + px * 4;
-              data[idx] = R;
-              data[idx + 1] = G;
-              data[idx + 2] = B;
+              data[idx] = rgb[0];
+              data[idx + 1] = rgb[1];
+              data[idx + 2] = rgb[2];
               data[idx + 3] = 255;
             }
           }
@@ -435,17 +467,15 @@ export class UI {
       }
       ctx.putImageData(canvas._imgData, 0, 0);
     } else {
-      // Slow path for human play board (large cells, gap between cells)
+      // Slow path for human play board (large cells, gap between cells).
+      // Colors delegated to renderer.humanCellColor(val) => CSS color string.
       ctx.fillStyle = '#0d0d22';
       ctx.fillRect(0, 0, canvas.width, canvas.height);
       var gap = 1;
       for (var r = 0; r < rows; r++) {
         for (var c = 0; c < cols; c++) {
           var val = board[r * cols + c];
-          if (val === 1) ctx.fillStyle = '#00ff88';
-          else if (val === -1) ctx.fillStyle = '#ff3366';
-          else if (val === 2) ctx.fillStyle = '#504660';  // wall
-          else ctx.fillStyle = '#1e1e3a';
+          ctx.fillStyle = renderer.humanCellColor(val);
           ctx.fillRect(c * cs + gap, r * cs + gap, cs - gap * 2, cs - gap * 2);
         }
       }

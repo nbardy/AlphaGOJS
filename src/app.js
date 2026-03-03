@@ -1,7 +1,6 @@
-import { DenseModel } from './dense_model';
-import { SpatialModel } from './spatial_model';
-import { Reinforce } from './reinforce';
-import { PPO } from './ppo';
+import { createModel, listModelTypes } from './model_registry';
+import { createAlgorithm, listAlgorithmTypes } from './algo_registry';
+import { assertModelContract, assertAlgorithmContract } from './contracts';
 import { SelfPlayTrainer } from './trainer';
 import { GPUTrainer } from './gpu_trainer';
 import { CheckpointPool } from './checkpoint_pool';
@@ -11,36 +10,32 @@ import { UI } from './ui';
 var ROWS = 20;
 var COLS = 20;
 var NUM_GAMES = 80;
-
-// --- Thin dispatchers (One Clean Path: one handler per type, exhaustive) ---
-
-function createModel(type, rows, cols) {
-  if (type === 'dense') return new DenseModel(rows, cols);
-  if (type === 'spatial') return new SpatialModel(rows, cols);
-  throw new Error('Unknown model type: ' + type);
-}
-
-function createAlgorithm(type, model) {
-  if (type === 'reinforce') return new Reinforce(model);
-  if (type === 'ppo') return new PPO(model);
-  throw new Error('Unknown algorithm type: ' + type);
-}
+var CHECKPOINT_POOL_CONFIG = {
+  maxCheckpoints: 50,
+  recentWindow: 50,
+  sampleMode: 'uniform_recent',
+  checkpointFraction: 0.25,
+  saveInterval: 20
+};
 
 // Pipeline type dispatcher: 'cpu' uses SelfPlayTrainer (model+algo abstraction),
 // 'gpu' uses GPUTrainer (all game state on GPU, ~320 bytes/tick transfer).
 // GPU pipeline bypasses the algo abstraction — GPUTrainer owns its own training loop
 // and exposes selectAction directly for human play.
-function createCPUPipeline(modelType, algoType, rows, cols, numGames, walls) {
+// gameType is a registry key (e.g. 'plague_walls', 'plague_classic').
+function createCPUPipeline(modelType, algoType, rows, cols, numGames, gameType) {
   var model = createModel(modelType, rows, cols);
+  assertModelContract(model);
   var algo = createAlgorithm(algoType, model);
+  assertAlgorithmContract(algo);
   var pool = new CheckpointPool(function () {
     return createModel(modelType, rows, cols);
-  });
+  }, CHECKPOINT_POOL_CONFIG);
   var trainer = new SelfPlayTrainer(algo, {
     numGames: numGames,
     rows: rows,
     cols: cols,
-    walls: walls,
+    gameType: gameType,
     trainBatchSize: 512,
     trainInterval: 30,
     checkpointPool: pool
@@ -48,18 +43,19 @@ function createCPUPipeline(modelType, algoType, rows, cols, numGames, walls) {
   return { trainer: trainer, algo: algo, pool: pool, pipelineType: 'cpu' };
 }
 
-function createGPUPipeline(modelType, rows, cols, numGames, walls) {
+function createGPUPipeline(modelType, rows, cols, numGames, gameType) {
   var model = createModel(modelType, rows, cols);
+  assertModelContract(model);
   var pool = new CheckpointPool(function () {
     return createModel(modelType, rows, cols);
-  });
+  }, CHECKPOINT_POOL_CONFIG);
   // GPUTrainer owns its game loop on GPU; checkpoint pool runs async CPU-side
   // Elo eval (1 game every 10 gens) so the Elo chart is no longer flat.
   var trainer = new GPUTrainer(model, {
     numGames: numGames,
     rows: rows,
     cols: cols,
-    walls: walls,
+    gameType: gameType,
     trainBatchSize: 512,
     trainInterval: 30,
     checkpointPool: pool
@@ -68,11 +64,20 @@ function createGPUPipeline(modelType, rows, cols, numGames, walls) {
 }
 
 export function createPipeline(modelType, algoType, rows, cols, numGames, pipelineType, gameType) {
-  var walls = gameType !== 'classic'; // 'advanced' (default) = walls, 'classic' = no walls
-  if (pipelineType === 'gpu') return createGPUPipeline(modelType, rows, cols, numGames, walls);
-  if (pipelineType === 'cpu' || !pipelineType) return createCPUPipeline(modelType, algoType, rows, cols, numGames, walls);
+  var resolvedGameType = gameType || 'plague_walls';
+  // GPUTrainer currently implements a REINFORCE-like internal loop.
+  // Advanced algorithms (SAC/PPG/MuZero) run on CPU pipeline.
+  if (pipelineType === 'gpu' && (algoType === 'ppo' || algoType === 'reinforce')) {
+    return createGPUPipeline(modelType, rows, cols, numGames, resolvedGameType);
+  }
+  if (pipelineType === 'gpu') {
+    return createCPUPipeline(modelType, algoType, rows, cols, numGames, resolvedGameType);
+  }
+  if (pipelineType === 'cpu' || !pipelineType) return createCPUPipeline(modelType, algoType, rows, cols, numGames, resolvedGameType);
   throw new Error('Unknown pipeline type: ' + pipelineType);
 }
+
+export { listModelTypes, listAlgorithmTypes };
 
 // --- Wiring ---
 
@@ -83,7 +88,9 @@ function start() {
     cols: COLS,
     numGames: NUM_GAMES,
     pipelineType: pipeline.pipelineType,
-    createPipeline: createPipeline
+    createPipeline: createPipeline,
+    listModelTypes: listModelTypes,
+    listAlgorithmTypes: listAlgorithmTypes
   });
   window.__alphaPlague = ui;
 }

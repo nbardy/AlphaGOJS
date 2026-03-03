@@ -9,9 +9,14 @@ import { flattenStates, maskedSoftmax, sampleFromProbs, logProbOfAction } from '
 // - onGameFinished computes GAE advantages per player sub-trajectory
 // - train() does K epochs of minibatch updates with clipped surrogate loss
 //
-// Loss: -clipped_surrogate + 0.5 * value_MSE - 0.01 * entropy
+// Loss: -clipped_surrogate + 0.5 * value_MSE - entropyCoeff * entropy
 // Hyperparams: epsilon=0.2, gamma=0.99, lambda=0.95, lr=0.0003, K=2, minibatch=128
 // Tuned for speed: 2 epochs x 2 minibatches = 4 gradient steps/gen (was 16).
+//
+// Adaptive entropy: coefficient adjusts toward a target entropy level to
+// prevent policy collapse (entropy too low) without excessive randomness
+// (entropy too high). Target = 50% of max entropy at ~30% valid moves.
+// Adaptation runs OUTSIDE minimize() to avoid GPU pipeline stalls.
 
 export class PPO {
   constructor(model) {
@@ -28,8 +33,13 @@ export class PPO {
     this.epochs = 2;          // Tuned: 2 epochs (was 4) — halves training cost per generation
     this.minibatchSize = 128;  // Tuned: 128 (was 64) — fewer, larger gradient steps
     this.valueLossCoeff = 0.5;
-    this.entropyCoeff = 0.01;
     this.lastEntropy = 0;
+
+    // Adaptive entropy regularization — prevents spatial model collapse at 10-30k samples.
+    // Initial coeff 0.03 is 3x the old hardcoded 0.01 for stronger early exploration.
+    this.entropyCoeff = 0.03;
+    this.targetEntropy = 0.5 * Math.log(model.boardSize * 0.3);
+    this.entropyAlpha = 0.0005;
   }
 
   /**
@@ -280,6 +290,16 @@ export class PPO {
     }
 
     statesFull.dispose();
+
+    // Adapt entropy coefficient toward target using lastEntropy from inference (CPU-side).
+    // OUTSIDE minimize() — never put adaptation/dataSync inside the gradient tape.
+    // If entropy < target, increase coeff to encourage exploration;
+    // if entropy > target, decrease coeff to allow exploitation.
+    if (self.lastEntropy > 0) {
+      var entropyError = self.targetEntropy - self.lastEntropy;
+      self.entropyCoeff = Math.max(0.001, Math.min(0.1, self.entropyCoeff + self.entropyAlpha * entropyError));
+    }
+
     self.trainSteps++;
     return numUpdates > 0 ? totalLoss / numUpdates : 0;
   }

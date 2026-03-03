@@ -1,6 +1,6 @@
 import * as tf from '@tensorflow/tfjs';
 import { maskedSoftmax, sampleFromProbs, flattenStates } from './action';
-import { Game } from './game';
+import { createGame } from './game';
 
 // GPU-Native Trainer: entire game loop on GPU, ~320 bytes/tick transfer.
 //
@@ -23,7 +23,7 @@ export class GPUTrainer {
     this.boardSize = this.rows * this.cols;
     this.trainBatchSize = config.trainBatchSize || 256;
     this.trainInterval = config.trainInterval || 20;
-    this.walls = config.walls !== false;
+    this.gameType = config.gameType || 'plague_walls';
 
     // GPU state tensor [N, boardSize] — the core of zero-transfer
     this.state = tf.zeros([this.numGames, this.boardSize]);
@@ -36,6 +36,15 @@ export class GPUTrainer {
 
     // Optimizer (same as Reinforce)
     this.optimizer = tf.train.adam(0.001);
+
+    // Adaptive entropy regularization — prevents spatial model collapse at 10-30k samples.
+    // Initial coeff 0.03 is 3x the old hardcoded 0.01 for stronger early exploration.
+    // GPU trainer has no CPU-side selectActions(), so lastEntropy is estimated from
+    // a small forward pass after each train() call (cheap, since GPU is already synced).
+    this.entropyCoeff = 0.03;
+    this.targetEntropy = 0.5 * Math.log(this.boardSize * 0.3);
+    this.entropyAlpha = 0.0005;
+    this.lastEntropy = 0;
 
     // CPU metadata — trivial scalars, no GPU transfer needed
     this.turns = new Int32Array(this.numGames);
@@ -425,7 +434,7 @@ export class GPUTrainer {
         var logProbs = selectedProbs.add(tf.scalar(1e-8)).log();
         var policyLoss = logProbs.mul(rewardsTensor).mean().neg();
         var entropy = preds.add(tf.scalar(1e-8)).log().mul(preds).sum(1).mean().neg();
-        return policyLoss.sub(entropy.mul(tf.scalar(0.01)));
+        return policyLoss.sub(entropy.mul(tf.scalar(self.entropyCoeff)));
       }, true);
 
       if (loss) {
@@ -436,10 +445,53 @@ export class GPUTrainer {
       console.warn('GPU trainer training error:', e.message);
     }
 
+    // Estimate policy entropy from the training batch for adaptive coefficient.
+    // GPU is already synced (loss.dataSync above), so this forward pass is cheap.
+    // Use a small sample (up to 16) to avoid unnecessary GPU work.
+    var entropySampleSize = Math.min(16, n);
+    try {
+      var sampleStates = statesTensor.slice([0, 0], [entropySampleSize, boardSize]);
+      var sampleMask = validMaskTensor.slice([0, 0], [entropySampleSize, boardSize]);
+      var sampleOut = self.model.model.predict(sampleStates);
+      var sampleLogits = tf.tidy(function () {
+        var logits = sampleOut.slice([0, 0], [-1, boardSize]);
+        return logits.add(sampleMask.sub(1).mul(1e9));
+      });
+      var probsData = tf.tidy(function () { return sampleLogits.softmax(); }).dataSync();
+      sampleLogits.dispose();
+      sampleOut.dispose();
+      sampleStates.dispose();
+      sampleMask.dispose();
+
+      // Compute mean entropy on CPU from the sampled probs
+      var entropySum = 0;
+      for (var si = 0; si < entropySampleSize; si++) {
+        var ent = 0;
+        for (var sj = 0; sj < boardSize; sj++) {
+          var p = probsData[si * boardSize + sj];
+          if (p > 1e-8) ent -= p * Math.log(p);
+        }
+        entropySum += ent;
+      }
+      self.lastEntropy = entropySum / entropySampleSize;
+    } catch (e) {
+      // Entropy estimation is best-effort; don't block training on failure
+    }
+
     statesTensor.dispose();
     actionMaskTensor.dispose();
     rewardsTensor.dispose();
     validMaskTensor.dispose();
+
+    // Adapt entropy coefficient toward target using lastEntropy from batch sample.
+    // OUTSIDE minimize() — never put adaptation/dataSync inside the gradient tape.
+    // If entropy < target, increase coeff to encourage exploration;
+    // if entropy > target, decrease coeff to allow exploitation.
+    if (self.lastEntropy > 0) {
+      var entropyError = self.targetEntropy - self.lastEntropy;
+      self.entropyCoeff = Math.max(0.001, Math.min(0.1, self.entropyCoeff + self.entropyAlpha * entropyError));
+    }
+
     self.trainSteps++;
     return lossVal;
   }
@@ -502,7 +554,7 @@ export class GPUTrainer {
 
     setTimeout(function () {
       try {
-        var game = new Game(self.rows, self.cols, self.walls);
+        var game = createGame(self.gameType, self.rows, self.cols);
         var boardSize = self.boardSize;
         var maxTurns = boardSize * 2;
 

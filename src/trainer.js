@@ -1,11 +1,12 @@
-import { Game } from './game';
+import { createGame } from './game';
 
 // SelfPlayTrainer orchestrates parallel self-play games.
 // It is algorithm-agnostic: it calls algo.selectActions() and algo.onGameFinished().
 // History stores full ActionResult metadata via Object.assign (no branching on algo type).
 //
-// Checkpoint integration: when a checkpointPool is provided, ~10% of game slots
-// play current model (P1) vs a past checkpoint (P2). These games update Elo
+// Checkpoint integration: when a checkpointPool is provided, a configurable
+// fraction of game slots plays current model (P1) vs a past checkpoint (P2).
+// These games update Elo
 // ratings and still contribute P1 moves to the training buffer.
 
 export class SelfPlayTrainer {
@@ -17,7 +18,7 @@ export class SelfPlayTrainer {
     this.boardSize = this.rows * this.cols;
     this.trainBatchSize = config.trainBatchSize || 256;
     this.trainInterval = config.trainInterval || 20;
-    this.walls = config.walls !== false;
+    this.gameType = config.gameType || 'plague_walls';
     this.checkpointPool = config.checkpointPool || null;
 
     this.games = [];
@@ -38,7 +39,7 @@ export class SelfPlayTrainer {
   _newSlot() {
     var vs = this.checkpointPool && this.checkpointPool.shouldBeCheckpointGame();
     return {
-      game: new Game(this.rows, this.cols, this.walls),
+      game: createGame(this.gameType, this.rows, this.cols),
       history: [],
       turn: 0,
       done: false,
