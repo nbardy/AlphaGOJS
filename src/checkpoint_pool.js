@@ -11,7 +11,8 @@ import { maskedSoftmax, sampleFromProbs } from './action';
 export class CheckpointPool {
   constructor(createModelFn, config) {
     config = config || {};
-    this.checkpoints = [];       // { weights: [{shape,data}], elo, gen }
+    this.checkpoints = [];       // { id, weights: [{shape,data}], elo, gen }
+    this.nextCheckpointId = 1;
     this.currentElo = 1000;
     this.maxCheckpoints = config.maxCheckpoints || 50;
     this.saveInterval = config.saveInterval || 20;      // save checkpoint every N generations
@@ -35,6 +36,7 @@ export class CheckpointPool {
       return { shape: w.shape.slice(), data: new Float32Array(d) };
     });
     this.checkpoints.push({
+      id: this.nextCheckpointId++,
       weights: weights,
       elo: this.currentElo,
       gen: generation
@@ -103,11 +105,26 @@ export class CheckpointPool {
     return Math.floor(Math.random() * n);
   }
 
-  // Load a checkpoint into the opponent model.
-  loadRandomOpponent() {
-    if (this.checkpoints.length === 0) return -1;
-    this._ensureOpponent();
+  pickRandomOpponentIndex() {
+    return this._pickCheckpointIndex();
+  }
+
+  _findIndexById(id) {
+    for (var i = 0; i < this.checkpoints.length; i++) {
+      if (this.checkpoints[i].id === id) return i;
+    }
+    return -1;
+  }
+
+  pickRandomOpponentId() {
     var idx = this._pickCheckpointIndex();
+    if (idx < 0) return -1;
+    return this.checkpoints[idx].id;
+  }
+
+  loadOpponentByIndex(idx) {
+    if (idx < 0 || idx >= this.checkpoints.length) return -1;
+    this._ensureOpponent();
     var ckpt = this.checkpoints[idx];
     var tensors = ckpt.weights.map(function (w) {
       return tf.tensor(w.data, w.shape);
@@ -116,6 +133,19 @@ export class CheckpointPool {
     tensors.forEach(function (t) { t.dispose(); });
     this.loadedIdx = idx;
     return idx;
+  }
+
+  loadOpponentById(id) {
+    var idx = this._findIndexById(id);
+    if (idx < 0) return -1;
+    return this.loadOpponentByIndex(idx);
+  }
+
+  // Load a checkpoint into the opponent model.
+  loadRandomOpponent() {
+    if (this.checkpoints.length === 0) return -1;
+    var idx = this._pickCheckpointIndex();
+    return this.loadOpponentByIndex(idx);
   }
 
   // Batch action selection for the checkpoint opponent.
@@ -148,7 +178,12 @@ export class CheckpointPool {
   // currentWon: true if current model (P1) won.
   updateElo(currentWon, draw) {
     if (this.loadedIdx < 0 || this.loadedIdx >= this.checkpoints.length) return;
-    var ckpt = this.checkpoints[this.loadedIdx];
+    this.updateEloForIndex(this.loadedIdx, currentWon, draw);
+  }
+
+  updateEloForIndex(idx, currentWon, draw) {
+    if (idx < 0 || idx >= this.checkpoints.length) return;
+    var ckpt = this.checkpoints[idx];
     var expected = 1 / (1 + Math.pow(10, (ckpt.elo - this.currentElo) / 400));
     var actual = draw ? 0.5 : (currentWon ? 1 : 0);
     this.currentElo += this.eloK * (actual - expected);
@@ -156,6 +191,12 @@ export class CheckpointPool {
 
     this.recentGames++;
     if (currentWon) this.recentWins++;
+  }
+
+  updateEloForId(id, currentWon, draw) {
+    var idx = this._findIndexById(id);
+    if (idx < 0) return;
+    this.updateEloForIndex(idx, currentWon, draw);
   }
 
   getCurrentElo() {

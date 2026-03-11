@@ -7,7 +7,10 @@ module.exports = {
   output: {
     path: path.resolve(__dirname, 'docs'),
     filename: 'app.bundle.js',
-    clean: true
+    clean: {
+      // Preserve implementation tracking docs under docs/ between builds.
+      keep: /NEXTGEN_.*\.md$/
+    }
   },
   plugins: [
     new HtmlWebpackPlugin({

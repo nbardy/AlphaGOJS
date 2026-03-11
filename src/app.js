@@ -2,8 +2,13 @@ import { createModel, listModelTypes } from './model_registry';
 import { createAlgorithm, listAlgorithmTypes } from './algo_registry';
 import { assertModelContract, assertAlgorithmContract } from './contracts';
 import { SelfPlayTrainer } from './trainer';
-import { GPUTrainer } from './gpu_trainer';
+import { GPUAlgoAdapter } from './algos/gpu_algo_adapter';
+import { GPUOrchestrator } from './orchestration/gpu_orchestrator';
+import { createGPUWorkerPipeline } from './nextgen/create_gpu_worker_pipeline';
+import { probeCapabilities } from './nextgen/capability_probe';
+import { chooseRuntimeTier } from './nextgen/runtime_planner';
 import { CheckpointPool } from './checkpoint_pool';
+import { resolveRuntimeSpec, listRuntimeTypes } from './runtime/runtime_registry';
 import { UI } from './ui';
 
 // --- Configuration ---
@@ -18,12 +23,14 @@ var CHECKPOINT_POOL_CONFIG = {
   saveInterval: 20
 };
 
-// Pipeline type dispatcher: 'cpu' uses SelfPlayTrainer (model+algo abstraction),
-// 'gpu' uses GPUTrainer (all game state on GPU, ~320 bytes/tick transfer).
-// GPU pipeline bypasses the algo abstraction — GPUTrainer owns its own training loop
-// and exposes selectAction directly for human play.
-// gameType is a registry key (e.g. 'plague_walls', 'plague_classic').
-function createCPUPipeline(modelType, algoType, rows, cols, numGames, gameType) {
+function pickNum(v, fallback) {
+  return typeof v === 'number' ? v : fallback;
+}
+
+// Pipeline constructors (internal implementation targets). Runtime selection
+// is handled separately by runtime_registry.
+function createCPUPipeline(modelType, algoType, rows, cols, numGames, gameType, runtimeOptions, runtimeId) {
+  runtimeOptions = runtimeOptions || {};
   var model = createModel(modelType, rows, cols);
   assertModelContract(model);
   var algo = createAlgorithm(algoType, model);
@@ -36,53 +43,111 @@ function createCPUPipeline(modelType, algoType, rows, cols, numGames, gameType) 
     rows: rows,
     cols: cols,
     gameType: gameType,
-    trainBatchSize: 512,
-    trainInterval: 30,
+    trainBatchSize: pickNum(runtimeOptions.trainBatchSize, 512),
+    trainInterval: pickNum(runtimeOptions.trainInterval, 30),
     checkpointPool: pool
   });
-  return { trainer: trainer, algo: algo, pool: pool, pipelineType: 'cpu' };
+  return { trainer: trainer, algo: algo, pool: pool, pipelineType: runtimeId || 'cpu' };
 }
 
-function createGPUPipeline(modelType, rows, cols, numGames, gameType) {
+function createGPUPipeline(modelType, algoType, rows, cols, numGames, gameType, runtimeOptions, runtimeId) {
+  runtimeOptions = runtimeOptions || {};
   var model = createModel(modelType, rows, cols);
   assertModelContract(model);
+  var algo = createAlgorithm(algoType, model);
+  assertAlgorithmContract(algo);
+  var gpuAlgo = new GPUAlgoAdapter(algo, model);
   var pool = new CheckpointPool(function () {
     return createModel(modelType, rows, cols);
   }, CHECKPOINT_POOL_CONFIG);
-  // GPUTrainer owns its game loop on GPU; checkpoint pool runs async CPU-side
-  // Elo eval (1 game every 10 gens) so the Elo chart is no longer flat.
-  var trainer = new GPUTrainer(model, {
+  // GPUOrchestrator keeps game simulation on GPU while allowing pluggable
+  // algorithms (PPO/PPG/SAC/MuZero/REINFORCE) through a unified adapter.
+  var trainer = new GPUOrchestrator(model, gpuAlgo, {
     numGames: numGames,
     rows: rows,
     cols: cols,
     gameType: gameType,
-    trainBatchSize: 512,
-    trainInterval: 30,
+    trainBatchSize: pickNum(runtimeOptions.trainBatchSize, 512),
+    trainInterval: pickNum(runtimeOptions.trainInterval, 30),
     checkpointPool: pool
   });
-  return { trainer: trainer, algo: null, pool: pool, pipelineType: 'gpu' };
+  return { trainer: trainer, algo: algo, pool: pool, pipelineType: runtimeId || 'gpu' };
 }
 
 export function createPipeline(modelType, algoType, rows, cols, numGames, pipelineType, gameType) {
   var resolvedGameType = gameType || 'plague_walls';
-  // GPUTrainer currently implements a REINFORCE-like internal loop.
-  // Advanced algorithms (SAC/PPG/MuZero) run on CPU pipeline.
-  if (pipelineType === 'gpu' && (algoType === 'ppo' || algoType === 'reinforce')) {
-    return createGPUPipeline(modelType, rows, cols, numGames, resolvedGameType);
+  var runtimeSpec = resolveRuntimeSpec(pipelineType);
+  var requestedRuntimeId = pipelineType || runtimeSpec.id;
+  var runtimeOptions = runtimeSpec.options || {};
+
+  if (runtimeSpec.pipelineKind === 'gpu_worker') {
+    var workerOptions = Object.assign({}, runtimeOptions, {
+      pipelineTypeOverride: requestedRuntimeId
+    });
+    return createGPUWorkerPipeline(
+      modelType,
+      algoType,
+      rows,
+      cols,
+      numGames,
+      resolvedGameType,
+      CHECKPOINT_POOL_CONFIG,
+      workerOptions
+    );
   }
-  if (pipelineType === 'gpu') {
-    return createCPUPipeline(modelType, algoType, rows, cols, numGames, resolvedGameType);
+  if (runtimeSpec.pipelineKind === 'gpu') {
+    return createGPUPipeline(
+      modelType,
+      algoType,
+      rows,
+      cols,
+      numGames,
+      resolvedGameType,
+      runtimeOptions,
+      requestedRuntimeId
+    );
   }
-  if (pipelineType === 'cpu' || !pipelineType) return createCPUPipeline(modelType, algoType, rows, cols, numGames, resolvedGameType);
-  throw new Error('Unknown pipeline type: ' + pipelineType);
+  if (runtimeSpec.pipelineKind === 'cpu') {
+    return createCPUPipeline(
+      modelType,
+      algoType,
+      rows,
+      cols,
+      numGames,
+      resolvedGameType,
+      runtimeOptions,
+      requestedRuntimeId
+    );
+  }
+  throw new Error('Unknown runtime pipeline kind: ' + runtimeSpec.pipelineKind);
 }
 
-export { listModelTypes, listAlgorithmTypes };
+export { listModelTypes, listAlgorithmTypes, listRuntimeTypes };
 
 // --- Wiring ---
 
-function start() {
-  var pipeline = createPipeline('dense', 'ppo', ROWS, COLS, NUM_GAMES, 'cpu');
+function mapTierToPipelineType(tier) {
+  if (tier === 'A') return 'single_gpu_phased';
+  if (tier === 'B') return 'cpu_actors_gpu_learner';
+  return 'cpu_actors_gpu_learner';
+}
+
+async function start() {
+  var pipelineType = 'cpu_actors_gpu_learner';
+  try {
+    var cap = await probeCapabilities();
+    var plan = chooseRuntimeTier(cap, {});
+    pipelineType = mapTierToPipelineType(plan.tier);
+  } catch (e) {
+    pipelineType = 'cpu_actors_gpu_learner';
+  }
+
+  var pipeline;
+  try {
+    pipeline = createPipeline('dense', 'ppo', ROWS, COLS, NUM_GAMES, pipelineType);
+  } catch (e) {
+    pipeline = createPipeline('dense', 'ppo', ROWS, COLS, NUM_GAMES, 'cpu_actors_gpu_learner');
+  }
   var ui = new UI(pipeline.trainer, pipeline.algo, {
     rows: ROWS,
     cols: COLS,
@@ -90,7 +155,8 @@ function start() {
     pipelineType: pipeline.pipelineType,
     createPipeline: createPipeline,
     listModelTypes: listModelTypes,
-    listAlgorithmTypes: listAlgorithmTypes
+    listAlgorithmTypes: listAlgorithmTypes,
+    listRuntimeTypes: listRuntimeTypes
   });
   window.__alphaPlague = ui;
 }
@@ -102,4 +168,6 @@ if (module.hot) {
   module.hot.accept();
 }
 
-start();
+start().catch(function (e) {
+  console.error('Bootstrap failed:', e);
+});

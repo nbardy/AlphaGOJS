@@ -163,7 +163,10 @@ export class SelfPlayTrainer {
     if (this.algo.shouldTrain(this.gamesSinceLastTrain, this.trainInterval, this.trainBatchSize)) {
       this.lastLoss = this.algo.train(this.trainBatchSize);
       this.generation++;
-      this.gamesSinceLastTrain = 0;
+      // Consume one interval of game credit per train step so any overflow
+      // above the threshold carries into subsequent train scheduling.
+      var consumedGames = Math.max(1, this.trainInterval || 1);
+      this.gamesSinceLastTrain = Math.max(0, this.gamesSinceLastTrain - consumedGames);
 
       // Save checkpoint + load new opponent for next batch
       if (this.checkpointPool) {

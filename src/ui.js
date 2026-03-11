@@ -7,7 +7,7 @@ export class UI {
     this.trainer = trainer;
     this.algo = algo;
     this.config = config || {};
-    this.pipelineType = this.config.pipelineType || 'cpu';
+    this.pipelineType = this.config.pipelineType || 'cpu_actors_gpu_learner';
     this.gameType = this.config.gameType || 'plague_walls';
     this.rows = trainer.rows;
     this.cols = trainer.cols;
@@ -39,11 +39,17 @@ export class UI {
 
   destroy() {
     this._destroyed = true;
+    if (this.trainer && typeof this.trainer.dispose === 'function') {
+      this.trainer.dispose();
+    }
   }
 
   _restart(modelType, algoType, pipelineType, gameType) {
     if (!this.config.createPipeline) return;
-    this.pipelineType = pipelineType || 'cpu';
+    if (this.trainer && typeof this.trainer.dispose === 'function') {
+      this.trainer.dispose();
+    }
+    this.pipelineType = pipelineType || 'cpu_actors_gpu_learner';
     this.gameType = gameType || 'plague_walls';
     var pipeline = this.config.createPipeline(
       modelType, algoType,
@@ -215,11 +221,23 @@ export class UI {
     else if (algoTypes.length > 0) algoSel.value = algoTypes[0].id;
     controls.appendChild(algoSel);
 
-    // Pipeline select (CPU vs GPU)
+    // Runtime select (modular execution topology)
     var pipeSel = document.createElement('select');
     pipeSel.id = 'pipe-sel';
     pipeSel.className = 'cfg-select';
-    pipeSel.innerHTML = '<option value="cpu">CPU</option><option value="gpu">GPU (fast)</option>';
+    var runtimeTypes = this.config.listRuntimeTypes ? this.config.listRuntimeTypes() : [
+      { id: 'single_gpu_phased', label: 'Single GPU (phased)' },
+      { id: 'cpu_actors_gpu_learner', label: 'CPU Actors + GPU Learner' },
+      { id: 'full_gpu_resident', label: 'Full GPU Resident' },
+      { id: 'cpu', label: 'CPU (legacy)' },
+      { id: 'gpu', label: 'GPU (legacy)' },
+      { id: 'gpu_worker', label: 'GPU Worker (legacy)' }
+    ];
+    var runtimeOptionsHTML = '';
+    for (var ri = 0; ri < runtimeTypes.length; ri++) {
+      runtimeOptionsHTML += '<option value="' + runtimeTypes[ri].id + '">' + runtimeTypes[ri].label + '</option>';
+    }
+    pipeSel.innerHTML = runtimeOptionsHTML;
     pipeSel.value = this.pipelineType;
     controls.appendChild(pipeSel);
 
@@ -409,17 +427,27 @@ export class UI {
       var mask = self.humanGame.getValidMovesMask();
       // GPU trainer implements selectAction directly; CPU uses algo wrapper.
       var actionSource = self.algo || self.trainer;
-      var action = actionSource.selectAction(state, mask);
-      self.humanGame.makeMove(-1, action);
-      self.humanGame.spreadPlague();
-      self._renderHuman();
+      var applyAI = function (action) {
+        self.humanGame.makeMove(-1, action);
+        self.humanGame.spreadPlague();
+        self._renderHuman();
 
-      if (self.humanGame.isGameOver() || self.humanGame.getValidMoves().length === 0) {
-        self._endHumanGame();
+        if (self.humanGame.isGameOver() || self.humanGame.getValidMoves().length === 0) {
+          self._endHumanGame();
+        } else {
+          self.humanTurn = true;
+          info.className = 'yt';
+          info.textContent = 'Your turn \u2014 click to place (Green)';
+        }
+      };
+
+      if (actionSource && typeof actionSource.selectActionAsync === 'function') {
+        actionSource.selectActionAsync(state, mask)
+          .then(function (action) { applyAI(action); })
+          .catch(function () { applyAI(0); });
       } else {
-        self.humanTurn = true;
-        info.className = 'yt';
-        info.textContent = 'Your turn \u2014 click to place (Green)';
+        var action = actionSource.selectAction(state, mask);
+        applyAI(action);
       }
     }, 150);
   }
