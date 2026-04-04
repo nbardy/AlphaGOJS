@@ -4,8 +4,9 @@
 // Self-registers as 'plague_walls' on import.
 
 import { registerGame } from './registry';
+import { generatePlagueWallsInto, PLAGUE_WALL_CELL } from '../engine/plague_walls_layout';
 
-var WALL = 2;
+var WALL = PLAGUE_WALL_CELL;
 
 function PlagueWalls(rows, cols) {
   this.rows = rows || 10;
@@ -15,42 +16,8 @@ function PlagueWalls(rows, cols) {
   this._generateWalls();
 }
 
-// Random wall chains scaled to board area.
-// ~5-12 chains per 100 cells, each 1-4 segments with 30% turn chance.
-// Center 3x3 always cleared so the board stays playable.
 PlagueWalls.prototype._generateWalls = function () {
-  var rows = this.rows, cols = this.cols;
-  var area = rows * cols;
-  var baseChains = 5 + Math.floor(Math.random() * 8);
-  var numChains = Math.round(baseChains * area / 100);
-  var DR = [0, 1, 0, -1];
-  var DC = [1, 0, -1, 0];
-
-  for (var chain = 0; chain < numChains; chain++) {
-    var r = Math.floor(Math.random() * rows);
-    var c = Math.floor(Math.random() * cols);
-    var len = 1 + Math.floor(Math.random() * 4);
-    var dir = Math.floor(Math.random() * 4);
-
-    for (var seg = 0; seg < len; seg++) {
-      if (r < 0 || r >= rows || c < 0 || c >= cols) break;
-      this.board[r * cols + c] = WALL;
-      r += DR[dir];
-      c += DC[dir];
-      if (Math.random() < 0.3) {
-        dir = (dir + (Math.random() < 0.5 ? 1 : 3)) % 4;
-      }
-    }
-  }
-
-  // Clear center 3x3 so mid-board is always playable
-  var midR = Math.floor(rows / 2), midC = Math.floor(cols / 2);
-  for (var dr = -1; dr <= 1; dr++) {
-    for (var dc = -1; dc <= 1; dc++) {
-      var idx = (midR + dr) * cols + (midC + dc);
-      if (idx >= 0 && idx < this.size) this.board[idx] = 0;
-    }
-  }
+  generatePlagueWallsInto(this.board, this.rows, this.cols, Math.random);
 };
 
 PlagueWalls.prototype.reset = function () {

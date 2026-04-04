@@ -41,6 +41,7 @@ export class GPUOrchestrator {
       cols: this.cols,
       gameType: this.gameType
     });
+    this.engine.seedInitialBoardsIfNeeded();
 
     this.trainQueue = new AsyncJobQueue(1);
     this.maintenanceQueue = new AsyncJobQueue(1);

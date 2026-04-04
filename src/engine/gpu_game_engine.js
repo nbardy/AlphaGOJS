@@ -1,4 +1,5 @@
 import * as tf from '@tensorflow/tfjs';
+import { generatePlagueWallsInto, PLAGUE_WALL_CELL } from './plague_walls_layout';
 
 // GPU simulation engine: owns only environment state and transitions.
 // Hot path avoids full-board readback: gather rows for inference, small
@@ -100,7 +101,9 @@ export class GPUGameEngine {
     var boardSize = this.boardSize;
     this.state = tf.tidy(function () {
       var grid = oldState.reshape([N, rows, cols, 1]);
-      var neighborSum = tf.conv2d(grid, kernel, 1, 'same');
+      // Only ±1 cells influence spread; walls (2) and empty (0) contribute 0 — matches CPU plague_walls.
+      var playerOnly = grid.mul(grid.abs().equal(1).cast('float32'));
+      var neighborSum = tf.conv2d(playerOnly, kernel, 1, 'same');
       var rand = tf.randomUniform(neighborSum.shape);
       var weighted = neighborSum.mul(rand).mul(2);
       var emptyMask = grid.equal(0).cast('float32');
@@ -117,8 +120,9 @@ export class GPUGameEngine {
     var packed = tf.tidy(function () {
       var s = self.state;
       var empty = s.equal(0).cast('float32').sum(1).expandDims(1);
-      var pos = s.greater(0).cast('float32').sum(1).expandDims(1);
-      var neg = s.less(0).cast('float32').sum(1).expandDims(1);
+      // Walls are PLAGUE_WALL_CELL (2); must not count as P1 territory.
+      var pos = s.equal(1).cast('float32').sum(1).expandDims(1);
+      var neg = s.equal(-1).cast('float32').sum(1).expandDims(1);
       return tf.concat([empty, pos, neg], 1);
     });
     this._trackReadback(N * 3);
@@ -147,15 +151,30 @@ export class GPUGameEngine {
   resetSlots(indices) {
     if (!indices || indices.length === 0) return;
     var N = this.numGames;
+    var B = this.boardSize;
     var oldState = this.state;
-    this.state = tf.tidy(function () {
-      var idxT = tf.tensor1d(indices, 'int32');
-      var oh = tf.oneHot(idxT, N);
-      var rowReset = oh.max(0).expandDims(1);
-      var keep = tf.sub(1, rowReset);
-      return oldState.mul(keep);
-    });
-    oldState.dispose();
+
+    if (this.gameType === 'plague_walls') {
+      var data = oldState.dataSync();
+      oldState.dispose();
+      for (var ri = 0; ri < indices.length; ri++) {
+        var slot = indices[ri];
+        var rowBuf = new Int8Array(B);
+        generatePlagueWallsInto(rowBuf, this.rows, this.cols);
+        var base = slot * B;
+        for (var j = 0; j < B; j++) data[base + j] = rowBuf[j];
+      }
+      this.state = tf.tensor2d(data, [N, B]);
+    } else {
+      this.state = tf.tidy(function () {
+        var idxT = tf.tensor1d(indices, 'int32');
+        var oh = tf.oneHot(idxT, N);
+        var rowReset = oh.max(0).expandDims(1);
+        var keep = tf.sub(1, rowReset);
+        return oldState.mul(keep);
+      });
+      oldState.dispose();
+    }
 
     for (var k = 0; k < indices.length; k++) {
       var i = indices[k];
@@ -170,7 +189,7 @@ export class GPUGameEngine {
    * Gather state rows for listed slots. Returns NEW tensors (caller must dispose):
    * raw board rows shaped [k, boardSize]. On GPU, legal cells are empty iff
    * `raw.equal(0)` (mask for policy: `.cast('float32')`); player observation is
-   * `raw.mul(player)` for player ∈ {1, -1}.
+   * `raw.mul(player)` for player ∈ {1, -1} (walls: see extractStatesMasksCPU).
    */
   gatherSlotsTensor(slotIds) {
     if (!slotIds || slotIds.length === 0) return null;
@@ -200,7 +219,11 @@ export class GPUGameEngine {
       var mask = new Float32Array(boardSize);
       for (var j = 0; j < boardSize; j++) {
         var v = stateData[offset + j];
-        state[j] = v * player;
+        if (v === PLAGUE_WALL_CELL) {
+          state[j] = 0.5;
+        } else {
+          state[j] = v * player;
+        }
         mask[j] = v === 0 ? 1 : 0;
       }
       outStates.push(state);
@@ -246,6 +269,24 @@ export class GPUGameEngine {
       done: this.done,
       winners: this.winners
     };
+  }
+
+  /**
+   * plague_walls: random wall layout per row (matches CPU). plague_classic: no-op (zeros).
+   */
+  seedInitialBoardsIfNeeded() {
+    if (this.gameType !== 'plague_walls') return;
+    var N = this.numGames;
+    var B = this.boardSize;
+    var data = new Float32Array(N * B);
+    for (var s = 0; s < N; s++) {
+      var rowBuf = new Int8Array(B);
+      generatePlagueWallsInto(rowBuf, this.rows, this.cols);
+      var base = s * B;
+      for (var j = 0; j < B; j++) data[base + j] = rowBuf[j];
+    }
+    if (this.state) this.state.dispose();
+    this.state = tf.tensor2d(data, [N, B]);
   }
 
   dispose() {
