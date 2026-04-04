@@ -49,3 +49,8 @@ Longer, narrative companion to [key_learnings.md](./key_learnings.md) (dense). N
 ## Observed outcome at “key_learnings” commit
 
 After the above were in tree together, **training showed convergence** and **league Elo increased** in manual runs — documented as motivation in `key_learnings.md`, not as a reproducible benchmark unless captured in `bench:system:headless` JSON or pinned seeds.
+
+---
+
+- **2026-04-04:** `NODE_OPTIONS=--openssl-legacy-provider npx webpack --config webpack.config.js` OK; `npm run bench:loop` failed (Puppeteer: Chrome not found / sandbox cache).
+- **2026-04-04 (follow-up):** **`GPUOrchestrator`** gained worker-style **`_buildActionBatchGpu`** + tensor **`_selectWithAlgorithm`** (`app.js` passes **`algoType`** for minification-safe kind). **`GPUGameEngine.resetSlots`** (`plague_walls`) avoids full-board **`dataSync`** when only some rows reset (sorted indices → **`tf.slice`** keep runs + fresh wall rows + **`tf.concat`**; full-matrix regen when all slots reset). Docs: **`key_learnings`**, **`THREAD_RECAP`**, this line.

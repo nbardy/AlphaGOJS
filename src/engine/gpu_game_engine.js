@@ -152,19 +152,57 @@ export class GPUGameEngine {
     if (!indices || indices.length === 0) return;
     var N = this.numGames;
     var B = this.boardSize;
+    var rows = this.rows;
+    var cols = this.cols;
     var oldState = this.state;
 
     if (this.gameType === 'plague_walls') {
-      var data = oldState.dataSync();
-      oldState.dispose();
-      for (var ri = 0; ri < indices.length; ri++) {
-        var slot = indices[ri];
-        var rowBuf = new Int8Array(B);
-        generatePlagueWallsInto(rowBuf, this.rows, this.cols);
-        var base = slot * B;
-        for (var j = 0; j < B; j++) data[base + j] = rowBuf[j];
+      // Unique valid slots, sorted so we can tf.slice contiguous "keep" runs and
+      // splice fresh wall layouts — avoids full-board dataSync when few games reset.
+      var sorted = indices.slice();
+      sorted.sort(function (a, b) { return a - b; });
+      var unique = [];
+      for (var ui = 0; ui < sorted.length; ui++) {
+        var sl = sorted[ui];
+        if (sl < 0 || sl >= N) continue;
+        if (ui === 0 || sl !== sorted[ui - 1]) unique.push(sl);
       }
-      this.state = tf.tensor2d(data, [N, B]);
+
+      if (unique.length === 0) {
+        // Invalid indices only — leave GPU state untouched (same observable rows).
+      } else if (unique.length === N) {
+        var dataAll = new Float32Array(N * B);
+        var rowBufAll = new Int8Array(B);
+        for (var sa = 0; sa < N; sa++) {
+          generatePlagueWallsInto(rowBufAll, rows, cols);
+          var baseA = sa * B;
+          for (var ja = 0; ja < B; ja++) dataAll[baseA + ja] = rowBufAll[ja];
+        }
+        oldState.dispose();
+        this.state = tf.tensor2d(dataAll, [N, B]);
+      } else {
+        var rowBuf = new Int8Array(B);
+        var rowFloat = new Float32Array(B);
+        var newState = tf.tidy(function () {
+          var pieces = [];
+          var rowStart = 0;
+          for (var t = 0; t <= unique.length; t++) {
+            var resetAt = (t < unique.length) ? unique[t] : N;
+            if (resetAt > rowStart) {
+              pieces.push(tf.slice(oldState, [rowStart, 0], [resetAt - rowStart, B]));
+            }
+            if (t < unique.length) {
+              generatePlagueWallsInto(rowBuf, rows, cols);
+              for (var j = 0; j < B; j++) rowFloat[j] = rowBuf[j];
+              pieces.push(tf.tensor2d(rowFloat, [1, B]));
+              rowStart = unique[t] + 1;
+            }
+          }
+          return pieces.length === 1 ? pieces[0] : tf.concat(pieces, 0);
+        });
+        oldState.dispose();
+        this.state = newState;
+      }
     } else {
       this.state = tf.tidy(function () {
         var idxT = tf.tensor1d(indices, 'int32');

@@ -42,6 +42,9 @@ At the revision when this file was added, **training was observed to converge** 
 - **Resident mode without back-pressure** → `queueDepth` pegged, **0 effective progress**; **soft queue cap** on the proxy mitigates (`src/nextgen/gpu_worker_trainer_proxy.js`).
 - **Dropping worker `runtimeOptions`** at init → bench flags / entropy path broken; init must **merge** full options into the worker.
 - **Checkpoint inference** doing full **logit `dataSync`** per batch → slow; **batched forward + multinomial + actions-only readback** (with CPU fallback) aligns cost with what league play needs.
+- **PPO `oldLogProb` vs train:** Buffer log π must match **`tf.logSoftmax(maskedLogits)`** at the taken action. CPU rollouts use **`logProbMaskedLogits` / `logProbOfAction`** (`src/action.js`, `ppo.js` `selectActions`); GPU rollouts use the same masked normalization via **TF `logSoftmax` + one-hot gather** (`gpu_owner_runtime.js`). Mismatch breaks importance ratios.
+- **`plague_walls` GPU–CPU parity:** **`plague_walls_layout`** shares wall RNG/placement; **`gpu_game_engine`** spread/neighbors/terminals track CPU rules; policy tensors use **wall = 0.5** like **`getBoardForNN`** (`gpu_orchestrator.js`, `gpu_owner_runtime.js`).
+- **`gpu_orchestrator`:** Happy path **GPU `gatherSlotsTensor`** → obs/mask; **`extractStatesMasksCPU`** only on **fallback** after batched TF select failures (plus compact CPU snapshots for trajectory replay per file comments).
 
 ---
 
@@ -53,7 +56,7 @@ At the revision when this file was added, **training was observed to converge** 
 | Masked probs / flatten states | `src/action.js` |
 | Model architecture | `src/spatial_lite_model.js`, `src/model_registry.js` |
 | App defaults, URL presets, checkpoint pool config | `src/app.js` |
-| GPU sim + gather / batched policy path | `src/engine/gpu_game_engine.js`, `src/nextgen/runtime/gpu_owner_runtime.js` |
+| GPU sim + gather / batched policy path | `src/engine/gpu_game_engine.js`, `src/nextgen/runtime/gpu_owner_runtime.js`, `src/orchestration/gpu_orchestrator.js` (main-thread GPU pipeline: same gather → tensor select + fallbacks) |
 | Checkpoint opponent sampling | `src/checkpoint_pool.js` |
 | Pipeline presets, queue cap | `src/runtime/runtime_registry.js`, `src/nextgen/gpu_worker_trainer_proxy.js` |
 

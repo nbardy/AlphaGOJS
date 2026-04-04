@@ -1,7 +1,8 @@
 import * as tf from '@tensorflow/tfjs';
-import { maskedSoftmax, sampleFromProbs } from '../action';
+import { flattenStates, maskedSoftmax, sampleFromProbs } from '../action';
 import { createGame } from '../game';
 import { GPUGameEngine } from '../engine/gpu_game_engine';
+import { PLAGUE_WALL_CELL } from '../engine/plague_walls_layout';
 import { AsyncJobQueue } from '../core/job_queue';
 
 // GPUOrchestrator
@@ -24,6 +25,10 @@ export class GPUOrchestrator {
     this.gameType = config.gameType || 'plague_walls';
     this.checkpointPool = config.checkpointPool || null;
     this.enableAsyncEloEval = !!config.enableAsyncEloEval;
+    this._useGpuBatchedPolicySelect = config.useGpuBatchedPolicySelect !== false;
+    this._algoKind = typeof config.algoType === 'string' && config.algoType
+      ? config.algoType
+      : this._inferWrappedAlgoKind();
 
     var uim = config.uiSnapshotMaxGames;
     if (typeof uim === 'number' && uim > 0) {
@@ -82,7 +87,9 @@ export class GPUOrchestrator {
 
     // P1 moves (always current algorithm)
     var p1Active = this.engine.getActiveSlots();
-    var p1Batch = this._buildActionBatch(p1Active, 1);
+    var p1Batch = (this._policySelectUsesGpuBatchedPath()
+      ? this._buildActionBatchGpu(p1Active, 1)
+      : this._buildActionBatch(p1Active, 1));
     if (p1Batch.slotIds.length > 0) {
       var p1Sel = this._selectWithAlgorithm(p1Batch);
       this.engine.applyActions(1, p1Batch.slotIds, p1Sel.actionsBySlot);
@@ -98,7 +105,9 @@ export class GPUOrchestrator {
       var p2ActionsBySlot = new Int32Array(this.numGames);
       var p2ApplySlots = [];
 
-      var selfBatch = this._buildActionBatch(split.selfSlots, -1);
+      var selfBatch = (this._policySelectUsesGpuBatchedPath()
+        ? this._buildActionBatchGpu(split.selfSlots, -1)
+        : this._buildActionBatch(split.selfSlots, -1));
       if (selfBatch.slotIds.length > 0) {
         var p2Sel = this._selectWithAlgorithm(selfBatch);
         for (var i = 0; i < selfBatch.slotIds.length; i++) {
@@ -165,7 +174,295 @@ export class GPUOrchestrator {
     return out;
   }
 
+  _inferWrappedAlgoKind() {
+    var inner = this.algo && this.algo.algo;
+    if (!inner || !inner.constructor || !inner.constructor.name) return '';
+    var n = inner.constructor.name;
+    if (n === 'PPO') return 'ppo';
+    if (n === 'PPG') return 'ppg';
+    if (n === 'Reinforce') return 'reinforce';
+    return '';
+  }
+
+  /**
+   * Self-play GPU path: gather rows on GPU, filter rows with no legal moves via a
+   * small (k-float) readback. Caller passes batch to _selectWithAlgorithm; tensors
+   * are disposed inside GPU batched tensor select (or on fallback error).
+   */
+  _buildActionBatchGpu(slotIds, player) {
+    var empty = { slotIds: [], states: [], masks: [], _obsTensor: null, _maskTensor: null, _gpuPerspective: player };
+    if (!slotIds || slotIds.length === 0) return empty;
+
+    var raw = this.engine.gatherSlotsTensor(slotIds);
+    var mask = raw.equal(0).cast('float32');
+    var rowSums = mask.sum(1);
+    this.engine._trackReadback(slotIds.length);
+    var sumData = rowSums.dataSync();
+    rowSums.dispose();
+
+    var keepIdx = [];
+    for (var i = 0; i < slotIds.length; i++) {
+      if (sumData[i] > 0) keepIdx.push(i);
+    }
+    if (keepIdx.length === 0) {
+      raw.dispose();
+      mask.dispose();
+      return empty;
+    }
+
+    var idxT = tf.tensor1d(keepIdx, 'int32');
+    var rawK = tf.gather(raw, idxT, 0);
+    var maskK = tf.gather(mask, idxT, 0);
+    raw.dispose();
+    mask.dispose();
+    idxT.dispose();
+
+    var pSc = tf.scalar(player);
+    // Match getBoardForNN(plague_walls): wall = 0.5, else v * player.
+    var obs = tf.tidy(function () {
+      var isWall = rawK.equal(PLAGUE_WALL_CELL).cast('float32');
+      var nonWall = tf.sub(1, isWall);
+      var perspective = rawK.mul(pSc);
+      return isWall.mul(0.5).add(nonWall.mul(perspective));
+    });
+    rawK.dispose();
+    pSc.dispose();
+
+    return {
+      slotIds: keepIdx.map(function (j) { return slotIds[j]; }),
+      states: [],
+      masks: [],
+      _obsTensor: obs,
+      _maskTensor: maskK,
+      _gpuPerspective: player
+    };
+  }
+
+  _policySelectUsesGpuBatchedPath() {
+    if (!this._useGpuBatchedPolicySelect) return false;
+    if (!this.model || typeof this.model.forward !== 'function') return false;
+    var k = this._algoKind;
+    return k === 'ppo' || k === 'reinforce' || k === 'ppg';
+  }
+
+  /**
+   * Batched policy forward + tf.multinomial on GPU; masked logits = logits + (mask-1)*1e9,
+   * logSoftmax for log probs. PPO/REINFORCE/PPG only (see _policySelectUsesGpuBatchedPath).
+   */
+  _selectWithAlgorithmGpuBatched(batch) {
+    return this._gpuBatchedOneModel(batch, this.model);
+  }
+
+  _gpuBatchedOneModel(batch, model) {
+    var self = this;
+    var k = batch.slotIds.length;
+    var boardSize = this.boardSize;
+    var N = this.numGames;
+    var flatStates = flattenStates(batch.states, boardSize);
+    var maskFlat = new Float32Array(k * boardSize);
+    for (var i = 0; i < k; i++) {
+      maskFlat.set(batch.masks[i], i * boardSize);
+    }
+
+    var entropyScalar = 0;
+    var actionsKept;
+    var logProbKept;
+    var valueKept;
+
+    tf.tidy(function () {
+      var statesT = tf.tensor2d(flatStates, [k, boardSize]);
+      var fwd = model.forward(statesT);
+      var logits = fwd.policy;
+      var vals = fwd.value;
+      var maskT = tf.tensor2d(maskFlat, [k, boardSize]);
+      var maskedLogits = logits.add(maskT.sub(1).mul(1e9));
+      var probs = tf.softmax(maskedLogits);
+      var entMean = probs.mul(tf.log(probs.add(1e-8))).sum(1).neg().mean();
+      entropyScalar = entMean.dataSync()[0];
+
+      var multinom = tf.multinomial(maskedLogits, 2);
+      var actionsT = multinom.slice([0, 1], [-1, 1]).squeeze([1]);
+      var logSM = tf.logSoftmax(maskedLogits);
+      var oh = tf.oneHot(actionsT.cast('int32'), boardSize);
+      var logProbT = logSM.mul(oh).sum(1);
+
+      actionsKept = tf.keep(actionsT.clone());
+      logProbKept = tf.keep(logProbT.clone());
+      valueKept = tf.keep(vals.clone());
+    });
+
+    var ad = actionsKept.dataSync();
+    var lp = logProbKept.dataSync();
+    var vd = valueKept.dataSync();
+    actionsKept.dispose();
+    logProbKept.dispose();
+    valueKept.dispose();
+
+    var actionsBySlot = new Int32Array(N);
+    var actions = new Int32Array(k);
+    var logProbs = new Float32Array(k);
+    var values = new Float32Array(k);
+    for (var ii = 0; ii < k; ii++) {
+      var slot = batch.slotIds[ii];
+      var ai = Math.round(ad[ii]);
+      if (ai < 0 || ai >= boardSize || batch.masks[ii][ai] <= 0) {
+        ai = self._fallbackAction(batch.masks[ii]);
+      }
+      actionsBySlot[slot] = ai;
+      actions[ii] = ai;
+      logProbs[ii] = lp[ii];
+      values[ii] = vd[ii];
+    }
+
+    return {
+      slotIds: batch.slotIds,
+      actionsBySlot: actionsBySlot,
+      actions: actions,
+      logProbs: logProbs,
+      values: values,
+      entropySum: entropyScalar * k,
+      entropyCount: k
+    };
+  }
+
+  /**
+   * Same masked policy forward + multinomial as _selectWithAlgorithmGpuBatched, but obs/mask
+   * stay on GPU. Fills batch.states / batch.masks from one obs readback for snapshots.
+   */
+  _selectWithAlgorithmGpuBatchedTensors(obsTensor, maskTensor, batch) {
+    return this._gpuBatchedOneModelTensors(obsTensor, maskTensor, batch, this.model);
+  }
+
+  _gpuBatchedOneModelTensors(obsTensor, maskTensor, batch, model) {
+    var self = this;
+    var k = batch.slotIds.length;
+    var boardSize = this.boardSize;
+    var N = this.numGames;
+
+    var entropyScalar = 0;
+    var actionsKept;
+    var logProbKept;
+    var valueKept;
+    try {
+      tf.tidy(function () {
+        var fwd = model.forward(obsTensor);
+        var logits = fwd.policy;
+        var vals = fwd.value;
+        var maskedLogits = logits.add(maskTensor.sub(1).mul(1e9));
+        var probs = tf.softmax(maskedLogits);
+        var entMean = probs.mul(tf.log(probs.add(1e-8))).sum(1).neg().mean();
+        entropyScalar = entMean.dataSync()[0];
+
+        var multinom = tf.multinomial(maskedLogits, 2);
+        var actionsT = multinom.slice([0, 1], [-1, 1]).squeeze([1]);
+        var logSM = tf.logSoftmax(maskedLogits);
+        var oh = tf.oneHot(actionsT.cast('int32'), boardSize);
+        var logProbT = logSM.mul(oh).sum(1);
+
+        actionsKept = tf.keep(actionsT.clone());
+        logProbKept = tf.keep(logProbT.clone());
+        valueKept = tf.keep(vals.clone());
+      });
+    } catch (err) {
+      obsTensor.dispose();
+      maskTensor.dispose();
+      batch._obsTensor = null;
+      batch._maskTensor = null;
+      throw err;
+    }
+
+    var ad = actionsKept.dataSync();
+    var lp = logProbKept.dataSync();
+    var vd = valueKept.dataSync();
+    actionsKept.dispose();
+    logProbKept.dispose();
+    valueKept.dispose();
+
+    this.engine._trackReadback(k * boardSize);
+    var obsFlat = obsTensor.dataSync();
+    obsTensor.dispose();
+    maskTensor.dispose();
+    batch._obsTensor = null;
+    batch._maskTensor = null;
+
+    batch.states = [];
+    batch.masks = [];
+    var EPS = 1e-6;
+    for (var r = 0; r < k; r++) {
+      var offset = r * boardSize;
+      var row = new Float32Array(boardSize);
+      row.set(obsFlat.subarray(offset, offset + boardSize));
+      batch.states.push(row);
+      var maskRow = new Float32Array(boardSize);
+      for (var j = 0; j < boardSize; j++) {
+        maskRow[j] = Math.abs(row[j]) < EPS ? 1 : 0;
+      }
+      batch.masks.push(maskRow);
+    }
+
+    var actionsBySlot = new Int32Array(N);
+    var actions = new Int32Array(k);
+    var logProbs = new Float32Array(k);
+    var values = new Float32Array(k);
+    for (var i = 0; i < k; i++) {
+      var slot = batch.slotIds[i];
+      var ai = Math.round(ad[i]);
+      if (ai < 0 || ai >= boardSize || batch.masks[i][ai] <= 0) {
+        ai = self._fallbackAction(batch.masks[i]);
+      }
+      actionsBySlot[slot] = ai;
+      actions[i] = ai;
+      logProbs[i] = lp[i];
+      values[i] = vd[i];
+    }
+
+    return {
+      slotIds: batch.slotIds,
+      actionsBySlot: actionsBySlot,
+      actions: actions,
+      logProbs: logProbs,
+      values: values,
+      entropySum: entropyScalar * k,
+      entropyCount: k
+    };
+  }
+
   _selectWithAlgorithm(batch) {
+    if (this._policySelectUsesGpuBatchedPath() && batch.slotIds.length > 0) {
+      if (batch._obsTensor != null && batch._maskTensor != null) {
+        try {
+          return this._selectWithAlgorithmGpuBatchedTensors(batch._obsTensor, batch._maskTensor, batch);
+        } catch (e) {
+          if (batch._obsTensor) {
+            try { batch._obsTensor.dispose(); } catch (e2) { /* noop */ }
+          }
+          if (batch._maskTensor) {
+            try { batch._maskTensor.dispose(); } catch (e2) { /* noop */ }
+          }
+          batch._obsTensor = null;
+          batch._maskTensor = null;
+          console.warn('[GPUOrchestrator] GPU batched tensor select failed, CPU rebuild:', e.message);
+          try {
+            var ex = this.engine.extractStatesMasksCPU(batch.slotIds, batch._gpuPerspective);
+            batch.states = ex.states;
+            batch.masks = ex.masks;
+            return this._selectWithAlgorithmGpuBatched(batch);
+          } catch (e3) {
+            console.warn('[GPUOrchestrator] GPU batched (CPU states) failed, using algo.selectActions:', e3.message);
+            var ex2 = this.engine.extractStatesMasksCPU(batch.slotIds, batch._gpuPerspective);
+            batch.states = ex2.states;
+            batch.masks = ex2.masks;
+          }
+        }
+      } else {
+        try {
+          return this._selectWithAlgorithmGpuBatched(batch);
+        } catch (e) {
+          console.warn('[GPUOrchestrator] GPU batched policy select failed, using CPU path:', e.message);
+        }
+      }
+    }
+
     var N = this.numGames;
     var actionsBySlot = new Int32Array(N);
     var k = batch.slotIds.length;

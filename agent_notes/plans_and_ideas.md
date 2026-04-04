@@ -141,6 +141,7 @@ Commits (newest context first):
 | Worker runtime | `src/nextgen/runtime/gpu_owner_runtime.js` |
 | Worker proxy | `src/nextgen/gpu_worker_trainer_proxy.js` |
 | GPU game engine | `src/engine/gpu_game_engine.js` |
+| Main-thread GPU trainer | `src/orchestration/gpu_orchestrator.js` |
 | User-facing caveats | `AGENTS.md` |
 
 ---
@@ -153,3 +154,4 @@ Add a one-line date note when you land a major perf or runtime change.
 - **2026-04:** Default runtime back to **single GPU phased** + **`trainInterval` 30** (autosel tier A/C); full GPU resident manual-only; `agent_notes` §6 training history table.
 - **2026-04-04:** PPO gather + log-softmax path, checkpoint batched action readback, GPU **`_buildActionBatchGpu`** / tensor policy select with CPU fallback, URL **`preset=fast|interactive`**, **Webpack 5** + refreshed **`dist`/`docs`** bundles, **WebGPU plague spread** prototype + benches + spec, **`spatial_lite_model.js`**, proxy/orchestrator/trainer/registry/UI tweaks (see §2 “Apr 2026” above).
 - **2026-04-04 (docs):** **`agent_notes/key_learnings.md`** (dense convergence/Elo/masking/PPO map) + **`exploration_log.md`** (tried items); README index updated. Commit message records **observed convergence + rising Elo** at that point.
+- **2026-04-04:** **`GPUOrchestrator`** tensor batch policy path (parity with worker); **`resetSlots`** partial **`tf.slice`/`concat`** for **`plague_walls`** (no full-board readback on typical resets); **`app.js`** passes **`algoType`** into orchestrator config.

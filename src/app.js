@@ -127,7 +127,8 @@ function createGPUPipeline(modelType, algoType, rows, cols, numGames, gameType, 
     trainBatchSize: pickNum(runtimeOptions.trainBatchSize, 512),
     trainInterval: pickNum(runtimeOptions.trainInterval, 30),
     checkpointPool: pool,
-    uiSnapshotMaxGames: pickNum(runtimeOptions.uiSnapshotMaxGames, 48)
+    uiSnapshotMaxGames: pickNum(runtimeOptions.uiSnapshotMaxGames, 48),
+    algoType: algoType
   });
   return { trainer: trainer, algo: algo, pool: pool, pipelineType: runtimeId || 'gpu' };
 }
