@@ -2,6 +2,7 @@
 // Pure functions: no model, no optimizer, no state.
 
 import * as tf from '@tensorflow/tfjs';
+import { nnCodesToFloatBoard, nnPerspectiveFloatBoardToCodes } from './nn_cell_codes';
 
 /**
  * Flatten an array of Float32Array states into a single Float32Array
@@ -18,7 +19,7 @@ export function flattenStates(states, boardSize) {
 
 /**
  * Raw discrete codes 0..3 per cell → joint embedding indices 0..(4*P*P-1) with P×P period.
- * @param {ArrayLike[]} states - each row Int32Array or compatible, length boardSize
+ * @param {ArrayLike[]} states - each row Int32 codes 0..3 or perspective float row (getBoardForNN layout)
  * @param {number} rows
  * @param {number} cols
  * @param {number} patchSize - e.g. 3
@@ -29,8 +30,9 @@ export function flattenDiscreteJointIndices(states, rows, cols, patchSize, board
   var n = states.length;
   var P = patchSize;
   var flat = new Int32Array(n * boardSize);
+  var codeRows = ensureNnCodeObservationRows(states, boardSize, n);
   for (var b = 0; b < n; b++) {
-    var row = states[b];
+    var row = codeRows[b];
     var off = b * boardSize;
     for (var i = 0; i < boardSize; i++) {
       var r = (i / cols) | 0;
@@ -42,16 +44,52 @@ export function flattenDiscreteJointIndices(states, rows, cols, patchSize, board
   return flat;
 }
 
+function observationRowsAreNnCodes(statesArr) {
+  var r0 = statesArr[0];
+  return r0 instanceof Int32Array || r0 instanceof Uint32Array;
+}
+
+/**
+ * @param {ArrayLike[]} statesArr
+ * @param {number} boardSize
+ * @param {number} n
+ * @returns {ArrayLike[]} rows of Int32 NN codes 0..3 (may alias statesArr)
+ */
+function ensureNnCodeObservationRows(statesArr, boardSize, n) {
+  if (observationRowsAreNnCodes(statesArr)) return statesArr;
+  var out = new Array(n);
+  for (var b = 0; b < n; b++) {
+    out[b] = nnPerspectiveFloatBoardToCodes(statesArr[b], boardSize);
+  }
+  return out;
+}
+
+/**
+ * Float32 flat [n, boardSize] for conv/dense models: accepts NN code rows or legacy float rows.
+ */
+function flattenObservationRowsForFloatModel(statesArr, boardSize, n) {
+  if (observationRowsAreNnCodes(statesArr)) {
+    var flat = new Float32Array(n * boardSize);
+    for (var b = 0; b < n; b++) {
+      flat.set(nnCodesToFloatBoard(statesArr[b], boardSize), b * boardSize);
+    }
+    return flat;
+  }
+  return flattenStates(statesArr, boardSize);
+}
+
 /**
  * Raw codes 0..3 per cell → packed patch tokens for Patch3TokenDiscreteModel.
  * Pads bottom/right with code 0 to ⌈rows/3⌉*3, ⌈cols/3⌉*3; patch order row-major; within patch k=0..8 row-major.
+ * Also accepts perspective float rows (getBoardForNN layout); coerced to codes first.
  * @returns {Int32Array} length n * hp * wp * 9, values joint index k*4+code
  */
 export function flattenPatchTokenJointInput(statesArr, rows, cols, hp, wp, boardSize, n) {
   var patchLen = hp * wp * 9;
   var flat = new Int32Array(n * patchLen);
+  var codeRows = ensureNnCodeObservationRows(statesArr, boardSize, n);
   for (var b = 0; b < n; b++) {
-    var row = statesArr[b];
+    var row = codeRows[b];
     var off = b * patchLen;
     var pidx = 0;
     for (var pr = 0; pr < hp; pr++) {
@@ -71,7 +109,10 @@ export function flattenPatchTokenJointInput(statesArr, rows, cols, hp, wp, board
 }
 
 /**
- * Build [n, boardSize] tensor for model.forward / model.predict (float or int32 joint indices).
+ * Build model input tensor from a batch of board rows.
+ * Plague games standardize on NN cell codes (Int32 0..3) in trajectories and GPU batches; float conv
+ * models get the same rows coerced to getBoardForNN-style floats here. Discrete models coerce float rows
+ * to codes when needed.
  * @param {*} model - must have boardSize, rows, cols; optional expectsDiscreteInput, patchSize, patchTokenInput
  */
 export function statesRowsToModelInputTensor(model, statesArr, n) {
@@ -93,7 +134,7 @@ export function statesRowsToModelInputTensor(model, statesArr, n) {
     var flatJ = flattenDiscreteJointIndices(statesArr, model.rows, model.cols, P, boardSize);
     return tf.tensor2d(flatJ, [n, boardSize], 'int32');
   }
-  return tf.tensor2d(flattenStates(statesArr, boardSize), [n, boardSize]);
+  return tf.tensor2d(flattenObservationRowsForFloatModel(statesArr, boardSize, n), [n, boardSize]);
 }
 
 /**

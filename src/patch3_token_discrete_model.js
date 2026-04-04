@@ -5,7 +5,7 @@ import * as tf from '@tensorflow/tfjs';
 // Policy: 1×1 logits on coarse map, upsample ×3, crop to original H×W, flatten.
 //
 // Input to TF graph: int32 [batch, hp*wp*9] packed patch-major (see flattenPatchTokenJointInput in action.js).
-// expectsDiscreteInput + patchTokenInput: trajectories still store raw Int32Array codes per cell.
+// expectsDiscreteInput + patchTokenInput: same per-cell Int32 code observations as patch3_discrete / spatial.
 
 export class Patch3TokenDiscreteModel {
   constructor(rows, cols) {

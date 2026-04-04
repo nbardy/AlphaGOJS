@@ -1,0 +1,32 @@
+diff --git a/node_modules/@tensorflow/tfjs-backend-webgpu/dist/base.js b/node_modules/@tensorflow/tfjs-backend-webgpu/dist/base.js
+index 6fc8338..0f808f0 100755
+--- a/node_modules/@tensorflow/tfjs-backend-webgpu/dist/base.js
++++ b/node_modules/@tensorflow/tfjs-backend-webgpu/dist/base.js
+@@ -32,7 +32,10 @@ if (isWebGPUSupported()) {
+             requiredFeatures.push('timestamp-query');
+         }
+         if (adapter.features.has('bgra8unorm-storage')) {
+-            requiredFeatures.push(['bgra8unorm-storage']);
++            requiredFeatures.push('bgra8unorm-storage');
++        }
++        if (adapter.features.has('packed-4x8-integer-dot-product')) {
++            requiredFeatures.push('packed-4x8-integer-dot-product');
+         }
+         deviceDescriptor.requiredFeatures =
+             requiredFeatures;
+diff --git a/node_modules/@tensorflow/tfjs-backend-webgpu/dist/tf-backend-webgpu.node.js b/node_modules/@tensorflow/tfjs-backend-webgpu/dist/tf-backend-webgpu.node.js
+index 8244cf7..72ffad6 100755
+--- a/node_modules/@tensorflow/tfjs-backend-webgpu/dist/tf-backend-webgpu.node.js
++++ b/node_modules/@tensorflow/tfjs-backend-webgpu/dist/tf-backend-webgpu.node.js
+@@ -2128,7 +2128,10 @@ if (isWebGPUSupported()) {
+                         requiredFeatures.push('timestamp-query');
+                     }
+                     if (adapter.features.has('bgra8unorm-storage')) {
+-                        requiredFeatures.push(['bgra8unorm-storage']);
++                        requiredFeatures.push('bgra8unorm-storage');
++                    }
++                    if (adapter.features.has('packed-4x8-integer-dot-product')) {
++                        requiredFeatures.push('packed-4x8-integer-dot-product');
+                     }
+                     deviceDescriptor.requiredFeatures =
+                         requiredFeatures;

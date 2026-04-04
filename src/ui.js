@@ -449,14 +449,8 @@ export class UI {
     var self = this;
     setTimeout(function () {
       var actionSource = self.algo || self.trainer;
-      var innerModel =
-        actionSource && actionSource.model
-          ? actionSource.model
-          : actionSource && actionSource.algo && actionSource.algo.model
-            ? actionSource.algo.model
-            : null;
       var state =
-        innerModel && innerModel.expectsDiscreteInput && self.humanGame.getBoardCodesForNN
+        typeof self.humanGame.getBoardCodesForNN === 'function'
           ? self.humanGame.getBoardCodesForNN(-1)
           : self.humanGame.getBoardForNN(-1);
       var mask = self.humanGame.getValidMovesMask();

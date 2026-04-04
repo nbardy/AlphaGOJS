@@ -50,8 +50,7 @@ export class SelfPlayTrainer {
   }
 
   _getBoardObservation(game, player) {
-    var m = this.algo && this.algo.model;
-    if (m && m.expectsDiscreteInput && typeof game.getBoardCodesForNN === 'function') {
+    if (typeof game.getBoardCodesForNN === 'function') {
       return game.getBoardCodesForNN(player);
     }
     return game.getBoardForNN(player);

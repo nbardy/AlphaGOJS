@@ -9,9 +9,10 @@
  *   await tf.setBackend('webgpu'); // or 'cpu'
  *
  * Fast shader path: the WebGPU device must include GPUFeatureName
- *   "packed-4x8-integer-dot-product" (add it in requestDevice.requiredFeatures).
- *   Stock tfjs-backend-webgpu does not request it; without it, this op falls back to
- *   a JS dot loop (still correct, slow, may sync GPU tensors via dataSync).
+ *   "packed-4x8-integer-dot-product". This repo applies a patch-package patch on
+ *   @tensorflow/tfjs-backend-webgpu (postinstall) so requestDevice asks for that
+ *   feature when the adapter supports it. Without it, this op falls back to a JS
+ *   dot loop (still correct, slow, may sync GPU tensors via dataSync).
  */
 
 import { engine, registerKernel, util } from '@tensorflow/tfjs';

@@ -42,3 +42,41 @@ export function int8BoardCellToNnCode(boardRow, player, i) {
   if (v * player === 1) return 1;
   return 2;
 }
+
+var _WALL_EPS = 1e-3;
+
+/**
+ * Inverse of plague getBoardForNN: float row (empty=0, own=+1, opp=-1, wall=0.5) → NN codes 0..3.
+ * @param {ArrayLike<number>} floatRow
+ * @param {number} boardSize
+ * @returns {Int32Array}
+ */
+export function nnPerspectiveFloatBoardToCodes(floatRow, boardSize) {
+  var out = new Int32Array(boardSize);
+  for (var i = 0; i < boardSize; i++) {
+    var v = floatRow[i];
+    if (Math.abs(v - 0.5) < _WALL_EPS) out[i] = 3;
+    else if (Math.abs(v) < _WALL_EPS) out[i] = 0;
+    else if (v > 0) out[i] = 1;
+    else out[i] = 2;
+  }
+  return out;
+}
+
+/**
+ * Same layout as plague getBoardForNN (perspective already baked into codes).
+ * @param {ArrayLike<number>} codeRow
+ * @param {number} boardSize
+ * @returns {Float32Array}
+ */
+export function nnCodesToFloatBoard(codeRow, boardSize) {
+  var out = new Float32Array(boardSize);
+  for (var i = 0; i < boardSize; i++) {
+    var c = codeRow[i];
+    if (c === 3) out[i] = 0.5;
+    else if (c === 0) out[i] = 0;
+    else if (c === 1) out[i] = 1;
+    else out[i] = -1;
+  }
+  return out;
+}

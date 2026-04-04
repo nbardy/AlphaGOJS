@@ -1,3 +1,9 @@
+/**
+ * Bundler (webpack) resolves deep imports under tfjs-layers. Native Node ESM cannot
+ * load @tensorflow/tfjs-layers/dist/index.js (extensionless internal imports); for Node
+ * scripts use `import tfl from '@tensorflow/tfjs-layers/dist/tf-layers.node.js'` and
+ * extend `tfl.layers.Layer` with the same weights/forward pattern, or bundle this file.
+ */
 import * as tf from '@tensorflow/tfjs';
 import { serialization } from '@tensorflow/tfjs-core';
 import { Dense } from '@tensorflow/tfjs-layers/dist/layers/core.js';

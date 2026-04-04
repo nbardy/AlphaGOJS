@@ -4,7 +4,7 @@ import * as tf from '@tensorflow/tfjs';
 // ((r%3)*3+(c%3))*4 + code, vocab 36. Full H×W conv trunk — not patch-compressed.
 // For true 3×3 **non-overlapping patch tokens** + coarse conv, use Patch3TokenDiscreteModel (`patch3_token`).
 //
-// expectsDiscreteInput: trajectory / batches store Int32Array raw codes 0..3 per cell.
+// expectsDiscreteInput: same Int32 code rows as other plague models (see statesRowsToModelInputTensor).
 
 export class Patch3DiscreteModel {
   constructor(rows, cols) {

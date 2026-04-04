@@ -1,5 +1,6 @@
 import * as tf from '@tensorflow/tfjs';
 import { statesRowsToModelInputTensor } from '../../action';
+import { nnPerspectiveFloatBoardToCodes } from '../../nn_cell_codes';
 import { createModel } from '../../model_registry';
 import { createAlgorithm } from '../../algo_registry';
 import { eloUpdatePair } from '../../league_elo';
@@ -384,8 +385,7 @@ export class GPUOwnerRuntime {
       }
       if (!hasValid) continue;
       out.slotIds.push(slotIds[i]);
-      var useCodes = !this._multiModel && this.model.expectsDiscreteInput;
-      out.states.push(useCodes ? cpu.codes[i] : cpu.states[i]);
+      out.states.push(cpu.codes[i]);
       out.masks.push(mask);
     }
     return out;
@@ -759,15 +759,14 @@ export class GPUOwnerRuntime {
 
     batch.states = [];
     batch.masks = [];
-    var EPS = 1e-6;
     for (var r = 0; r < k; r++) {
       var offset = r * boardSize;
-      var row = new Float32Array(boardSize);
-      row.set(obsFlat.subarray(offset, offset + boardSize));
-      batch.states.push(row);
+      var rowF = new Float32Array(boardSize);
+      rowF.set(obsFlat.subarray(offset, offset + boardSize));
+      batch.states.push(nnPerspectiveFloatBoardToCodes(rowF, boardSize));
       var maskRow = new Float32Array(boardSize);
       for (var j = 0; j < boardSize; j++) {
-        maskRow[j] = Math.abs(row[j]) < EPS ? 1 : 0;
+        maskRow[j] = rowF[j] === 0 ? 1 : 0;
       }
       batch.masks.push(maskRow);
     }
@@ -848,15 +847,14 @@ export class GPUOwnerRuntime {
 
     batch.states = [];
     batch.masks = [];
-    var EPS = 1e-6;
     for (var r = 0; r < k; r++) {
       var offset = r * boardSize;
-      var row = new Float32Array(boardSize);
-      row.set(obsFlat.subarray(offset, offset + boardSize));
-      batch.states.push(row);
+      var rowF = new Float32Array(boardSize);
+      rowF.set(obsFlat.subarray(offset, offset + boardSize));
+      batch.states.push(nnPerspectiveFloatBoardToCodes(rowF, boardSize));
       var maskRow = new Float32Array(boardSize);
       for (var j = 0; j < boardSize; j++) {
-        maskRow[j] = Math.abs(row[j]) < EPS ? 1 : 0;
+        maskRow[j] = rowF[j] === 0 ? 1 : 0;
       }
       batch.masks.push(maskRow);
     }
@@ -920,15 +918,13 @@ export class GPUOwnerRuntime {
           console.warn('[gpu_owner] GPU batched tensor select failed, CPU rebuild:', e.message);
           try {
             var ex = this.engine.extractStatesMasksCPU(batch.slotIds, batch._gpuPerspective);
-            batch.states =
-              !this._multiModel && this.model.expectsDiscreteInput ? ex.codes : ex.states;
+            batch.states = ex.codes;
             batch.masks = ex.masks;
             return this._selectWithAlgorithmGpuBatched(batch);
           } catch (e3) {
             console.warn('[gpu_owner] GPU batched (CPU states) failed, using algo.selectActions:', e3.message);
             var ex2 = this.engine.extractStatesMasksCPU(batch.slotIds, batch._gpuPerspective);
-            batch.states =
-              !this._multiModel && this.model.expectsDiscreteInput ? ex2.codes : ex2.states;
+            batch.states = ex2.codes;
             batch.masks = ex2.masks;
           }
         }

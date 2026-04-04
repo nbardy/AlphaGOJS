@@ -1,5 +1,6 @@
 import * as tf from '@tensorflow/tfjs';
 import { maskedSoftmax, sampleFromProbs, statesRowsToModelInputTensor } from '../action';
+import { nnPerspectiveFloatBoardToCodes } from '../nn_cell_codes';
 import { createGame } from '../game';
 import { GPUGameEngine } from '../engine/gpu_game_engine';
 import { PLAGUE_WALL_CELL } from '../engine/plague_walls_layout';
@@ -168,7 +169,7 @@ export class GPUOrchestrator {
       }
       if (!hasValid) continue;
       out.slotIds.push(slotIds[i]);
-      out.states.push(this.model.expectsDiscreteInput ? cpu.codes[i] : cpu.states[i]);
+      out.states.push(cpu.codes[i]);
       out.masks.push(mask);
     }
     return out;
@@ -392,15 +393,14 @@ export class GPUOrchestrator {
 
     batch.states = [];
     batch.masks = [];
-    var EPS = 1e-6;
     for (var r = 0; r < k; r++) {
       var offset = r * boardSize;
-      var row = new Float32Array(boardSize);
-      row.set(obsFlat.subarray(offset, offset + boardSize));
-      batch.states.push(row);
+      var rowF = new Float32Array(boardSize);
+      rowF.set(obsFlat.subarray(offset, offset + boardSize));
+      batch.states.push(nnPerspectiveFloatBoardToCodes(rowF, boardSize));
       var maskRow = new Float32Array(boardSize);
       for (var j = 0; j < boardSize; j++) {
-        maskRow[j] = Math.abs(row[j]) < EPS ? 1 : 0;
+        maskRow[j] = rowF[j] === 0 ? 1 : 0;
       }
       batch.masks.push(maskRow);
     }
@@ -449,13 +449,13 @@ export class GPUOrchestrator {
           console.warn('[GPUOrchestrator] GPU batched tensor select failed, CPU rebuild:', e.message);
           try {
             var ex = this.engine.extractStatesMasksCPU(batch.slotIds, batch._gpuPerspective);
-            batch.states = this.model.expectsDiscreteInput ? ex.codes : ex.states;
+            batch.states = ex.codes;
             batch.masks = ex.masks;
             return this._selectWithAlgorithmGpuBatched(batch);
           } catch (e3) {
             console.warn('[GPUOrchestrator] GPU batched (CPU states) failed, using algo.selectActions:', e3.message);
             var ex2 = this.engine.extractStatesMasksCPU(batch.slotIds, batch._gpuPerspective);
-            batch.states = this.model.expectsDiscreteInput ? ex2.codes : ex2.states;
+            batch.states = ex2.codes;
             batch.masks = ex2.masks;
           }
         }
@@ -757,7 +757,7 @@ export class GPUOrchestrator {
         for (var j = 0; j < B; j++) { if (mask1[j] > 0) { has1 = true; break; } }
         if (!has1) break;
         var state1 =
-          this.model.expectsDiscreteInput && game.getBoardCodesForNN
+          typeof game.getBoardCodesForNN === 'function'
             ? game.getBoardCodesForNN(1)
             : game.getBoardForNN(1);
         var action1 = this.selectAction(state1, mask1);
@@ -769,7 +769,7 @@ export class GPUOrchestrator {
         if (!has2) break;
         var oppM = this.checkpointPool.opponentModel;
         var state2 =
-          oppM && oppM.expectsDiscreteInput && game.getBoardCodesForNN
+          typeof game.getBoardCodesForNN === 'function'
             ? game.getBoardCodesForNN(-1)
             : game.getBoardForNN(-1);
         var r2 = this.checkpointPool.selectActions([state2], [mask2]);
