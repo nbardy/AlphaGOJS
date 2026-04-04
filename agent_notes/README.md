@@ -9,6 +9,7 @@ Living notes for runtime choice, performance, benchmarks, and roadmap. **Not** u
 | [exploration_log.md](./exploration_log.md) | Narrative of **what we tried** (readbacks, worker path, benches, experiments) |
 | [plans_and_ideas.md](./plans_and_ideas.md) | Roadmap, queue starvation, readbacks, bench modes, future architectures |
 | [THREAD_RECAP.md](./THREAD_RECAP.md) | Consolidated Q&A: PPO, Elo, runtimes, TF.js readback, artifacts, blockers |
+| [HANDOFF_2026-04-04_benchmark_output_smoke.md](./HANDOFF_2026-04-04_benchmark_output_smoke.md) | Handoff note for the terse benchmark-output flow and the `bench:all:smoke` validation run on 2026-04-04 |
 
 ## Fastest approach right now (configured)
 
