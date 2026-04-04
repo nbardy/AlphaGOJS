@@ -8,6 +8,8 @@
  *      node benchmarks/webgpu_plague_spread_throughput.mjs --rows=20 --cols=20 --numGames=80
  *
  * If no adapter: prints skipped JSON and exits 0 (CI-friendly).
+ *
+ * GPU and CPU both receive the same warmup iterations so the ratio is not CPU-cold-biased.
  */
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -18,7 +20,7 @@ import { WebGPUPlagueSpreadEngine } from '../src/engine/webgpu_plague_spread_eng
 import { spreadPackedAllGamesInOut } from '../src/engine/plague_spread_cpu.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const WGSL_PATH = join(__dirname, '../src/engine/wgsl/plague_spread.wgsl');
+const WGSL_PATH = join(__dirname, '../src/engine/wgsl/plague_env.wgsl');
 
 function clampInt(v, fallback, min, max) {
   const n = Number.parseInt(v, 10);
@@ -151,6 +153,7 @@ async function main() {
     const warmN = Math.min(32, cfg.spreadsPerSample);
     for (let w = 0; w < cfg.warmup; w++) {
       await runGpuSample(engine, cfg, warmN);
+      runCpuSample(cfg, warmN);
     }
 
     const gpuSecs = [];

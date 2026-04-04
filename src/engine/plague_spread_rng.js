@@ -1,5 +1,5 @@
 /**
- * Deterministic spread RNG — bit-for-bit companion to src/engine/wgsl/plague_spread.wgsl
+ * Deterministic spread RNG — bit-for-bit companion to `spread_pass` in plague_env.wgsl
  * (hash_u32 + rand01). Use in tests / CPU reference for WebGPU parity.
  */
 

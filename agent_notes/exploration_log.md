@@ -32,7 +32,7 @@ Longer, narrative companion to [key_learnings.md](./key_learnings.md) (dense). N
 ## Tooling and side experiments
 
 - **Webpack 5** migration: dev server, prod build, **vendor split**, **worker chunk**, **`.wgsl` as raw source** for experiments (`webpack.config.js`, `webpack.prod.js`, `package.json`).
-- **WebGPU plague spread (experimental):** Separate **WGSL** spread kernel + CPU reference + **parity / throughput** Node benches (`src/engine/webgpu_plague_spread*.js`, `wgsl/`, `docs/WEBGPU_PLAGUE_GAME_SPEC.md`). **Not** the main TF.js training sim; upper bound / research direction.
+- **WebGPU plague env (experimental):** **`plague_env.wgsl`** (spread + apply + terminals) + CPU reference + **parity / throughput** benches; optional **`?webgpuEnv=1`** worker path vs TF tensor sim (`docs/WEBGPU_PLAGUE_GAME_SPEC.md`).
 - **URL ergonomics:** **`preset=fast` / `preset=interactive`** fill missing **`rows` / `cols` / `numGames`** with **10 / 10 / 40** (`src/app.js`).
 - **`spatial_lite`:** Default model in registry — separable conv + per-cell logits + value head (`spatial_lite_model.js`).
 

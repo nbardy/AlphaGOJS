@@ -16,7 +16,9 @@ function makeDefaultStats() {
     entropy: 0,
     trainInFlight: false,
     gpuReadbackCalls: 0,
-    gpuReadbackBytes: 0
+    gpuReadbackBytes: 0,
+    multiModel: false,
+    modelStats: null
   };
 }
 

@@ -2,7 +2,10 @@ const path = require('path');
 const HtmlWebpackPlugin = require('html-webpack-plugin');
 
 module.exports = {
-  entry: './src/app.js',
+  entry: {
+    app: './src/app.js',
+    league: './src/app_league.js'
+  },
   module: {
     rules: [
       { test: /\.wgsl$/i, type: 'asset/source' }
@@ -10,7 +13,7 @@ module.exports = {
   },
   output: {
     path: path.resolve(__dirname, 'dist'),
-    filename: 'app.bundle.js',
+    filename: '[name].bundle.js',
     clean: true
   },
   devServer: {
@@ -19,7 +22,14 @@ module.exports = {
   devtool: 'eval-source-map',
   plugins: [
     new HtmlWebpackPlugin({
-      title: 'Hot Module Replacement'
+      title: 'AlphaPlague',
+      filename: 'index.html',
+      chunks: ['app']
+    }),
+    new HtmlWebpackPlugin({
+      title: 'AlphaPlague — League',
+      filename: 'league.html',
+      chunks: ['league']
     })
   ],
   mode: 'development'

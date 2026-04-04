@@ -27,7 +27,9 @@
     "bench:system:algos": "node benchmarks/system_interface_benchmark.mjs --algos=ppo,reinforce",
     "bench:loop": "node benchmarks/loop_decomposition_benchmark.mjs",
     "bench:webgpu:parity": "node benchmarks/webgpu_plague_spread_parity.mjs",
-    "bench:webgpu:spread": "node benchmarks/webgpu_plague_spread_throughput.mjs"
+    "bench:webgpu:spread": "node benchmarks/webgpu_plague_spread_throughput.mjs",
+    "bench:all": "node benchmarks/run_all_benchmarks.mjs",
+    "bench:all:smoke": "node benchmarks/run_all_benchmarks.mjs --smoke"
   },
   "keywords": [],
   "author": "",

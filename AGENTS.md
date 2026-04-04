@@ -40,8 +40,10 @@ Optional query params are parsed at startup (invalid values fall back to default
 
 ### Benchmarks & profiling (optional)
 
+- **Index:** **`docs/BENCHMARKS.md`** — matrix of every bench, what layer it measures (full app vs WGSL kernel vs TF.js backends), and fair-comparison notes.
+- **`npm run bench:all`** / **`npm run bench:all:smoke`** — sequential bundle: `build` (unless `--skip-build`), **`bench:webgpu:spread`**, **`bench:loop`**, **`bench:system:headless`**. Add **`--with-native-webgpu`** to include **`bench:webgpu:parity`** (needs adapter). See `benchmarks/run_all_benchmarks.mjs`.
 - **`npm run build`** then **`npm run bench:system:headless`** — end-to-end app throughput (Puppeteer opens `docs/index.html`). Install browser: `npx puppeteer browsers install chrome`.
 - **`npm run bench:loop`** — GPU worker loop decomposition: `sim_random` (no policy/train) vs `sim_forward` (forward only) vs full RL; prints games/s and optional policy/physics ms per sim tick.
-- **`npm run bench:webgpu:spread`** — native **WGSL plague spread** only: spreads/s and cell-updates/s vs CPU reference (needs WebGPU adapter; exits 0 with `skipped` if none). Not directly comparable to `bench:loop` games/s (that includes policy + full sim); use as an upper bound on physics-style compute. **`npm run bench:webgpu:parity`** — correctness check vs CPU. **`npm run bench:webgpu:node`** — generic WebGPU microbenches (Dawn Node).
-- **URL flags** (dev/bench only; omit in normal use): `?pipeline=single_gpu_phased&benchLoop=sim_random|sim_forward&benchInstrument=1&benchMinimalUi=1`. When absent, there is no extra work on hot paths.
+- **`npm run bench:webgpu:spread`** — native **WGSL plague spread** only: spreads/s and cell-updates/s vs CPU reference (needs WebGPU adapter; exits 0 with `skipped` if none). GPU and CPU paths share the same warmup for a fairer ratio. Not directly comparable to `bench:loop` games/s. **`npm run bench:webgpu:parity`** — correctness check vs CPU. **`npm run bench:webgpu:node`** — generic WebGPU microbenches (Dawn Node).
+- **URL flags** (dev/bench only; omit in normal use): `?pipeline=single_gpu_phased&benchLoop=sim_random|sim_forward&benchInstrument=1&benchMinimalUi=1&webgpuEnv=1` (WebGPU sim in the GPU worker when supported; falls back to TF `GPUGameEngine`). When absent, there is no extra work on hot paths.
 - **Deeper plans / defaults / roadmap:** `agent_notes/README.md`, **`agent_notes/key_learnings.md`** (dense takeaways), `agent_notes/exploration_log.md`, `agent_notes/plans_and_ideas.md`, recap `agent_notes/THREAD_RECAP.md`.

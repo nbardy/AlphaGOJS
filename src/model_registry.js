@@ -1,6 +1,7 @@
 import { DenseModel } from './dense_model';
 import { SpatialModel } from './spatial_model';
 import { SpatialLiteModel } from './spatial_lite_model';
+import { SpatialPyramidGradModel } from './spatial_pyramid_grad_model';
 
 // Model registry: single source of truth for UI labels and constructors.
 // Add new model types here only.
@@ -10,6 +11,13 @@ var MODEL_TYPES = [
     label: 'Spatial lite (sep conv)',
     create: function (rows, cols) {
       return new SpatialLiteModel(rows, cols);
+    }
+  },
+  {
+    id: 'pyramid_grad',
+    label: 'Pyramid + dilated + neighbor stem',
+    create: function (rows, cols) {
+      return new SpatialPyramidGradModel(rows, cols);
     }
   },
   { id: 'dense', label: 'Dense', create: function (rows, cols) { return new DenseModel(rows, cols); } },

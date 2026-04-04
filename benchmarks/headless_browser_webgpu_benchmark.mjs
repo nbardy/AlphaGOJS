@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { getChromeLaunchArgs, loadPuppeteer } from './puppeteer_bench_common.mjs';
 
 function clampInt(v, fallback, min, max) {
   const n = Number.parseInt(v, 10);
@@ -30,35 +31,6 @@ function parseArgs(argv) {
   return out;
 }
 
-function chromeArgs() {
-  const args = [
-    '--enable-unsafe-webgpu',
-    '--allow-file-access-from-files',
-    '--no-sandbox',
-    '--disable-dev-shm-usage'
-  ];
-
-  if (process.platform === 'linux') {
-    // Chrome WebGPU guidance: Vulkan + ANGLE Vulkan on Linux.
-    args.push('--enable-features=Vulkan');
-    args.push('--use-angle=vulkan');
-  }
-  if (process.platform === 'darwin') {
-    args.push('--use-angle=metal');
-  }
-
-  return args;
-}
-
-async function loadPuppeteer() {
-  try {
-    const mod = await import('puppeteer');
-    return mod.default || mod;
-  } catch (e) {
-    throw new Error('`puppeteer` is not installed. Run `npm install` first.');
-  }
-}
-
 async function main() {
   const cfg = parseArgs(process.argv.slice(2));
   const puppeteer = await loadPuppeteer();
@@ -68,7 +40,7 @@ async function main() {
 
   const browser = await puppeteer.launch({
     headless: true,
-    args: chromeArgs()
+    args: getChromeLaunchArgs()
   });
 
   try {

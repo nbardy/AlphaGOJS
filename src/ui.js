@@ -152,8 +152,13 @@ export class UI {
 
     // Header
     var header = document.createElement('header');
+    var leagueMode = !!this.config.leagueMode;
+    var homeHref = this.config.homeHref || 'index.html';
+    var subLine = leagueMode
+      ? 'League training (all architectures, unified Elo) &mdash; <a href="' + homeHref + '" style="color:#88aaff;">Single-model training</a>'
+      : 'Self-play RL &mdash; plague territory with random walls &mdash; 80 games live &mdash; <a href="league.html" style="color:#88aaff;">League mode</a>';
     header.innerHTML = '<h1>AlphaPlague</h1>'
-      + '<div class="subtitle">Self-play RL &mdash; plague territory with random walls &mdash; 80 games live</div>'
+      + '<div class="subtitle">' + subLine + '</div>'
       + '<div id="stats">'
       + '<div class="stat"><div class="label">Games</div><div class="value" id="sg">0</div></div>'
       + '<div class="stat"><div class="label">Gen</div><div class="value" id="sgen">0</div></div>'
@@ -162,7 +167,8 @@ export class UI {
       + '<div class="stat"><div class="label">Elo</div><div class="value" id="selo">1000</div></div>'
       + '<div class="stat"><div class="label">vs Ckpt</div><div class="value sg" id="sckpt">&mdash;</div></div>'
       + '<div class="stat"><div class="label">Entropy</div><div class="value" id="sentr">&mdash;</div></div>'
-      + '</div>';
+      + '</div>'
+      + '<div id="multi-model-elo" class="subtitle" style="display:none;margin-top:8px;text-align:center;color:#889;max-width:860px;margin-left:auto;margin-right:auto;line-height:1.5;"></div>';
     app.appendChild(header);
 
     // Controls
@@ -184,27 +190,40 @@ export class UI {
     speedDiv.innerHTML = '<span>Speed:</span><input type="range" id="sspeed" min="1" max="50" value="1"><span id="sval">1x</span>';
     controls.appendChild(speedDiv);
 
-    // Model select
-    var modelSel = document.createElement('select');
-    modelSel.id = 'model-sel';
-    modelSel.className = 'cfg-select';
-    var modelTypes = this.config.listModelTypes ? this.config.listModelTypes() : [
-      { id: 'dense', label: 'Dense' },
-      { id: 'spatial', label: 'Spatial (slow)' }
-    ];
-    var modelOptionsHTML = '';
-    var hasSpatialLite = false;
-    var hasDense = false;
-    for (var mi = 0; mi < modelTypes.length; mi++) {
-      if (modelTypes[mi].id === 'spatial_lite') hasSpatialLite = true;
-      if (modelTypes[mi].id === 'dense') hasDense = true;
-      modelOptionsHTML += '<option value="' + modelTypes[mi].id + '">' + modelTypes[mi].label + '</option>';
+    // Model select (standard app only; league page trains every architecture)
+    var modelSel = null;
+    if (!this.config.leagueMode) {
+      modelSel = document.createElement('select');
+      modelSel.id = 'model-sel';
+      modelSel.className = 'cfg-select';
+      var modelTypes = this.config.listModelTypes ? this.config.listModelTypes() : [
+        { id: 'dense', label: 'Dense' },
+        { id: 'spatial', label: 'Spatial (slow)' }
+      ];
+      var modelOptionsHTML = '';
+      var hasSpatialLite = false;
+      var hasDense = false;
+      for (var mi = 0; mi < modelTypes.length; mi++) {
+        if (modelTypes[mi].id === 'spatial_lite') hasSpatialLite = true;
+        if (modelTypes[mi].id === 'dense') hasDense = true;
+        modelOptionsHTML += '<option value="' + modelTypes[mi].id + '">' + modelTypes[mi].label + '</option>';
+      }
+      modelSel.innerHTML = modelOptionsHTML;
+      if (hasSpatialLite) modelSel.value = 'spatial_lite';
+      else if (hasDense) modelSel.value = 'dense';
+      else if (modelTypes.length > 0) modelSel.value = modelTypes[0].id;
+      controls.appendChild(modelSel);
+    } else {
+      var leagueLab = document.createElement('span');
+      leagueLab.id = 'model-sel-label';
+      leagueLab.className = 'cfg-select';
+      leagueLab.textContent = 'All architectures (league)';
+      leagueLab.style.border = '1px solid #2a2a5a';
+      leagueLab.style.padding = '6px 10px';
+      leagueLab.style.borderRadius = '6px';
+      leagueLab.style.display = 'inline-block';
+      controls.appendChild(leagueLab);
     }
-    modelSel.innerHTML = modelOptionsHTML;
-    if (hasSpatialLite) modelSel.value = 'spatial_lite';
-    else if (hasDense) modelSel.value = 'dense';
-    else if (modelTypes.length > 0) modelSel.value = modelTypes[0].id;
-    controls.appendChild(modelSel);
 
     // Algo select
     var algoSel = document.createElement('select');
@@ -263,7 +282,8 @@ export class UI {
     restartBtn.className = 'restart-btn';
     restartBtn.textContent = 'Restart';
     restartBtn.onclick = function () {
-      self._restart(modelSel.value, algoSel.value, pipeSel.value, gameSel.value);
+      var mt = self.config.leagueMode ? null : modelSel.value;
+      self._restart(mt, algoSel.value, pipeSel.value, gameSel.value);
     };
     controls.appendChild(restartBtn);
 
@@ -571,11 +591,50 @@ export class UI {
     }
 
     // Update stat bar from trainer stats (Elo is live, not per-snapshot).
-    // GPU pipeline has no checkpoint pool, so elo/checkpointWinRate are undefined.
-    var hasElo = typeof s.elo === 'number' && s.elo > 0;
-    document.getElementById('selo').textContent = hasElo ? s.elo.toFixed(0) : (this.pipelineType === 'gpu' ? '--' : '1000');
-    var ckptWr = s.checkpointWinRate;
-    document.getElementById('sckpt').textContent = ckptWr > 0 ? (ckptWr * 100).toFixed(0) + '%' : '\u2014';
+    var mmEl = document.getElementById('multi-model-elo');
+    if (s.multiModel && s.modelStats && s.modelStats.length > 0 && mmEl) {
+      mmEl.style.display = 'block';
+      var mtList = this.config.listModelTypes ? this.config.listModelTypes() : [];
+      var labelById = {};
+      for (var li = 0; li < mtList.length; li++) {
+        labelById[mtList[li].id] = mtList[li].label;
+      }
+      var parts = [];
+      for (var mj = 0; mj < s.modelStats.length; mj++) {
+        var row = s.modelStats[mj];
+        var lab = labelById[row.id] || row.id;
+        parts.push(
+          lab
+            + ': Elo\u00a0'
+            + (typeof row.elo === 'number' ? row.elo.toFixed(0) : '—')
+            + ', gen\u00a0'
+            + row.generation
+            + ', L\u00a0'
+            + (row.loss ? row.loss.toFixed(3) : '—')
+        );
+      }
+      mmEl.textContent = parts.join(' \u2022 ');
+      document.getElementById('selo').textContent = 'multi';
+      var ckAgg = 0;
+      var ckN = 0;
+      for (var ck = 0; ck < s.modelStats.length; ck++) {
+        if (typeof s.modelStats[ck].checkpointWinRate === 'number') {
+          ckAgg += s.modelStats[ck].checkpointWinRate;
+          ckN++;
+        }
+      }
+      document.getElementById('sckpt').textContent =
+        ckN > 0 ? ((ckAgg / ckN) * 100).toFixed(0) + '%' : '\u2014';
+    } else {
+      if (mmEl) {
+        mmEl.style.display = 'none';
+        mmEl.textContent = '';
+      }
+      var hasElo = typeof s.elo === 'number' && s.elo > 0;
+      document.getElementById('selo').textContent = hasElo ? s.elo.toFixed(0) : (this.pipelineType === 'gpu' ? '--' : '1000');
+      var ckptWr = s.checkpointWinRate;
+      document.getElementById('sckpt').textContent = ckptWr > 0 ? (ckptWr * 100).toFixed(0) + '%' : '\u2014';
+    }
     var last = this.metrics.last();
     if (last) {
       document.getElementById('sentr').textContent = last.entropy.toFixed(3);
@@ -595,7 +654,7 @@ export class UI {
     var selfP2Rate = totalSelf > 0 ? stats.p2Wins / totalSelf : 0.5;
     var selfDrawRate = totalSelf > 0 ? stats.draws / totalSelf : 0;
 
-    this.metrics.push({
+    var snap = {
       generation: stats.generation,
       loss: stats.loss,
       elo: stats.elo || 1000,
@@ -605,20 +664,88 @@ export class UI {
       selfPlayDrawRate: selfDrawRate,
       entropy: entropy,
       avgGameLength: stats.avgGameLength,
-      bufferSize: stats.bufferSize
-    });
+      bufferSize: stats.bufferSize,
+      multiModel: !!stats.multiModel
+    };
+    if (stats.multiModel && stats.modelStats && this.config.listModelTypes) {
+      var byId = {};
+      for (var si = 0; si < stats.modelStats.length; si++) {
+        byId[stats.modelStats[si].id] = stats.modelStats[si].elo;
+      }
+      var mt = this.config.listModelTypes();
+      for (var mj = 0; mj < mt.length; mj++) {
+        var tid = mt[mj].id;
+        snap['elo_' + tid] = typeof byId[tid] === 'number' ? byId[tid] : 1000;
+      }
+    }
+    this.metrics.push(snap);
     this._chartsDirty = true;
   }
 
   _renderCharts() {
     var data = this.metrics.length > 0;
+    var last = data ? this.metrics.last() : null;
+    var leagueMulti = !!(last && last.multiModel && this.config.listModelTypes);
 
-    drawLineChart(this.charts.elo, data ? this.metrics.getSeries('elo') : [], {
-      title: 'Elo Rating',
-      color: '#ffaa00',
-      refLine: 1000,
-      refColor: '#444466'
-    });
+    if (leagueMulti) {
+      var modelTypes = this.config.listModelTypes();
+      var colors = ['#ffaa00', '#00ff88', '#66aaff', '#ff66cc', '#aa88ff', '#88ffaa'];
+      var entries = this.metrics.entries;
+      var series = [];
+      var allY = [1000];
+      for (var mi = 0; mi < modelTypes.length; mi++) {
+        var id = modelTypes[mi].id;
+        var key = 'elo_' + id;
+        var filled = [];
+        var lastV = 1000;
+        for (var ei = 0; ei < entries.length; ei++) {
+          var vv = entries[ei][key];
+          if (typeof vv === 'number' && isFinite(vv)) lastV = vv;
+          filled.push(lastV);
+          allY.push(lastV);
+        }
+        series.push({
+          data: filled,
+          color: colors[mi % colors.length],
+          label: modelTypes[mi].label
+        });
+      }
+      var n = entries.length;
+      var maxPts = this.metrics.maxPoints || 500;
+      if (n > maxPts) {
+        var idxs = [0];
+        for (var si = 1; si < maxPts - 1; si++) {
+          idxs.push(Math.min(n - 2, Math.floor(1 + (si - 1) * (n - 2) / (maxPts - 2))));
+        }
+        idxs.push(n - 1);
+        series = series.map(function (s) {
+          return {
+            data: idxs.map(function (ix) {
+              return s.data[ix];
+            }),
+            color: s.color,
+            label: s.label
+          };
+        });
+      }
+      var minY = Math.min.apply(null, allY) - 40;
+      var maxY = Math.max.apply(null, allY) + 40;
+      drawLineChart(this.charts.elo, [], {
+        title: 'League Elo (per architecture)',
+        refLine: 1000,
+        refColor: '#444466',
+        series: series,
+        minY: minY,
+        maxY: maxY
+      });
+    } else {
+      drawLineChart(this.charts.elo, data ? this.metrics.getSeries('elo') : [], {
+        title: 'Elo Rating',
+        color: '#ffaa00',
+        refLine: 1000,
+        refColor: '#444466'
+      });
+    }
     drawLineChart(this.charts.ckptWin, data ? this.metrics.getSeries('checkpointWinRate').map(function (v) { return v * 100; }) : [], {
       title: 'Win% vs Checkpoints',
       color: '#00ff88',

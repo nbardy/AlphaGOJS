@@ -63,7 +63,7 @@ Legacy aliases: `cpu`, `gpu`, `gpu_worker` map to the rows above.
 - **`src/engine/gpu_game_engine.js` + `src/nextgen/runtime/gpu_owner_runtime.js`:** **`gatherSlotsTensor`**, **`_buildActionBatchGpu`** (sub-gather after dropping no-legal rows), tensor-first **`_selectWithAlgorithm`** when **`_obsTensor` / `_maskTensor`** present; **`obsTensor.dataSync()`** for snapshot/trajectory rows; fallback to **`extractStatesMasksCPU`** + batched CPU path. Checkpoint P2 slots still use CPU batch build + pool.
 - **`src/app.js`:** **`preset=fast`** / **`preset=interactive`** fill only **missing** query keys **`rows` / `cols` / `numGames`** with **10 / 10 / 40** (documented in root **`AGENTS.md`** and **`THREAD_RECAP.md`** §7).
 - **Tooling:** **Webpack 5** (`webpack.config.js`, `webpack.prod.js`), **`copy-webpack-plugin`** / **`html-webpack-plugin`**, vendor split + worker chunk outputs under **`dist/`** and **`docs/`** bundles.
-- **WebGPU plague spread (experimental):** **`src/engine/webgpu_plague_spread*.js`**, **`src/engine/wgsl/`**, CPU reference + RNG helpers, **`docs/WEBGPU_PLAGUE_GAME_SPEC.md`**, benches **`bench:webgpu:parity`** / **`bench:webgpu:spread`** (`package.json`). Not wired as the main TF.js game engine yet.
+- **WebGPU plague spread / env (experimental):** **`src/engine/webgpu_plague_spread*.js`**, **`webgpu_plague_game_engine.js`**, **`src/engine/wgsl/plague_env.wgsl`**, CPU reference + RNG helpers, **`docs/WEBGPU_PLAGUE_GAME_SPEC.md`**, benches **`bench:webgpu:parity`** / **`bench:webgpu:spread`**. Optional worker sim: **`?webgpuEnv=1`** (vs TF **`GPUGameEngine`**).
 - **Models:** **`src/spatial_lite_model.js`** in tree as default spatial-lite architecture (see **`THREAD_RECAP`** spatial vs spatial_lite).
 
 ---

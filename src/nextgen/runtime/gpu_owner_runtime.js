@@ -5,6 +5,8 @@ import { createAlgorithm } from '../../algo_registry';
 import { eloUpdatePair } from '../../league_elo';
 import { CheckpointPool } from '../../checkpoint_pool';
 import { GPUGameEngine } from '../../engine/gpu_game_engine';
+import { WebGPUGameEngine } from '../../engine/webgpu_plague_game_engine';
+import plagueEnvWGSL from '../../engine/wgsl/plague_env.wgsl';
 import { PLAGUE_WALL_CELL } from '../../engine/plague_walls_layout';
 import { AsyncJobQueue } from '../../core/job_queue';
 import { MSG } from '../protocol/messages';
@@ -71,6 +73,8 @@ export class GPUOwnerRuntime {
     this.recentLengths = [];
     this.lastEntropy = 0;
     this._trainInFlight = false;
+    this._nextTrainModelIdx = 0;
+    this._multiTrainStagger = false;
   }
 
   async init(config) {
@@ -86,7 +90,11 @@ export class GPUOwnerRuntime {
     this.cols = config.cols || 20;
     this.numGames = config.numGames || 80;
     this.boardSize = this.rows * this.cols;
-    this.trainBatchSize = config.trainBatchSize || 512;
+    var requestedTrainBatchSize =
+      typeof config.trainBatchSize === 'number' && config.trainBatchSize > 0
+        ? config.trainBatchSize
+        : 512;
+    this.trainBatchSize = requestedTrainBatchSize;
     this.trainInterval = config.trainInterval || 30;
     this.pauseTicksWhenTraining = !!config.pauseTicksWhenTraining;
     this.gameType = config.gameType || 'plague_walls';
@@ -102,6 +110,8 @@ export class GPUOwnerRuntime {
       Array.isArray(modelTypes) &&
       modelTypes.length > 1;
     this._multiModel = useMulti;
+    this._multiTrainStagger = useMulti && config.multiTrainStagger !== false;
+    this._nextTrainModelIdx = 0;
     this.models = null;
     this.algos = null;
     this.pools = null;
@@ -129,11 +139,21 @@ export class GPUOwnerRuntime {
           );
         })(modelTypes[mi]);
       }
+      for (var ax = 0; ax < this.algos.length; ax++) {
+        var ag = this.algos[ax];
+        if (ag && typeof ag.maxBufferSize === 'number' && ag.maxBufferSize > 10000) {
+          ag.maxBufferSize = 10000;
+        }
+      }
       this.model = this.models[0];
       this.algo = this.algos[0];
       this.pool = this.pools[0];
       this.gamesSinceLastTrain = new Int32Array(this._numModels);
       this.generation = new Int32Array(this._numModels);
+      // Same total numGames as single-model, but each architecture only owns ~1/N slots; when several
+      // models hit shouldTrain together we otherwise run N full train(batch) calls per burst. Scale
+      // batch by N so aggregate samples per burst stays in line with one single-model train().
+      this.trainBatchSize = Math.max(32, Math.floor(requestedTrainBatchSize / this._numModels));
     } else {
       this._modelTypeIds = null;
       this._numModels = 1;
@@ -147,12 +167,35 @@ export class GPUOwnerRuntime {
       this.generation = 0;
     }
 
-    this.engine = new GPUGameEngine({
-      numGames: this.numGames,
-      rows: this.rows,
-      cols: this.cols,
-      gameType: this.gameType
-    });
+    var useWebGpuEnv = !!config.useWebGPUGameEngine && this.gameType === 'plague_walls';
+    if (useWebGpuEnv) {
+      try {
+        this.engine = await WebGPUGameEngine.create(
+          {
+            numGames: this.numGames,
+            rows: this.rows,
+            cols: this.cols,
+            gameType: this.gameType
+          },
+          plagueEnvWGSL
+        );
+      } catch (e) {
+        console.warn('[gpu_owner] WebGPU env unavailable, using TF GPUGameEngine:', e && e.message ? e.message : e);
+        this.engine = new GPUGameEngine({
+          numGames: this.numGames,
+          rows: this.rows,
+          cols: this.cols,
+          gameType: this.gameType
+        });
+      }
+    } else {
+      this.engine = new GPUGameEngine({
+        numGames: this.numGames,
+        rows: this.rows,
+        cols: this.cols,
+        gameType: this.gameType
+      });
+    }
     this.engine.seedInitialBoardsIfNeeded();
     this.trainQueue = new AsyncJobQueue(1);
 
@@ -1352,25 +1395,62 @@ export class GPUOwnerRuntime {
       var tTrain0 = self._benchInstrument ? performance.now() : 0;
       try {
         if (self._multiModel) {
-          var trained = 0;
-          var lossAcc = 0;
-          for (var m = 0; m < self._numModels; m++) {
-            if (!self.algos[m].shouldTrain(self.gamesSinceLastTrain[m], self.trainInterval, self.trainBatchSize)) {
-              continue;
+          if (self._multiTrainStagger) {
+            var startM = self._nextTrainModelIdx % self._numModels;
+            var trainedOne = -1;
+            for (var kk = 0; kk < self._numModels; kk++) {
+              var m = (startM + kk) % self._numModels;
+              if (!self.algos[m].shouldTrain(self.gamesSinceLastTrain[m], self.trainInterval, self.trainBatchSize)) {
+                continue;
+              }
+              var L1 = self.algos[m].train(self.trainBatchSize);
+              self.lastLossByModel[m] = L1;
+              self.generation[m]++;
+              self.lastLoss = L1;
+              var cg1 = Math.max(1, self.trainInterval || 1);
+              self.gamesSinceLastTrain[m] = Math.max(0, self.gamesSinceLastTrain[m] - cg1);
+              if (self.pools[m] && self.pools[m].shouldSave(self.generation[m])) {
+                self.pools[m].save(self.models[m].model, self.generation[m]);
+              }
+              trainedOne = m;
+              self._nextTrainModelIdx = (m + 1) % self._numModels;
+              break;
             }
-            var Lm = self.algos[m].train(self.trainBatchSize);
-            self.lastLossByModel[m] = Lm;
-            self.generation[m]++;
-            trained++;
-            lossAcc += Lm;
-            var consumedGm = Math.max(1, self.trainInterval || 1);
-            self.gamesSinceLastTrain[m] = Math.max(0, self.gamesSinceLastTrain[m] - consumedGm);
-            if (self.pools[m] && self.pools[m].shouldSave(self.generation[m])) {
-              self.pools[m].save(self.models[m].model, self.generation[m]);
+            if (trainedOne >= 0) {
+              var more = false;
+              for (var om = 0; om < self._numModels; om++) {
+                if (self.algos[om].shouldTrain(self.gamesSinceLastTrain[om], self.trainInterval, self.trainBatchSize)) {
+                  more = true;
+                  break;
+                }
+              }
+              if (more) {
+                setTimeout(function () {
+                  if (!self._disposed) self._maybeScheduleTrain();
+                }, 0);
+              }
             }
-          }
-          if (trained > 0) {
-            self.lastLoss = lossAcc / trained;
+          } else {
+            var trained = 0;
+            var lossAcc = 0;
+            for (var m = 0; m < self._numModels; m++) {
+              if (!self.algos[m].shouldTrain(self.gamesSinceLastTrain[m], self.trainInterval, self.trainBatchSize)) {
+                continue;
+              }
+              var Lm = self.algos[m].train(self.trainBatchSize);
+              self.lastLossByModel[m] = Lm;
+              self.generation[m]++;
+              trained++;
+              lossAcc += Lm;
+              var consumedGm = Math.max(1, self.trainInterval || 1);
+              self.gamesSinceLastTrain[m] = Math.max(0, self.gamesSinceLastTrain[m] - consumedGm);
+              if (self.pools[m] && self.pools[m].shouldSave(self.generation[m])) {
+                self.pools[m].save(self.models[m].model, self.generation[m]);
+              }
+            }
+            if (trained > 0) {
+              self.lastLoss = lossAcc / trained;
+            }
           }
         } else {
           if (!self.algo) return;
@@ -1395,7 +1475,11 @@ export class GPUOwnerRuntime {
     });
   }
 
-  _tickOne() {
+  async _tickOne() {
+    if (this.engine.ensureBoardCacheForPolicy) {
+      await this.engine.ensureBoardCacheForPolicy();
+    }
+
     var ins = this._benchInstrument;
     var t0 = ins ? performance.now() : 0;
 
@@ -1419,7 +1503,7 @@ export class GPUOwnerRuntime {
     }
 
     if (p1Batch.slotIds.length > 0 && p1Sel) {
-      this.engine.applyActions(1, p1Batch.slotIds, p1Sel.actionsBySlot);
+      await Promise.resolve(this.engine.applyActions(1, p1Batch.slotIds, p1Sel.actionsBySlot));
       if (!minimal) this._recordSnapshot(1, p1Batch, p1Sel);
     }
     if (ins) {
@@ -1511,20 +1595,20 @@ export class GPUOwnerRuntime {
     }
 
     if (p2ApplySlots.length > 0) {
-      this.engine.applyActions(-1, p2ApplySlots, p2ActionsBySlot);
+      await Promise.resolve(this.engine.applyActions(-1, p2ApplySlots, p2ActionsBySlot));
     }
     if (ins) {
       this._benchPhysicsMsBatch += performance.now() - t0;
       t0 = performance.now();
     }
 
-    this.engine.spread();
+    await Promise.resolve(this.engine.spread());
     this.engine.incrementTurnsForActive();
 
-    var finished = this.engine.resolveTerminals();
+    var finished = await Promise.resolve(this.engine.resolveTerminals());
     if (finished.doneSlots.length > 0) {
       this._finishSlots(finished.doneSlots, finished.winners);
-      this.engine.resetSlots(finished.doneSlots);
+      await Promise.resolve(this.engine.resetSlots(finished.doneSlots));
       this._resetSlotMetadata(finished.doneSlots);
       this._pruneSnapshots();
     }
@@ -1661,11 +1745,14 @@ export class GPUOwnerRuntime {
     return out;
   }
 
-  _emitTickResult() {
+  async _emitTickResult() {
     var payload = { type: MSG.TICK_RESULT };
     var xfer = null;
 
     if (this._ticks % this._snapshotEveryTicks === 0) {
+      if (this.engine.syncBoardFromGpuForUi) {
+        await this.engine.syncBoardFromGpuForUi();
+      }
       var slotIds = this._boardUiSlotIdsForSnapshot();
       var boards = slotIds.length === this.numGames
         ? this.engine.getBoardsForRender()
@@ -1706,16 +1793,16 @@ export class GPUOwnerRuntime {
   async tick(steps) {
     if (!this._ready || this._disposed || !this.engine) return;
     if (this.pauseTicksWhenTraining && this._trainInFlight) {
-      this._emitTickResult();
+      await this._emitTickResult();
       return;
     }
     this.engine.beginReadbackFrame();
     var n = Math.max(1, steps || 1);
     for (var i = 0; i < n; i++) {
-      this._tickOne();
+      await this._tickOne();
       this._ticks++;
     }
-    this._emitTickResult();
+    await this._emitTickResult();
   }
 
   async inferAction(requestId, state, mask) {

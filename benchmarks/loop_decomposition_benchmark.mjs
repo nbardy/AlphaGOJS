@@ -7,13 +7,17 @@
  *
  * Optional benchInstrument=1 adds worker-reported ms/tick (policy vs physics) and train wall time.
  * benchMinimalUi=1 throttles board snapshots to reduce postMessage overhead.
+ * --webgpuEnv=1 adds webgpuEnv=1 to the page URL (WebGPU sim in worker vs TF tensor env).
  *
  * Prereq: npm run build, npx puppeteer browsers install chrome
  * Run: npm run bench:loop
  */
-import fs from 'node:fs';
-import path from 'path';
-import { pathToFileURL } from 'node:url';
+import {
+  getChromeLaunchArgs,
+  loadPuppeteer,
+  resolveBuiltAppFileUrl,
+  waitForAppReady
+} from './puppeteer_bench_common.mjs';
 
 function clampInt(v, fallback, min, max) {
   const n = Number.parseInt(v, 10);
@@ -37,7 +41,8 @@ function parseArgs(argv) {
     timeoutMs: 180000,
     headless: true,
     instrument: true,
-    minimalUi: true
+    minimalUi: true,
+    webgpuEnv: false
   };
   for (const arg of argv) {
     if (!arg.startsWith('--')) continue;
@@ -51,41 +56,9 @@ function parseArgs(argv) {
     else if (key === 'headless') out.headless = value !== 'false';
     else if (key === 'instrument') out.instrument = value !== 'false';
     else if (key === 'minimalUi') out.minimalUi = value !== 'false';
+    else if (key === 'webgpuEnv') out.webgpuEnv = value !== 'false' && value !== '0';
   }
   return out;
-}
-
-function chromeArgs() {
-  const args = [
-    '--enable-unsafe-webgpu',
-    '--allow-file-access-from-files',
-    '--no-sandbox',
-    '--disable-dev-shm-usage'
-  ];
-  if (process.platform === 'linux') {
-    args.push('--enable-features=Vulkan');
-    args.push('--use-angle=vulkan');
-  }
-  if (process.platform === 'darwin') {
-    args.push('--use-angle=metal');
-  }
-  return args;
-}
-
-async function loadPuppeteer() {
-  try {
-    const mod = await import('puppeteer');
-    return mod.default || mod;
-  } catch (e) {
-    throw new Error('`puppeteer` is not installed. Run `npm install`.');
-  }
-}
-
-async function waitForAppReady(page, timeoutMs) {
-  await page.waitForFunction(() => {
-    const ui = window.__alphaPlague;
-    return !!(ui && ui.trainer && typeof ui.trainer.getStats === 'function');
-  }, { timeout: timeoutMs });
 }
 
 async function waitForWorkerReady(page, timeoutMs) {
@@ -104,6 +77,7 @@ function buildBenchUrl(baseUrl, cfg, mode) {
   if (cfg.instrument) u.searchParams.set('benchInstrument', '1');
   if (mode === 'sim_random') u.searchParams.set('benchLoop', 'sim_random');
   else if (mode === 'sim_forward') u.searchParams.set('benchLoop', 'sim_forward');
+  if (cfg.webgpuEnv) u.searchParams.set('webgpuEnv', '1');
   return u.toString();
 }
 
@@ -146,17 +120,13 @@ async function runThroughputSample(page, durationMs, ticksPerFrame) {
 
 async function main() {
   const cfg = parseArgs(process.argv.slice(2));
-  const indexPath = path.resolve(process.cwd(), 'docs/index.html');
-  if (!fs.existsSync(indexPath)) {
-    throw new Error('Missing docs/index.html. Run `npm run build` first.');
-  }
-  const baseUrl = pathToFileURL(indexPath).toString();
+  const { fileUrl: baseUrl } = resolveBuiltAppFileUrl(process.cwd());
 
   const puppeteer = await loadPuppeteer();
   const browser = await puppeteer.launch({
     headless: cfg.headless,
     protocolTimeout: 600000,
-    args: chromeArgs()
+    args: getChromeLaunchArgs()
   });
 
   const modes = [

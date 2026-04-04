@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Verifies GPU spread matches CPU reference (same hash RNG as plague_spread.wgsl).
+ * Verifies GPU spread matches CPU reference (same hash RNG as plague_env.wgsl spread_pass).
  * Requires WebGPU (e.g. `webgpu` Dawn package): npm run bench:webgpu:parity
  */
 import { readFileSync } from 'node:fs';
@@ -11,7 +11,7 @@ import { WebGPUPlagueSpreadEngine } from '../src/engine/webgpu_plague_spread_eng
 import { spreadPackedAllGames } from '../src/engine/plague_spread_cpu.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const WGSL_PATH = join(__dirname, '../src/engine/wgsl/plague_spread.wgsl');
+const WGSL_PATH = join(__dirname, '../src/engine/wgsl/plague_env.wgsl');
 
 function assertEqual(a, b, label) {
   if (a.length !== b.length) throw new Error(label + ': length ' + a.length + ' vs ' + b.length);

@@ -1,5 +1,5 @@
 /**
- * CPU reference spread with the same neighbor order and RNG as plague_spread.wgsl
+ * CPU reference spread with the same neighbor order and RNG as plague_env.wgsl `spread_pass`
  * (via plague_spread_rng.rand01). For parity tests against WebGPU.
  */
 

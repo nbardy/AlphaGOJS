@@ -1,7 +1,10 @@
 #!/usr/bin/env node
-import fs from 'node:fs';
-import path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import {
+  getChromeLaunchArgs,
+  loadPuppeteer,
+  resolveBuiltAppFileUrl,
+  waitForAppReady
+} from './puppeteer_bench_common.mjs';
 
 function clampInt(v, fallback, min, max) {
   const n = Number.parseInt(v, 10);
@@ -89,39 +92,6 @@ function parseArgs(argv) {
   }
 
   return out;
-}
-
-function chromeArgs() {
-  const args = [
-    '--enable-unsafe-webgpu',
-    '--allow-file-access-from-files',
-    '--no-sandbox',
-    '--disable-dev-shm-usage'
-  ];
-  if (process.platform === 'linux') {
-    args.push('--enable-features=Vulkan');
-    args.push('--use-angle=vulkan');
-  }
-  if (process.platform === 'darwin') {
-    args.push('--use-angle=metal');
-  }
-  return args;
-}
-
-async function loadPuppeteer() {
-  try {
-    const mod = await import('puppeteer');
-    return mod.default || mod;
-  } catch (e) {
-    throw new Error('`puppeteer` is not installed. Run `npm install`.');
-  }
-}
-
-async function waitForAppReady(page, timeoutMs) {
-  await page.waitForFunction(() => {
-    const ui = window.__alphaPlague;
-    return !!(ui && ui.trainer && typeof ui.trainer.getStats === 'function');
-  }, { timeout: timeoutMs });
 }
 
 async function configureAndRestart(page, cfg, pipeline, algoOverride) {
@@ -387,17 +357,12 @@ async function main() {
   const algoList = cfg.algos.length > 0 ? cfg.algos : [cfg.algo];
   const puppeteer = await loadPuppeteer();
 
-  const indexPath = path.resolve(process.cwd(), 'docs/index.html');
-  if (!fs.existsSync(indexPath)) {
-    throw new Error('Missing docs/index.html. Run `npm run build` first.');
-  }
-
-  const url = pathToFileURL(indexPath).toString();
+  const { fileUrl: url } = resolveBuiltAppFileUrl(process.cwd());
 
   const browser = await puppeteer.launch({
     headless: cfg.headless,
     protocolTimeout: cfg.protocolTimeoutMs,
-    args: chromeArgs()
+    args: getChromeLaunchArgs()
   });
 
   const out = {

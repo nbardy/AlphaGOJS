@@ -69,6 +69,9 @@ function parseRuntimeQueryOverrides() {
   if (p.get('benchMinimalUi') === '1') {
     bench.benchMinimalUi = true;
   }
+  if (p.get('webgpuEnv') === '1') {
+    bench.useWebGPUGameEngine = true;
+  }
   var pl = p.get('pipeline');
   var preset = p.get('preset');
   var presetFastOrInteractive = preset === 'fast' || preset === 'interactive';

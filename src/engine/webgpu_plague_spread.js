@@ -1,9 +1,10 @@
 /**
  * Browser / webpack entry: bundles WGSL via asset/source rule.
- * For Node, import webgpu_plague_spread_engine.js and pass readFileSync(wgslPath).
+ * For Node, import webgpu_plague_spread_engine.js and pass readFileSync(plague_env.wgsl).
+ * Uses `spread_pass` from plague_env.wgsl (same kernel as the full WebGPU game engine).
  */
 
-import plagueSpreadWGSL from './wgsl/plague_spread.wgsl';
+import plagueEnvWGSL from './wgsl/plague_env.wgsl';
 import { WebGPUPlagueSpreadEngine as Core } from './webgpu_plague_spread_engine.js';
 
 export {
@@ -18,6 +19,6 @@ export {
 
 export class WebGPUPlagueSpreadEngine extends Core {
   constructor(device, config) {
-    super(device, config, plagueSpreadWGSL);
+    super(device, config, plagueEnvWGSL);
   }
 }

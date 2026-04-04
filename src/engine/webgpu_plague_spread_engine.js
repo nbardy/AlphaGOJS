@@ -1,7 +1,10 @@
 /**
  * WebGPU batched plague spread — core engine (WGSL source passed in so Node benchmarks
- * can read plague_spread.wgsl from disk; browser code uses webgpu_plague_spread.js).
+ * can read plague_env.wgsl from disk; browser uses webgpu_plague_spread.js which bundles it).
+ * Only the `spread_pass` entry point is used; the module may contain other env passes.
  */
+
+import { copyGpuBufferToUint32 } from './webgpu_copy_read_u32.js';
 
 /** Unpacked u32 cell codes (matches WGSL). */
 export const CELL_EMPTY = 0;
@@ -41,7 +44,7 @@ export class WebGPUPlagueSpreadEngine {
   /**
    * @param {GPUDevice} device
    * @param {{ rows: number, cols: number, numGames: number }} config
-   * @param {string} wgslSource full WGSL source (e.g. contents of plague_spread.wgsl)
+   * @param {string} wgslSource full WGSL source (e.g. contents of plague_env.wgsl)
    */
   constructor(device, config, wgslSource) {
     if (!wgslSource || typeof wgslSource !== 'string') {
@@ -162,25 +165,8 @@ export class WebGPUPlagueSpreadEngine {
 
   async downloadPacked() {
     var readBuf = this._readIsA ? this.bufA : this.bufB;
-    var bytes = this.boardSize * this.numGames * 4;
-    var staging = this.device.createBuffer({
-      size: bytes,
-      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
-    });
-    var enc = this.device.createCommandEncoder();
-    enc.copyBufferToBuffer(readBuf, 0, staging, 0, bytes);
-    this.device.queue.submit([enc.finish()]);
-    await staging.mapAsync(GPUMapMode.READ);
-    var mapped = staging.getMappedRange();
     var count = this.boardSize * this.numGames;
-    // View exactly `count` u32s; do not use Uint8Array(length) — that length is in bytes
-    // and would inflate element count when passed to the Uint32Array copy constructor.
-    var view = new Uint32Array(mapped, 0, count);
-    var copy = new Uint32Array(count);
-    copy.set(view);
-    staging.unmap();
-    staging.destroy();
-    return copy;
+    return copyGpuBufferToUint32(this.device, readBuf, 0, count);
   }
 
   dispose() {
