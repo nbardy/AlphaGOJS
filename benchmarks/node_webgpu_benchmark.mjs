@@ -1,5 +1,9 @@
 #!/usr/bin/env node
 import { performance } from 'node:perf_hooks';
+import {
+  emitBenchmarkReport,
+  prepareBenchmarkOutput
+} from './benchmark_output.mjs';
 
 function now() {
   return performance.now();
@@ -741,13 +745,15 @@ function toFeatureList(features) {
 }
 
 async function main() {
+  const argv = process.argv.slice(2);
+  const output = prepareBenchmarkOutput('node_webgpu_benchmark', argv);
   let writeBench = null;
   let dispatchBench = null;
   let readbackBench = null;
   let transformerBench = null;
 
   try {
-    const cfg = parseArgs(process.argv.slice(2));
+    const cfg = parseArgs(argv);
     const { adapter, device, provider } = await initWebGPU();
 
     writeBench = createWriteBufferBenchmark(device, cfg.writeBytesPerRound, cfg.writeRounds);
@@ -808,22 +814,22 @@ async function main() {
       derived
     };
 
-    console.log('Node WebGPU benchmark complete');
-    console.log('warmup=' + cfg.warmup + ' runs=' + cfg.runs + ' seq=' + cfg.seqLen + ' hidden=' + cfg.hiddenDim);
-    console.log('writeBuffer median=' + fmt(writeRes.stats.median, 2) + 'ms p95=' + fmt(writeRes.stats.p95, 2) + 'ms medianGBps=' + fmt(derived.uploadGbps.median, 3));
-    console.log('computeDispatch median=' + fmt(dispatchRes.stats.median, 2) + 'ms p95=' + fmt(dispatchRes.stats.p95, 2) + 'ms medianDispatchesPerSec=' + fmt(derived.dispatch.medianDispatchesPerSec, 1));
-    console.log('readback median=' + fmt(readbackRes.stats.median, 2) + 'ms p95=' + fmt(readbackRes.stats.p95, 2) + 'ms');
-    console.log('transformer computeOnly median=' + fmt(txCompute.stats.median, 2) + 'ms e2e median=' + fmt(txE2E.stats.median, 2) + 'ms e2eTokensPerSec=' + fmt(derived.transformer.e2eTokensPerSec, 1));
-    console.log('transformer stage medians: upload=' + fmt(txDetailed.summary.uploadMs.median, 2)
-      + ' qkv=' + fmt(txDetailed.summary.qkvMs.median, 2)
-      + ' scores=' + fmt(txDetailed.summary.attnScoresMs.median, 2)
-      + ' softmax=' + fmt(txDetailed.summary.softmaxMs.median, 2)
-      + ' context=' + fmt(txDetailed.summary.contextMs.median, 2)
-      + ' out=' + fmt(txDetailed.summary.outProjMs.median, 2)
-      + ' readback=' + fmt(txDetailed.summary.readbackMs.median, 2)
-      + ' total=' + fmt(txDetailed.summary.totalMs.median, 2));
-
-    console.log(JSON.stringify(results, null, 2));
+    emitBenchmarkReport(output, results, [
+      'Node WebGPU benchmark complete',
+      'warmup=' + cfg.warmup + ' runs=' + cfg.runs + ' seq=' + cfg.seqLen + ' hidden=' + cfg.hiddenDim,
+      'writeBuffer median=' + fmt(writeRes.stats.median, 2) + 'ms p95=' + fmt(writeRes.stats.p95, 2) + 'ms medianGBps=' + fmt(derived.uploadGbps.median, 3),
+      'computeDispatch median=' + fmt(dispatchRes.stats.median, 2) + 'ms p95=' + fmt(dispatchRes.stats.p95, 2) + 'ms medianDispatchesPerSec=' + fmt(derived.dispatch.medianDispatchesPerSec, 1),
+      'readback median=' + fmt(readbackRes.stats.median, 2) + 'ms p95=' + fmt(readbackRes.stats.p95, 2) + 'ms',
+      'transformer computeOnly median=' + fmt(txCompute.stats.median, 2) + 'ms e2e median=' + fmt(txE2E.stats.median, 2) + 'ms e2eTokensPerSec=' + fmt(derived.transformer.e2eTokensPerSec, 1),
+      'transformer stage medians: upload=' + fmt(txDetailed.summary.uploadMs.median, 2)
+        + ' qkv=' + fmt(txDetailed.summary.qkvMs.median, 2)
+        + ' scores=' + fmt(txDetailed.summary.attnScoresMs.median, 2)
+        + ' softmax=' + fmt(txDetailed.summary.softmaxMs.median, 2)
+        + ' context=' + fmt(txDetailed.summary.contextMs.median, 2)
+        + ' out=' + fmt(txDetailed.summary.outProjMs.median, 2)
+        + ' readback=' + fmt(txDetailed.summary.readbackMs.median, 2)
+        + ' total=' + fmt(txDetailed.summary.totalMs.median, 2)
+    ]);
   } catch (err) {
     const msg = err && err.message ? err.message : String(err);
     console.error('Node WebGPU benchmark failed:', msg);

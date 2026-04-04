@@ -14,6 +14,7 @@ import {
   encodePlagueWallsBoardToPacked,
   requestPlagueSpreadDevice
 } from './webgpu_plague_spread_engine.js';
+import { packedUintToNnCode } from '../nn_cell_codes';
 
 function packedRowToFloat32Row(packedRow, boardSize, out) {
   for (var j = 0; j < boardSize; j++) {
@@ -437,7 +438,10 @@ export class WebGPUGameEngine {
   extractStatesMasksCPU(slotIds, player) {
     var outStates = [];
     var outMasks = [];
-    if (!slotIds || slotIds.length === 0) return { states: outStates, masks: outMasks };
+    var outCodes = [];
+    if (!slotIds || slotIds.length === 0) {
+      return { states: outStates, masks: outMasks, codes: outCodes };
+    }
     var boardSize = this.boardSize;
     var k = slotIds.length;
     this._trackReadback(k * boardSize);
@@ -446,6 +450,7 @@ export class WebGPUGameEngine {
       var offset = slot * boardSize;
       var state = new Float32Array(boardSize);
       var mask = new Float32Array(boardSize);
+      var codes = new Int32Array(boardSize);
       for (var j = 0; j < boardSize; j++) {
         var u = this._packedCache[offset + j];
         var v;
@@ -459,11 +464,13 @@ export class WebGPUGameEngine {
           state[j] = v * player;
         }
         mask[j] = v === 0 ? 1 : 0;
+        codes[j] = packedUintToNnCode(u, player);
       }
       outStates.push(state);
       outMasks.push(mask);
+      outCodes.push(codes);
     }
-    return { states: outStates, masks: outMasks };
+    return { states: outStates, masks: outMasks, codes: outCodes };
   }
 
   getBoardsForRender() {

@@ -49,6 +49,14 @@ export class SelfPlayTrainer {
     };
   }
 
+  _getBoardObservation(game, player) {
+    var m = this.algo && this.algo.model;
+    if (m && m.expectsDiscreteInput && typeof game.getBoardCodesForNN === 'function') {
+      return game.getBoardCodesForNN(player);
+    }
+    return game.getBoardForNN(player);
+  }
+
   tick() {
     var i, j, gi;
 
@@ -60,7 +68,7 @@ export class SelfPlayTrainer {
       var hasValid = false;
       for (j = 0; j < this.boardSize; j++) { if (mask[j] > 0) { hasValid = true; break; } }
       if (!hasValid) { this._finish(i); continue; }
-      s1.push(this.games[i].game.getBoardForNN(1));
+      s1.push(this._getBoardObservation(this.games[i].game, 1));
       m1.push(mask);
       idx1.push(i);
     }
@@ -85,7 +93,7 @@ export class SelfPlayTrainer {
       var hasValid2 = false;
       for (j = 0; j < this.boardSize; j++) { if (mask2[j] > 0) { hasValid2 = true; break; } }
       if (!hasValid2) { this._finish(i); continue; }
-      var boardState = this.games[i].game.getBoardForNN(-1);
+      var boardState = this._getBoardObservation(this.games[i].game, -1);
       if (this.games[i].vsCheckpoint && this.checkpointPool) {
         s2c.push(boardState);
         m2c.push(mask2);

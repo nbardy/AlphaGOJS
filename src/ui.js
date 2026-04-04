@@ -448,10 +448,19 @@ export class UI {
 
     var self = this;
     setTimeout(function () {
-      var state = self.humanGame.getBoardForNN(-1);
+      var actionSource = self.algo || self.trainer;
+      var innerModel =
+        actionSource && actionSource.model
+          ? actionSource.model
+          : actionSource && actionSource.algo && actionSource.algo.model
+            ? actionSource.algo.model
+            : null;
+      var state =
+        innerModel && innerModel.expectsDiscreteInput && self.humanGame.getBoardCodesForNN
+          ? self.humanGame.getBoardCodesForNN(-1)
+          : self.humanGame.getBoardForNN(-1);
       var mask = self.humanGame.getValidMovesMask();
       // GPU trainer implements selectAction directly; CPU uses algo wrapper.
-      var actionSource = self.algo || self.trainer;
       var applyAI = function (action) {
         self.humanGame.makeMove(-1, action);
         self.humanGame.spreadPlague();

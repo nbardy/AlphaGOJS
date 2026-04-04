@@ -1,6 +1,6 @@
 import * as tf from '@tensorflow/tfjs';
 import { PPO } from './ppo';
-import { flattenStates } from './action';
+import { statesRowsToModelInputTensor } from './action';
 
 // Phasic Policy Gradient (PPG) on top of PPO.
 //
@@ -61,7 +61,7 @@ export class PPG extends PPO {
       returnsArr[i] = batch[i].returnVal;
     }
 
-    var statesT = tf.tensor2d(flattenStates(statesArr, boardSize), [n, boardSize]);
+    var statesT = statesRowsToModelInputTensor(this.model, statesArr, n);
     var validMaskData = new Float32Array(n * boardSize);
     for (var i = 0; i < n; i++) {
       for (var j = 0; j < boardSize; j++) {

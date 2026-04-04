@@ -1,5 +1,6 @@
 import * as tf from '@tensorflow/tfjs';
 import { generatePlagueWallsInto, PLAGUE_WALL_CELL } from './plague_walls_layout';
+import { floatEngineCellToNnCode } from '../nn_cell_codes';
 
 // GPU simulation engine: owns only environment state and transitions.
 // Hot path avoids full-board readback: gather rows for inference, small
@@ -240,7 +241,10 @@ export class GPUGameEngine {
   extractStatesMasksCPU(slotIds, player) {
     var outStates = [];
     var outMasks = [];
-    if (!slotIds || slotIds.length === 0) return { states: outStates, masks: outMasks };
+    var outCodes = [];
+    if (!slotIds || slotIds.length === 0) {
+      return { states: outStates, masks: outMasks, codes: outCodes };
+    }
 
     var boardSize = this.boardSize;
     var k = slotIds.length;
@@ -255,6 +259,7 @@ export class GPUGameEngine {
       var offset = s * boardSize;
       var state = new Float32Array(boardSize);
       var mask = new Float32Array(boardSize);
+      var codes = new Int32Array(boardSize);
       for (var j = 0; j < boardSize; j++) {
         var v = stateData[offset + j];
         if (v === PLAGUE_WALL_CELL) {
@@ -263,11 +268,13 @@ export class GPUGameEngine {
           state[j] = v * player;
         }
         mask[j] = v === 0 ? 1 : 0;
+        codes[j] = floatEngineCellToNnCode(v, player);
       }
       outStates.push(state);
       outMasks.push(mask);
+      outCodes.push(codes);
     }
-    return { states: outStates, masks: outMasks };
+    return { states: outStates, masks: outMasks, codes: outCodes };
   }
 
   /**

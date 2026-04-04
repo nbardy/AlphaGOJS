@@ -1,5 +1,5 @@
 import * as tf from '@tensorflow/tfjs';
-import { maskedSoftmax, sampleFromProbs, flattenStates } from './action';
+import { maskedSoftmax, sampleFromProbs, statesRowsToModelInputTensor } from './action';
 import { createGame } from './game';
 
 // GPU-Native Trainer: entire game loop on GPU, ~320 bytes/tick transfer.
@@ -16,6 +16,11 @@ import { createGame } from './game';
 
 export class GPUTrainer {
   constructor(model, config) {
+    if (model && model.expectsDiscreteInput) {
+      throw new Error(
+        'Discrete-observation models (patch3_discrete) require the WebGPU/TF worker pipeline, not legacy GPUTrainer.'
+      );
+    }
     this.model = model;
     this.numGames = config.numGames || 40;
     this.rows = config.rows || 10;
@@ -401,7 +406,7 @@ export class GPUTrainer {
       masksArr.push(batch[i].mask);
     }
 
-    var statesTensor = tf.tensor2d(flattenStates(statesArr, boardSize), [n, boardSize]);
+    var statesTensor = statesRowsToModelInputTensor(this.model, statesArr, n);
 
     var actionMaskData = new Float32Array(n * boardSize);
     for (var i = 0; i < n; i++) {
@@ -513,7 +518,7 @@ export class GPUTrainer {
 
   selectAction(state, mask) {
     var boardSize = this.model.boardSize;
-    var statesTensor = tf.tensor2d(state, [1, boardSize]);
+    var statesTensor = statesRowsToModelInputTensor(this.model, [state], 1);
     var out = this.model.forward(statesTensor);
     var logitsData = out.policy.dataSync();
     out.policy.dispose();

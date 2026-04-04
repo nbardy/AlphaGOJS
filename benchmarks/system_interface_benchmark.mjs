@@ -1,10 +1,27 @@
 #!/usr/bin/env node
+/**
+ * End-to-end UI + worker throughput (Puppeteer opens `docs/index.html` after `npm run build`).
+ *
+ * **Wall time:** Defaults use 3 pipelines × (warmup + timed runs + **120× `selectActionAsync`**
+ * round-trips per pipeline). That can exceed **30+ minutes** and look “hung.” Prefer
+ * `--pipelines=single_gpu_phased`, `--inferenceRuns=10`, shorter `--duration` for a quick check.
+ * The **`bench:all`** aggregator passes fewer pipelines + `--inferenceRuns=24` unless `--full-system`.
+ *
+ * **Chrome:** `npx puppeteer browsers install chrome` if Puppeteer cannot find the binary.
+ */
 import {
-  getChromeLaunchArgs,
+  getPuppeteerLaunchOptions,
   loadPuppeteer,
   resolveBuiltAppFileUrl,
   waitForAppReady
 } from './puppeteer_bench_common.mjs';
+import {
+  computePercentDelta,
+  emitBenchmarkReport,
+  formatNumber,
+  formatSignedPercent,
+  prepareBenchmarkOutput
+} from './benchmark_output.mjs';
 
 function clampInt(v, fallback, min, max) {
   const n = Number.parseInt(v, 10);
@@ -352,18 +369,26 @@ function summarizeRunSet(runSet) {
   };
 }
 
+function systemBenchLog(msg) {
+  const t = new Date().toISOString().replace('T', ' ').replace('Z', '');
+  console.log('[bench:system ' + t + '] ' + msg);
+}
+
 async function main() {
-  const cfg = parseArgs(process.argv.slice(2));
+  const argv = process.argv.slice(2);
+  const cfg = parseArgs(argv);
+  const output = prepareBenchmarkOutput('system_interface_benchmark', argv);
   const algoList = cfg.algos.length > 0 ? cfg.algos : [cfg.algo];
   const puppeteer = await loadPuppeteer();
 
   const { fileUrl: url } = resolveBuiltAppFileUrl(process.cwd());
 
-  const browser = await puppeteer.launch({
-    headless: cfg.headless,
-    protocolTimeout: cfg.protocolTimeoutMs,
-    args: getChromeLaunchArgs()
-  });
+  const browser = await puppeteer.launch(
+    getPuppeteerLaunchOptions({
+      headless: cfg.headless,
+      protocolTimeout: cfg.protocolTimeoutMs
+    })
+  );
 
   const out = {
     timestamp: new Date().toISOString(),
@@ -393,6 +418,7 @@ async function main() {
     for (const algo of algoList) {
       out.algorithms[algo] = { pipelines: {} };
       for (const pipeline of cfg.pipelines) {
+        systemBenchLog('start pipeline=' + pipeline + ' algo=' + algo + ' (restart + warmup ' + cfg.warmupSec + 's)');
         await configureAndRestart(page, cfg, pipeline, algo);
 
         // Warmup run (discarded)
@@ -404,6 +430,7 @@ async function main() {
         }
 
         const runs = [];
+        systemBenchLog('throughput ' + cfg.runs + ' x ' + cfg.durationSec + 's …');
         for (let i = 0; i < cfg.runs; i++) {
           const sample = await runThroughputSample(page, {
             durationMs: Math.round(cfg.durationSec * 1000),
@@ -412,17 +439,20 @@ async function main() {
           runs.push(sample);
         }
 
+        systemBenchLog('inference busy ' + cfg.inferenceRuns + ' RPCs (may take minutes on gpu_worker) …');
         const infBusyRaw = await runInferenceSample(page, {
           runs: cfg.inferenceRuns,
           inferenceTimeoutMs: cfg.inferenceTimeoutMs
         });
 
         // Restart to get a clean queue state for idle inference latency.
+        systemBenchLog('restart + inference idle ' + cfg.inferenceRuns + ' RPCs …');
         await configureAndRestart(page, cfg, pipeline, algo);
         const infIdleRaw = await runInferenceSample(page, {
           runs: cfg.inferenceRuns,
           inferenceTimeoutMs: cfg.inferenceTimeoutMs
         });
+        systemBenchLog('done pipeline=' + pipeline + ' algo=' + algo);
 
         const inference = {
           busyLatencyMs: summarize(infBusyRaw.latencies || []),
@@ -494,33 +524,70 @@ async function main() {
     }
   }
 
-  console.log('System interface benchmark complete');
-  console.log(
+  const comparisons = {};
+  const summaryLines = [
+    'System interface benchmark complete',
     'config duration=' + cfg.durationSec + 's runs=' + cfg.runs
-    + ' ticks=' + cfg.ticksPerFrame
-    + ' model=' + cfg.model
-    + ' algo=' + cfg.algo
-    + ' algos=' + (cfg.algos.length > 0 ? cfg.algos.join(',') : '(single)')
-    + ' game=' + cfg.game
-    + ' qualityWindows=' + (cfg.qualityWindowsSec.length > 0 ? cfg.qualityWindowsSec.join(',') : '(none)')
-  );
-  for (const row of summaries) {
-    console.log(
-      row.algo + '/' + row.pipeline
-      + ' games/s=' + Number(row.gamesPerSec).toFixed(2)
-      + ' trainSteps/s=' + Number(row.trainStepsPerSec).toFixed(2)
-      + ' gen/min=' + Number(row.generationsPerMin).toFixed(2)
-      + ' fps=' + Number(row.framesPerSec).toFixed(1)
-      + ' raf_p95_ms=' + Number(row.rafP95Ms).toFixed(2)
-      + ' infer_busy_p95_ms=' + Number(row.inferBusyP95Ms).toFixed(3)
-      + ' infer_idle_p95_ms=' + Number(row.inferIdleP95Ms).toFixed(3)
-      + ' infer_busy_timeouts=' + row.inferBusyTimeouts
-      + ' infer_idle_timeouts=' + row.inferIdleTimeouts
-      + ' quality_elo_delta=' + Number(row.qualityEloDelta).toFixed(3)
-      + ' quality_per_gpu_sec=' + Number(row.qualityPerGpuSecond).toFixed(6)
+      + ' ticks=' + cfg.ticksPerFrame
+      + ' model=' + cfg.model
+      + ' algo=' + cfg.algo
+      + ' algos=' + (cfg.algos.length > 0 ? cfg.algos.join(',') : '(single)')
+      + ' game=' + cfg.game
+      + ' qualityWindows=' + (cfg.qualityWindowsSec.length > 0 ? cfg.qualityWindowsSec.join(',') : '(none)')
+  ];
+
+  for (const algo of algoList) {
+    const algoRows = summaries.filter((row) => row.algo === algo);
+    if (!algoRows.length) continue;
+
+    const baselineRow = algoRows.find((row) => row.pipeline === 'single_gpu_phased') || algoRows[0];
+    const bestRow = algoRows
+      .slice()
+      .sort((a, b) => (Number.isFinite(b.gamesPerSec) ? b.gamesPerSec : -Infinity) - (Number.isFinite(a.gamesPerSec) ? a.gamesPerSec : -Infinity))[0];
+
+    comparisons[algo] = {
+      baselinePipeline: baselineRow.pipeline,
+      bestPipelineByGamesPerSec: bestRow ? bestRow.pipeline : null,
+      rows: algoRows.map((row) => ({
+        pipeline: row.pipeline,
+        gamesPerSecDeltaVsBaselinePercent: computePercentDelta(row.gamesPerSec, baselineRow.gamesPerSec),
+        inferBusyP95DeltaVsBaselinePercent: computePercentDelta(row.inferBusyP95Ms, baselineRow.inferBusyP95Ms),
+        inferIdleP95DeltaVsBaselinePercent: computePercentDelta(row.inferIdleP95Ms, baselineRow.inferIdleP95Ms)
+      }))
+    };
+
+    summaryLines.push(
+      'algo=' + algo
+      + ' baseline=' + baselineRow.pipeline
+      + ' best_games/s=' + (bestRow ? bestRow.pipeline : 'n/a')
+      + ' best_delta=' + formatSignedPercent(bestRow ? computePercentDelta(bestRow.gamesPerSec, baselineRow.gamesPerSec) : null)
     );
+
+    for (const row of algoRows) {
+      const rowCmp = comparisons[algo].rows.find((entry) => entry.pipeline === row.pipeline) || {};
+      let line = row.pipeline
+        + ' games/s=' + formatNumber(row.gamesPerSec, 2)
+        + ' trainSteps/s=' + formatNumber(row.trainStepsPerSec, 2)
+        + ' gen/min=' + formatNumber(row.generationsPerMin, 2)
+        + ' busy_p95_ms=' + formatNumber(row.inferBusyP95Ms, 3)
+        + ' idle_p95_ms=' + formatNumber(row.inferIdleP95Ms, 3)
+        + ' timeouts=' + row.inferBusyTimeouts + '/' + row.inferIdleTimeouts;
+      if (row.pipeline !== baselineRow.pipeline) {
+        line += ' games_delta=' + formatSignedPercent(rowCmp.gamesPerSecDeltaVsBaselinePercent)
+          + ' busy_delta=' + formatSignedPercent(rowCmp.inferBusyP95DeltaVsBaselinePercent)
+          + ' idle_delta=' + formatSignedPercent(rowCmp.inferIdleP95DeltaVsBaselinePercent);
+      }
+      if (Number.isFinite(row.qualityEloDelta)) {
+        line += ' quality_elo_delta=' + formatNumber(row.qualityEloDelta, 3)
+          + ' quality_per_gpu_sec=' + formatNumber(row.qualityPerGpuSecond, 6);
+      }
+      summaryLines.push(line);
+    }
   }
-  console.log(JSON.stringify(out, null, 2));
+
+  out.summaries = summaries;
+  out.comparisons = comparisons;
+  emitBenchmarkReport(output, out, summaryLines);
 }
 
 main().catch((err) => {

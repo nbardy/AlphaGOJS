@@ -1,5 +1,5 @@
 import * as tf from '@tensorflow/tfjs';
-import { maskedSoftmax, sampleFromProbs, flattenStates } from './action';
+import { maskedSoftmax, sampleFromProbs, statesRowsToModelInputTensor } from './action';
 
 // Checkpoint pool for Elo-rated self-play.
 // Saves model weight snapshots periodically. During training, some games
@@ -157,8 +157,7 @@ export class CheckpointPool {
 
   // CPU path: full logits sync + maskedSoftmax per row (fallback).
   _selectActionsCpuFallback(states, masks, boardSize, n) {
-    var flat = flattenStates(states, boardSize);
-    var statesTensor = tf.tensor2d(flat, [n, boardSize]);
+    var statesTensor = statesRowsToModelInputTensor(this.opponentModel, states, n);
     var out = this.opponentModel.forward(statesTensor);
     var logitsData = out.policy.dataSync();
     out.policy.dispose();
@@ -179,14 +178,13 @@ export class CheckpointPool {
   // Batched forward + masked multinomial on TF; sync only action indices (matches gpu_trainer / gpu_owner_runtime).
   _selectActionsTfBatched(states, masks, boardSize, n) {
     var self = this;
-    var flat = flattenStates(states, boardSize);
     var maskFlat = new Float32Array(n * boardSize);
     for (var i = 0; i < n; i++) maskFlat.set(masks[i], i * boardSize);
 
     var actionsKept = null;
     try {
       tf.tidy(function () {
-        var statesT = tf.tensor2d(flat, [n, boardSize]);
+        var statesT = statesRowsToModelInputTensor(self.opponentModel, states, n);
         var fwd = self.opponentModel.forward(statesT);
         var logits = fwd.policy;
         var maskT = tf.tensor2d(maskFlat, [n, boardSize]);

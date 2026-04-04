@@ -1,5 +1,5 @@
 import * as tf from '@tensorflow/tfjs';
-import { flattenStates, maskedSoftmax, sampleFromProbs } from './action';
+import { maskedSoftmax, sampleFromProbs, statesRowsToModelInputTensor } from './action';
 
 // REINFORCE (policy gradient) algorithm.
 // Owns optimizer, experience buffer, and training loop.
@@ -39,7 +39,7 @@ export class Reinforce {
     var n = states.length;
     if (n === 0) return [];
 
-    var statesTensor = tf.tensor2d(flattenStates(states, boardSize), [n, boardSize]);
+    var statesTensor = statesRowsToModelInputTensor(this.model, states, n);
     var out = this.model.forward(statesTensor);
     var logitsData = out.policy.dataSync();
     out.policy.dispose();
@@ -115,7 +115,7 @@ export class Reinforce {
       masksArr.push(batch[i].mask);
     }
 
-    var statesTensor = tf.tensor2d(flattenStates(statesArr, boardSize), [n, boardSize]);
+    var statesTensor = statesRowsToModelInputTensor(this.model, statesArr, n);
 
     var actionMaskData = new Float32Array(n * boardSize);
     for (var i = 0; i < n; i++) {

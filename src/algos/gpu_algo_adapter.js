@@ -1,6 +1,6 @@
 import * as tf from '@tensorflow/tfjs';
 import { BaseGPUAlgorithm } from './base_gpu_algorithm';
-import { maskedSoftmax, sampleFromProbs } from '../action';
+import { maskedSoftmax, sampleFromProbs, statesRowsToModelInputTensor } from '../action';
 
 // Adapter: wraps an existing CPU-style algorithm (PPO/PPG/SAC/etc.)
 // so it can be orchestrated by the GPU pipeline.
@@ -58,7 +58,7 @@ export class GPUAlgoAdapter extends BaseGPUAlgorithm {
 
     // Generic fallback using wrapped model if an algorithm doesn't expose selectAction.
     var boardSize = this.model.boardSize;
-    var statesTensor = tf.tensor2d(state, [1, boardSize]);
+    var statesTensor = statesRowsToModelInputTensor(this.model, [state], 1);
     var out = this.model.forward(statesTensor);
     var logitsData = out.policy.dataSync();
     out.policy.dispose();

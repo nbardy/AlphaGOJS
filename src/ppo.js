@@ -1,5 +1,5 @@
 import * as tf from '@tensorflow/tfjs';
-import { flattenStates, maskedSoftmax, sampleFromProbs, logProbOfAction } from './action';
+import { maskedSoftmax, sampleFromProbs, logProbOfAction, statesRowsToModelInputTensor } from './action';
 
 // PPO (Proximal Policy Optimization) with GAE (Generalized Advantage Estimation).
 // Owns optimizer, experience buffer, and training loop.
@@ -51,7 +51,7 @@ export class PPO {
     var n = states.length;
     if (n === 0) return [];
 
-    var statesTensor = tf.tensor2d(flattenStates(states, boardSize), [n, boardSize]);
+    var statesTensor = statesRowsToModelInputTensor(this.model, states, n);
     var out = this.model.forward(statesTensor);
     var logitsData = out.policy.dataSync();
     var valuesData = out.value.dataSync();
@@ -196,7 +196,7 @@ export class PPO {
     var mbSize = this.minibatchSize;
 
     // Build full tensors once; masksFull reused for tf.gather per minibatch (disposed after all epochs).
-    var statesFull = tf.tensor2d(flattenStates(statesArr, boardSize), [n, boardSize]);
+    var statesFull = statesRowsToModelInputTensor(this.model, statesArr, n);
     var masksFlat = new Float32Array(n * boardSize);
     for (var ri = 0; ri < n; ri++) {
       var row = ri * boardSize;

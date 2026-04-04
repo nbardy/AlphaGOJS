@@ -1,7 +1,12 @@
 #!/usr/bin/env node
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { getChromeLaunchArgs, loadPuppeteer } from './puppeteer_bench_common.mjs';
+import {
+  emitBenchmarkReport,
+  formatNumber,
+  prepareBenchmarkOutput
+} from './benchmark_output.mjs';
+import { getPuppeteerLaunchOptions, loadPuppeteer } from './puppeteer_bench_common.mjs';
 
 function clampInt(v, fallback, min, max) {
   const n = Number.parseInt(v, 10);
@@ -32,16 +37,15 @@ function parseArgs(argv) {
 }
 
 async function main() {
-  const cfg = parseArgs(process.argv.slice(2));
+  const argv = process.argv.slice(2);
+  const cfg = parseArgs(argv);
+  const output = prepareBenchmarkOutput('headless_browser_webgpu_benchmark', argv);
   const puppeteer = await loadPuppeteer();
 
   const benchmarkPath = path.resolve(process.cwd(), 'benchmarks/browser_webgpu_benchmark.html');
   const benchmarkUrl = pathToFileURL(benchmarkPath).toString();
 
-  const browser = await puppeteer.launch({
-    headless: true,
-    args: getChromeLaunchArgs()
-  });
+  const browser = await puppeteer.launch(getPuppeteerLaunchOptions({ headless: true }));
 
   try {
     const page = await browser.newPage();
@@ -77,12 +81,13 @@ async function main() {
     const transformer = derived.transformer || {};
     const upload = derived.uploadGbps || {};
 
-    console.log('Headless browser WebGPU benchmark complete');
-    console.log('config warmup=' + cfg.warmup + ' runs=' + cfg.runs + ' seq=' + cfg.seqLen + ' hidden=' + cfg.hiddenDim);
-    console.log('ua=' + (env.userAgent || 'unknown'));
-    console.log('upload median GB/s=' + (Number.isFinite(upload.median) ? upload.median.toFixed(3) : 'n/a'));
-    console.log('transformer e2e tokens/s=' + (Number.isFinite(transformer.e2eTokensPerSec) ? transformer.e2eTokensPerSec.toFixed(1) : 'n/a'));
-    console.log(JSON.stringify(data, null, 2));
+    emitBenchmarkReport(output, data, [
+      'Headless browser WebGPU benchmark complete',
+      'config warmup=' + cfg.warmup + ' runs=' + cfg.runs + ' seq=' + cfg.seqLen + ' hidden=' + cfg.hiddenDim,
+      'ua=' + (env.userAgent || 'unknown'),
+      'upload median GB/s=' + formatNumber(upload.median, 3),
+      'transformer e2e tokens/s=' + formatNumber(transformer.e2eTokensPerSec, 1)
+    ]);
   } finally {
     await browser.close();
   }

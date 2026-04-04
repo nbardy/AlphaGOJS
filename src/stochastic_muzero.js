@@ -11,6 +11,11 @@ import { flattenStates, maskedSoftmax, sampleFromProbs } from './action';
 
 export class StochasticMuZero {
   constructor(model) {
+    if (model.expectsDiscreteInput) {
+      throw new Error(
+        'StochasticMuZero does not support discrete-observation models (patch3_discrete).'
+      );
+    }
     this.model = model; // policy/value network
     this.boardSize = model.boardSize;
 

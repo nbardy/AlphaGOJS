@@ -105,6 +105,18 @@ PlagueWalls.prototype.getBoardForNN = function (player) {
   return state;
 };
 
+PlagueWalls.prototype.getBoardCodesForNN = function (player) {
+  var out = new Int32Array(this.size);
+  for (var i = 0; i < this.size; i++) {
+    var v = this.board[i];
+    if (v === WALL) out[i] = 3;
+    else if (v === 0) out[i] = 0;
+    else if (v * player === 1) out[i] = 1;
+    else out[i] = 2;
+  }
+  return out;
+};
+
 // Renderer: colors for plague with walls
 var renderer = {
   label: 'Walls',

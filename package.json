@@ -5,7 +5,8 @@
   "main": "index.js",
   "dependencies": {
     "@tensorflow/tfjs": "^4.22.0",
-    "@tensorflow/tfjs-backend-wasm": "^4.22.0"
+    "@tensorflow/tfjs-backend-wasm": "^4.22.0",
+    "@tensorflow/tfjs-backend-webgpu": "^4.22.0"
   },
   "devDependencies": {
     "copy-webpack-plugin": "^12.0.0",
@@ -26,7 +27,9 @@
     "bench:system:headless": "node benchmarks/system_interface_benchmark.mjs",
     "bench:system:algos": "node benchmarks/system_interface_benchmark.mjs --algos=ppo,reinforce",
     "bench:loop": "node benchmarks/loop_decomposition_benchmark.mjs",
+    "bench:patch3-smoke": "node benchmarks/patch3_discrete_forward_smoke.mjs",
     "bench:webgpu:parity": "node benchmarks/webgpu_plague_spread_parity.mjs",
+    "bench:webgpu:parity:packed": "node benchmarks/webgpu_plague_spread_parity_packed.mjs",
     "bench:webgpu:spread": "node benchmarks/webgpu_plague_spread_throughput.mjs",
     "bench:all": "node benchmarks/run_all_benchmarks.mjs",
     "bench:all:smoke": "node benchmarks/run_all_benchmarks.mjs --smoke"

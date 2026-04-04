@@ -14,6 +14,7 @@ Webpack **5** (`webpack.config.js`); production: **`npm run build`**. The dev se
 
 ### Architecture
 
+- **`docs/PLAGUE_GAME_RULES.md`** — Plague **game rules** (walls + classic), spread math, terminal/winner, NN encoding; handoff doc (canonical code: `src/games/plague_walls.js` / `plague_classic.js`).
 - `src/game.js` — Pure JS game logic (no TF.js dependency), 10×10 plague territory game
 - `src/model.js` — TF.js policy network (256→128→100 dense, REINFORCE training with entropy bonus)
 - `src/trainer.js` — Self-play trainer running 40 parallel games with batched inference
@@ -60,8 +61,9 @@ Optional query params are parsed at startup (invalid values fall back to default
 ### Benchmarks & profiling (optional)
 
 - **Index:** **`docs/BENCHMARKS.md`** — matrix of every bench, what layer it measures (full app vs WGSL kernel vs TF.js backends), and fair-comparison notes.
-- **`npm run bench:all`** / **`npm run bench:all:smoke`** — sequential bundle: `build` (unless `--skip-build`), **`bench:webgpu:spread`**, **`bench:loop`**, **`bench:system:headless`**. Add **`--with-native-webgpu`** to include **`bench:webgpu:parity`** (needs adapter). See `benchmarks/run_all_benchmarks.mjs`.
-- **`npm run build`** then **`npm run bench:system:headless`** — end-to-end app throughput (Puppeteer opens `docs/index.html`). Install browser: `npx puppeteer browsers install chrome`.
+- **zsh paste:** run **one command per line**. Do not append **`(~…)`** after a command — zsh treats it as a glob qualifier and can print `unknown file attribute: ~`.
+- **`npm run bench:all`** / **`npm run bench:all:smoke`** — sequential bundle: `build` (unless `--skip-build`), **`bench:webgpu:spread`**, **`bench:loop`**, **`bench:system:headless`**. Add **`--with-native-webgpu`** for **`bench:webgpu:parity`**. Default **`bench:all`** uses **two** pipelines and **`--inferenceRuns=24`** so the system step does not run 30+ minutes; use **`node benchmarks/run_all_benchmarks.mjs --full-system`** for all three pipelines + heavier inference (slow). See `benchmarks/run_all_benchmarks.mjs`.
+- **`npm run build`** then **`npm run bench:system:headless`** — end-to-end app throughput (Puppeteer opens `docs/index.html`). Either install Puppeteer’s Chrome (**`npx puppeteer browsers install chrome`**) **or** point at your own binary: **`CHROME_PATH`** or **`PUPPETEER_EXECUTABLE_PATH`** (see **`getPuppeteerLaunchOptions`** in `benchmarks/puppeteer_bench_common.mjs`). If the system bench “hangs,” it is often still working: reduce **`--inferenceRuns`** or **`--pipelines`** (see header in `benchmarks/system_interface_benchmark.mjs`).
 - **`npm run bench:loop`** — GPU worker loop decomposition: `sim_random` (no policy/train) vs `sim_forward` (forward only) vs full RL; prints games/s and optional policy/physics ms per sim tick.
 - **`npm run bench:webgpu:spread`** — native **WGSL plague spread** only: spreads/s and cell-updates/s vs CPU reference (needs WebGPU adapter; exits 0 with `skipped` if none). GPU and CPU paths share the same warmup for a fairer ratio. Not directly comparable to `bench:loop` games/s. **`npm run bench:webgpu:parity`** — correctness check vs CPU. **`npm run bench:webgpu:node`** — generic WebGPU microbenches (Dawn Node).
 - **URL flags** (dev/bench only; omit in normal use): `?pipeline=single_gpu_phased&benchLoop=sim_random|sim_forward&benchInstrument=1&benchMinimalUi=1&webgpuEnv=1` (WebGPU sim in the GPU worker when supported; falls back to TF `GPUGameEngine`). When absent, there is no extra work on hot paths.

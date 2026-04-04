@@ -13,11 +13,18 @@
  * Run: npm run bench:loop
  */
 import {
-  getChromeLaunchArgs,
+  getPuppeteerLaunchOptions,
   loadPuppeteer,
   resolveBuiltAppFileUrl,
   waitForAppReady
 } from './puppeteer_bench_common.mjs';
+import {
+  computePercentDelta,
+  emitBenchmarkReport,
+  formatNumber,
+  formatSignedPercent,
+  prepareBenchmarkOutput
+} from './benchmark_output.mjs';
 
 function clampInt(v, fallback, min, max) {
   const n = Number.parseInt(v, 10);
@@ -119,15 +126,18 @@ async function runThroughputSample(page, durationMs, ticksPerFrame) {
 }
 
 async function main() {
-  const cfg = parseArgs(process.argv.slice(2));
+  const argv = process.argv.slice(2);
+  const cfg = parseArgs(argv);
+  const output = prepareBenchmarkOutput('loop_decomposition_benchmark', argv);
   const { fileUrl: baseUrl } = resolveBuiltAppFileUrl(process.cwd());
 
   const puppeteer = await loadPuppeteer();
-  const browser = await puppeteer.launch({
-    headless: cfg.headless,
-    protocolTimeout: 600000,
-    args: getChromeLaunchArgs()
-  });
+  const browser = await puppeteer.launch(
+    getPuppeteerLaunchOptions({
+      headless: cfg.headless,
+      protocolTimeout: 600000
+    })
+  );
 
   const modes = [
     { id: 'sim_random', label: 'sim_random (no forward/train)' },
@@ -179,35 +189,62 @@ async function main() {
       });
     }
 
-    console.log('Loop decomposition benchmark (GPU worker query modes)');
-    console.log(
+    const byMode = Object.fromEntries(rows.map((row) => [row.mode, row]));
+    const randomGps = byMode.sim_random ? byMode.sim_random.gamesPerSecMedian : NaN;
+    const forwardGps = byMode.sim_forward ? byMode.sim_forward.gamesPerSecMedian : NaN;
+    const fullGps = byMode.full ? byMode.full.gamesPerSecMedian : NaN;
+    const result = {
+      benchmark: 'loop_decomposition_benchmark',
+      config: cfg,
+      rows,
+      comparisons: {
+        simForwardVsRandomPercent: computePercentDelta(forwardGps, randomGps),
+        fullVsForwardPercent: computePercentDelta(fullGps, forwardGps),
+        fullVsRandomPercent: computePercentDelta(fullGps, randomGps)
+      }
+    };
+
+    const summaryLines = [
+      'Loop decomposition benchmark (GPU worker query modes)',
       'pipeline=' + cfg.pipeline
-      + ' duration=' + cfg.durationSec + 's runs=' + cfg.runs
-      + ' ticks/frame=' + cfg.ticksPerFrame
-      + ' instrument=' + cfg.instrument
-      + ' minimalUi=' + cfg.minimalUi
-    );
-    console.log('');
+        + ' duration=' + cfg.durationSec + 's runs=' + cfg.runs
+        + ' ticks/frame=' + cfg.ticksPerFrame
+        + ' instrument=' + cfg.instrument
+        + ' minimalUi=' + cfg.minimalUi
+        + ' webgpuEnv=' + cfg.webgpuEnv
+    ];
+
     for (const r of rows) {
-      let line = r.mode.padEnd(14)
-        + ' games/s ~' + r.gamesPerSecMedian.toFixed(1)
-        + '  (min ' + r.gamesPerSecMin.toFixed(1) + ' max ' + r.gamesPerSecMax.toFixed(1) + ')'
-        + '  trainSteps/s ~' + r.trainStepsPerSecMedian.toFixed(3);
+      let deltaText = '';
+      if (r.mode === 'sim_forward') {
+        deltaText = ' delta_vs_sim_random=' + formatSignedPercent(result.comparisons.simForwardVsRandomPercent);
+      } else if (r.mode === 'full') {
+        deltaText = ' delta_vs_sim_forward=' + formatSignedPercent(result.comparisons.fullVsForwardPercent)
+          + ' delta_vs_sim_random=' + formatSignedPercent(result.comparisons.fullVsRandomPercent);
+      }
+
+      let line = r.mode
+        + ' games/s=' + formatNumber(r.gamesPerSecMedian, 1)
+        + ' range=' + formatNumber(r.gamesPerSecMin, 1) + '..' + formatNumber(r.gamesPerSecMax, 1)
+        + ' trainSteps/s=' + formatNumber(r.trainStepsPerSecMedian, 3)
+        + deltaText;
       if (typeof r.benchAvgPolicyMsPerSimTick === 'number') {
         const pol = r.benchAvgPolicyMsPerSimTick;
         const phy = r.benchAvgPhysicsMsPerSimTick;
         const tot = pol + phy;
-        const pct = tot > 0 ? (100 * pol / tot).toFixed(1) : '—';
-        line += '  policy_ms/tick=' + pol.toFixed(3) + '  physics_ms/tick=' + phy.toFixed(3)
-          + '  policy~' + pct + '%(of pol+phy)';
+        const pct = tot > 0 ? (100 * pol / tot) : NaN;
+        line += ' policy_ms/tick=' + formatNumber(pol, 3)
+          + ' physics_ms/tick=' + formatNumber(phy, 3)
+          + ' policy_share=' + formatNumber(pct, 1) + '%';
       }
       if (r.benchTrainCalls > 0) {
-        line += '  train_wall_ms=' + Number(r.benchTrainMs).toFixed(1) + ' calls=' + r.benchTrainCalls;
+        line += ' train_wall_ms=' + formatNumber(Number(r.benchTrainMs), 1)
+          + ' train_calls=' + r.benchTrainCalls;
       }
-      console.log(line);
+      summaryLines.push(line);
     }
-    console.log('');
-    console.log(JSON.stringify({ config: cfg, rows }, null, 2));
+
+    emitBenchmarkReport(output, result, summaryLines);
   } finally {
     await browser.close();
   }

@@ -90,6 +90,17 @@ PlagueClassic.prototype.getBoardForNN = function (player) {
   return state;
 };
 
+PlagueClassic.prototype.getBoardCodesForNN = function (player) {
+  var out = new Int32Array(this.size);
+  for (var i = 0; i < this.size; i++) {
+    var v = this.board[i];
+    if (v === 0) out[i] = 0;
+    else if (v * player === 1) out[i] = 1;
+    else out[i] = 2;
+  }
+  return out;
+};
+
 // Renderer: colors for classic plague (no walls)
 var renderer = {
   label: 'Classic',

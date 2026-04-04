@@ -1,5 +1,5 @@
 import * as tf from '@tensorflow/tfjs';
-import { flattenStates } from '../../action';
+import { statesRowsToModelInputTensor } from '../../action';
 import { createModel } from '../../model_registry';
 import { createAlgorithm } from '../../algo_registry';
 import { eloUpdatePair } from '../../league_elo';
@@ -165,6 +165,16 @@ export class GPUOwnerRuntime {
       }, poolCfg);
       this.gamesSinceLastTrain = 0;
       this.generation = 0;
+    }
+
+    if (useMulti && this.models) {
+      for (var qm = 0; qm < this.models.length; qm++) {
+        if (this.models[qm].expectsDiscreteInput) {
+          throw new Error(
+            'Discrete-observation models (patch3_discrete) are not supported in league / multi-model mode.'
+          );
+        }
+      }
     }
 
     var useWebGpuEnv = !!config.useWebGPUGameEngine && this.gameType === 'plague_walls';
@@ -374,7 +384,8 @@ export class GPUOwnerRuntime {
       }
       if (!hasValid) continue;
       out.slotIds.push(slotIds[i]);
-      out.states.push(cpu.states[i]);
+      var useCodes = !this._multiModel && this.model.expectsDiscreteInput;
+      out.states.push(useCodes ? cpu.codes[i] : cpu.states[i]);
       out.masks.push(mask);
     }
     return out;
@@ -435,7 +446,7 @@ export class GPUOwnerRuntime {
     return out;
   }
 
-  _policySelectUsesGpuBatchedPath() {
+  _policySelectUsesGpuBatchedTfPath() {
     if (!this._useGpuBatchedPolicySelect) return false;
     if (this._multiModel) {
       if (!this.models || this.models.length === 0) return false;
@@ -447,6 +458,13 @@ export class GPUOwnerRuntime {
     }
     var k = this._algoKind;
     return k === 'ppo' || k === 'reinforce' || k === 'ppg';
+  }
+
+  _policySelectUsesGpuTensorObsPath() {
+    if (this._benchLoopMode === 'sim_random') return false;
+    if (!this._policySelectUsesGpuBatchedTfPath()) return false;
+    if (this._multiModel) return true;
+    return !this.model.expectsDiscreteInput;
   }
 
   _modelIdxForSlot(slot) {
@@ -462,7 +480,6 @@ export class GPUOwnerRuntime {
     var k = batch.slotIds.length;
     var boardSize = this.boardSize;
     var N = this.numGames;
-    var flatStates = flattenStates(batch.states, boardSize);
     var maskFlat = new Float32Array(k * boardSize);
     for (var i = 0; i < k; i++) {
       maskFlat.set(batch.masks[i], i * boardSize);
@@ -488,12 +505,12 @@ export class GPUOwnerRuntime {
       var idxList = byModel[mm];
       if (idxList.length === 0) continue;
       var km = idxList.length;
-      var subFlat = new Float32Array(km * boardSize);
       var subMaskFlat = new Float32Array(km * boardSize);
+      var subStates = [];
       for (var j = 0; j < km; j++) {
         var row = idxList[j];
         var off = row * boardSize;
-        subFlat.set(flatStates.subarray(off, off + boardSize), j * boardSize);
+        subStates.push(batch.states[row]);
         subMaskFlat.set(maskFlat.subarray(off, off + boardSize), j * boardSize);
       }
 
@@ -503,7 +520,7 @@ export class GPUOwnerRuntime {
       var valueKept;
       var mod = this.models[mm];
       tf.tidy(function () {
-        var statesT = tf.tensor2d(subFlat, [km, boardSize]);
+        var statesT = statesRowsToModelInputTensor(mod, subStates, km);
         var fwd = mod.forward(statesT);
         var logits = fwd.policy;
         var vals = fwd.value;
@@ -566,7 +583,6 @@ export class GPUOwnerRuntime {
     var k = batch.slotIds.length;
     var boardSize = this.boardSize;
     var N = this.numGames;
-    var flatStates = flattenStates(batch.states, boardSize);
     var maskFlat = new Float32Array(k * boardSize);
     for (var i = 0; i < k; i++) {
       maskFlat.set(batch.masks[i], i * boardSize);
@@ -578,7 +594,7 @@ export class GPUOwnerRuntime {
     var valueKept;
 
     tf.tidy(function () {
-      var statesT = tf.tensor2d(flatStates, [k, boardSize]);
+      var statesT = statesRowsToModelInputTensor(model, batch.states, k);
       var fwd = model.forward(statesT);
       var logits = fwd.policy;
       var vals = fwd.value;
@@ -888,7 +904,7 @@ export class GPUOwnerRuntime {
     if (this._benchLoopMode === 'sim_random') {
       return this._selectRandomLegal(batch);
     }
-    if (this._policySelectUsesGpuBatchedPath() && batch.slotIds.length > 0) {
+    if (this._policySelectUsesGpuBatchedTfPath() && batch.slotIds.length > 0) {
       if (batch._obsTensor != null && batch._maskTensor != null) {
         try {
           return this._selectWithAlgorithmGpuBatchedTensors(batch._obsTensor, batch._maskTensor, batch);
@@ -904,13 +920,15 @@ export class GPUOwnerRuntime {
           console.warn('[gpu_owner] GPU batched tensor select failed, CPU rebuild:', e.message);
           try {
             var ex = this.engine.extractStatesMasksCPU(batch.slotIds, batch._gpuPerspective);
-            batch.states = ex.states;
+            batch.states =
+              !this._multiModel && this.model.expectsDiscreteInput ? ex.codes : ex.states;
             batch.masks = ex.masks;
             return this._selectWithAlgorithmGpuBatched(batch);
           } catch (e3) {
             console.warn('[gpu_owner] GPU batched (CPU states) failed, using algo.selectActions:', e3.message);
             var ex2 = this.engine.extractStatesMasksCPU(batch.slotIds, batch._gpuPerspective);
-            batch.states = ex2.states;
+            batch.states =
+              !this._multiModel && this.model.expectsDiscreteInput ? ex2.codes : ex2.states;
             batch.masks = ex2.masks;
           }
         }
@@ -1207,11 +1225,18 @@ export class GPUOwnerRuntime {
       if (found < 0) continue;
 
       var raw = snap.states[found];
-      var state = new Float32Array(B);
+      var state;
       var mask = new Float32Array(B);
-      for (var j = 0; j < B; j++) {
-        state[j] = raw[j];
-        mask[j] = raw[j] === 0 ? 1 : 0;
+      if (raw instanceof Int32Array) {
+        state = new Int32Array(B);
+        state.set(raw);
+        for (var j = 0; j < B; j++) mask[j] = state[j] === 0 ? 1 : 0;
+      } else {
+        state = new Float32Array(B);
+        for (var j2 = 0; j2 < B; j2++) {
+          state[j2] = raw[j2];
+          mask[j2] = raw[j2] === 0 ? 1 : 0;
+        }
       }
 
       var step = {
@@ -1488,9 +1513,9 @@ export class GPUOwnerRuntime {
     var minimal = this._benchMinimalReplay();
 
     var p1Active = this.engine.getActiveSlots();
-    var p1Batch = (this._benchLoopMode === 'sim_random' || !this._policySelectUsesGpuBatchedPath())
-      ? this._buildActionBatch(p1Active, 1)
-      : this._buildActionBatchGpu(p1Active, 1);
+    var p1Batch = this._policySelectUsesGpuTensorObsPath()
+      ? this._buildActionBatchGpu(p1Active, 1)
+      : this._buildActionBatch(p1Active, 1);
     var p1Sel = null;
     if (p1Batch.slotIds.length > 0) {
       p1Sel = this._selectWithAlgorithm(p1Batch);
@@ -1516,9 +1541,9 @@ export class GPUOwnerRuntime {
     var p2Active = this.engine.getActiveSlots();
     if (p2Active.length > 0) {
       var splitP2 = this._splitP2Slots(p2Active);
-      var selfBatch = (this._benchLoopMode === 'sim_random' || !this._policySelectUsesGpuBatchedPath())
-        ? this._buildActionBatch(splitP2.selfSlots, -1)
-        : this._buildActionBatchGpu(splitP2.selfSlots, -1);
+      var selfBatch = this._policySelectUsesGpuTensorObsPath()
+        ? this._buildActionBatchGpu(splitP2.selfSlots, -1)
+        : this._buildActionBatch(splitP2.selfSlots, -1);
       var ckptBatch = this._buildActionBatch(splitP2.ckptSlots, -1);
 
       if (selfBatch.slotIds.length > 0) {
@@ -1545,13 +1570,13 @@ export class GPUOwnerRuntime {
         for (var ko = 0; ko < kOpp.length; ko++) {
           var oj = parseInt(kOpp[ko], 10);
           var slist = byOpp[oj];
-          var crossBatch = (this._benchLoopMode === 'sim_random' || !this._policySelectUsesGpuBatchedPath())
-            ? this._buildActionBatch(slist, -1)
-            : this._buildActionBatchGpu(slist, -1);
+          var crossBatch = this._policySelectUsesGpuTensorObsPath()
+            ? this._buildActionBatchGpu(slist, -1)
+            : this._buildActionBatch(slist, -1);
           if (crossBatch.slotIds.length === 0) continue;
           var csel;
           try {
-            if (this._policySelectUsesGpuBatchedPath()) {
+            if (this._policySelectUsesGpuBatchedTfPath()) {
               if (crossBatch._obsTensor != null && crossBatch._maskTensor != null) {
                 csel = this._gpuBatchedOneModelTensors(
                   crossBatch._obsTensor,

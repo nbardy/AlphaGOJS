@@ -11,6 +11,9 @@ import { flattenStates, maskedSoftmax, sampleFromProbs } from './action';
 
 export class SAC {
   constructor(model) {
+    if (model.expectsDiscreteInput) {
+      throw new Error('SAC does not support discrete-observation models (patch3_discrete).');
+    }
     this.model = model; // actor network (policy logits come from model.forward)
     this.boardSize = model.boardSize;
 
