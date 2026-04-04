@@ -74,10 +74,36 @@ export function sampleFromProbs(probs) {
 }
 
 /**
+ * log π(a|s) under the same masked distribution as maskedSoftmax / TF logSoftmax(masked logits).
+ * Uses logit_a - logSumExp over legal cells (stable max trick). Matches GPU rollout and PPO train().
+ */
+export function logProbMaskedLogits(logits, mask, action) {
+  var n = logits.length;
+  var maxVal = -Infinity;
+  for (var i = 0; i < n; i++) {
+    if (mask[i] > 0 && logits[i] > maxVal) maxVal = logits[i];
+  }
+  if (maxVal === -Infinity) return Number.NEGATIVE_INFINITY;
+
+  var sumExp = 0;
+  for (var i = 0; i < n; i++) {
+    if (mask[i] > 0) sumExp += Math.exp(logits[i] - maxVal);
+  }
+
+  if (sumExp <= 1e-8) {
+    var validCount = 0;
+    for (var i = 0; i < n; i++) if (mask[i] > 0) validCount++;
+    if (validCount > 0 && mask[action] > 0) return -Math.log(validCount);
+    return Number.NEGATIVE_INFINITY;
+  }
+
+  var logSumExp = Math.log(sumExp) + maxVal;
+  return logits[action] - logSumExp;
+}
+
+/**
  * Compute log probability of a specific action given logits and mask.
- * Uses the same masked softmax internally.
  */
 export function logProbOfAction(logits, mask, action) {
-  var probs = maskedSoftmax(logits, mask);
-  return Math.log(probs[action] + 1e-8);
+  return logProbMaskedLogits(logits, mask, action);
 }

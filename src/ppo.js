@@ -66,7 +66,7 @@ export class PPO {
       for (var j = 0; j < boardSize; j++) logits[j] = logitsData[i * boardSize + j];
       var probs = maskedSoftmax(logits, masks[i]);
       var action = sampleFromProbs(probs);
-      var lp = Math.log(probs[action] + 1e-8);
+      var lp = logProbOfAction(logits, masks[i], action);
       // Compute entropy from inference probs (CPU, zero GPU cost)
       var ent = 0;
       for (var j = 0; j < boardSize; j++) {
