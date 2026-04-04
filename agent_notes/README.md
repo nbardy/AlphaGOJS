@@ -5,6 +5,8 @@ Living notes for runtime choice, performance, benchmarks, and roadmap. **Not** u
 | Doc | Contents |
 |-----|----------|
 | [README.md](./README.md) | This index + **default vs fastest** |
+| [key_learnings.md](./key_learnings.md) | **Dense** takeaways: masking, PPO, defaults, Elo/league, pitfalls, file map |
+| [exploration_log.md](./exploration_log.md) | Narrative of **what we tried** (readbacks, worker path, benches, experiments) |
 | [plans_and_ideas.md](./plans_and_ideas.md) | Roadmap, queue starvation, readbacks, bench modes, future architectures |
 | [THREAD_RECAP.md](./THREAD_RECAP.md) | Consolidated Q&A: PPO, Elo, runtimes, TF.js readback, artifacts, blockers |
 
