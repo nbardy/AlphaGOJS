@@ -117,16 +117,22 @@ export class WebGPUGameEngine {
       ]
     });
 
+    // WGSL @group(N) ↔ pipelineLayout.bindGroupLayouts[N]. apply_pass uses @group(1), terminal @group(2).
+    var layoutEmpty = device.createBindGroupLayout({ entries: [] });
+    this._bindEmpty = device.createBindGroup({ layout: layoutEmpty, entries: [] });
+
     this.pipelineSpread = device.createComputePipeline({
       layout: device.createPipelineLayout({ bindGroupLayouts: [layoutSpread] }),
       compute: { module: module, entryPoint: 'spread_pass' }
     });
     this.pipelineApply = device.createComputePipeline({
-      layout: device.createPipelineLayout({ bindGroupLayouts: [layoutApply] }),
+      layout: device.createPipelineLayout({ bindGroupLayouts: [layoutEmpty, layoutApply] }),
       compute: { module: module, entryPoint: 'apply_pass' }
     });
     this.pipelineTerm = device.createComputePipeline({
-      layout: device.createPipelineLayout({ bindGroupLayouts: [layoutTerm] }),
+      layout: device.createPipelineLayout({
+        bindGroupLayouts: [layoutEmpty, layoutEmpty, layoutTerm]
+      }),
       compute: { module: module, entryPoint: 'terminal_pass' }
     });
 
@@ -205,7 +211,16 @@ export class WebGPUGameEngine {
     });
   }
 
-  static async create(config, wgslSource) {
+  /**
+   * @param {{ numGames: number, rows: number, cols: number, gameType?: string }} config
+   * @param {string} wgslSource
+   * @param {GPUDevice | null | undefined} existingDevice If set (e.g. TF.js WebGPU backend’s device),
+   *   reuse it so the worker does not open a second GPUDevice — reduces driver churn and lost-device errors.
+   */
+  static async create(config, wgslSource, existingDevice) {
+    if (existingDevice) {
+      return new WebGPUGameEngine(existingDevice, config, wgslSource);
+    }
     var req = await requestPlagueSpreadDevice();
     return new WebGPUGameEngine(req.device, config, wgslSource);
   }
@@ -305,7 +320,8 @@ export class WebGPUGameEngine {
     var enc = this.device.createCommandEncoder();
     var pass = enc.beginComputePass();
     pass.setPipeline(this.pipelineApply);
-    pass.setBindGroup(0, this._readIsA ? this.bindApplyA : this.bindApplyB);
+    pass.setBindGroup(0, this._bindEmpty);
+    pass.setBindGroup(1, this._readIsA ? this.bindApplyA : this.bindApplyB);
     pass.dispatchWorkgroups(this._wgApply);
     pass.end();
     this.device.queue.submit([enc.finish()]);
@@ -336,7 +352,9 @@ export class WebGPUGameEngine {
     var enc = this.device.createCommandEncoder();
     var pass = enc.beginComputePass();
     pass.setPipeline(this.pipelineTerm);
-    pass.setBindGroup(0, this._readIsA ? this.bindTermA : this.bindTermB);
+    pass.setBindGroup(0, this._bindEmpty);
+    pass.setBindGroup(1, this._bindEmpty);
+    pass.setBindGroup(2, this._readIsA ? this.bindTermA : this.bindTermB);
     pass.dispatchWorkgroups(this._wgTerm);
     pass.end();
     this.device.queue.submit([enc.finish()]);

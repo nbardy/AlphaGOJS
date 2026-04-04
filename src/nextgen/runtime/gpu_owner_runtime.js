@@ -1,4 +1,5 @@
 import * as tf from '@tensorflow/tfjs';
+import { ensureBestTfBackendOnce, getTfWebGpuDeviceIfAvailable } from '../../tf_backend_bootstrap';
 import { statesRowsToModelInputTensor } from '../../action';
 import { nnPerspectiveFloatBoardToCodes } from '../../nn_cell_codes';
 import { createModel } from '../../model_registry';
@@ -81,6 +82,7 @@ export class GPUOwnerRuntime {
   async init(config) {
     config = config || {};
     await this.dispose();
+    await ensureBestTfBackendOnce();
 
     this._disposed = false;
     this._ready = false;
@@ -181,6 +183,10 @@ export class GPUOwnerRuntime {
     var useWebGpuEnv = !!config.useWebGPUGameEngine && this.gameType === 'plague_walls';
     if (useWebGpuEnv) {
       try {
+        var tfWgpu = getTfWebGpuDeviceIfAvailable();
+        if (tfWgpu && typeof console !== 'undefined' && console.info) {
+          console.info('[webgpu env] sharing TensorFlow.js GPUDevice for plague sim');
+        }
         this.engine = await WebGPUGameEngine.create(
           {
             numGames: this.numGames,
@@ -188,7 +194,8 @@ export class GPUOwnerRuntime {
             cols: this.cols,
             gameType: this.gameType
           },
-          plagueEnvWGSL
+          plagueEnvWGSL,
+          tfWgpu
         );
       } catch (e) {
         console.warn('[gpu_owner] WebGPU env unavailable, using TF GPUGameEngine:', e && e.message ? e.message : e);

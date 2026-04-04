@@ -1,5 +1,5 @@
 import * as tf from '@tensorflow/tfjs';
-import { flattenStates, maskedSoftmax, sampleFromProbs } from './action';
+import { flattenBoardRowsForFloatNn, maskedSoftmax, sampleFromProbs } from './action';
 
 // Discrete Soft Actor-Critic (SAC) for board-index action spaces.
 // Actor: reuses the selected policy model (Dense/Spatial).
@@ -83,7 +83,7 @@ export class SAC {
     var boardSize = this.boardSize;
     if (n === 0) return [];
 
-    var statesTensor = tf.tensor2d(flattenStates(states, boardSize), [n, boardSize]);
+    var statesTensor = tf.tensor2d(flattenBoardRowsForFloatNn(states, boardSize, n), [n, boardSize]);
     var out = this.model.forward(statesTensor);
     var logitsData = out.policy.dataSync();
     out.policy.dispose();
@@ -209,8 +209,8 @@ export class SAC {
       nextMasksArr.push(batch[i].nextMask);
     }
 
-    var statesT = tf.tensor2d(flattenStates(statesArr, boardSize), [n, boardSize]);
-    var nextStatesT = tf.tensor2d(flattenStates(nextStatesArr, boardSize), [n, boardSize]);
+    var statesT = tf.tensor2d(flattenBoardRowsForFloatNn(statesArr, boardSize, n), [n, boardSize]);
+    var nextStatesT = tf.tensor2d(flattenBoardRowsForFloatNn(nextStatesArr, boardSize, n), [n, boardSize]);
     var rewardsT = tf.tensor1d(rewards);
     var donesT = tf.tensor1d(dones);
 

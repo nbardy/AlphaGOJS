@@ -66,8 +66,9 @@ function ensureNnCodeObservationRows(statesArr, boardSize, n) {
 
 /**
  * Float32 flat [n, boardSize] for conv/dense models: accepts NN code rows or legacy float rows.
+ * Exported for SAC / MuZero and any path that builds float tensors without statesRowsToModelInputTensor.
  */
-function flattenObservationRowsForFloatModel(statesArr, boardSize, n) {
+export function flattenBoardRowsForFloatNn(statesArr, boardSize, n) {
   if (observationRowsAreNnCodes(statesArr)) {
     var flat = new Float32Array(n * boardSize);
     for (var b = 0; b < n; b++) {
@@ -76,6 +77,22 @@ function flattenObservationRowsForFloatModel(statesArr, boardSize, n) {
     return flat;
   }
   return flattenStates(statesArr, boardSize);
+}
+
+/**
+ * Single board row → float features (getBoardForNN layout). Handles Int32 NN codes or float rows.
+ */
+export function boardRowToFloatNnInput(row, boardSize) {
+  if (row instanceof Int32Array || row instanceof Uint32Array) {
+    return nnCodesToFloatBoard(row, boardSize);
+  }
+  var out = new Float32Array(boardSize);
+  if (row instanceof Float32Array) {
+    out.set(row);
+  } else {
+    for (var i = 0; i < boardSize; i++) out[i] = row[i];
+  }
+  return out;
 }
 
 /**
@@ -134,7 +151,7 @@ export function statesRowsToModelInputTensor(model, statesArr, n) {
     var flatJ = flattenDiscreteJointIndices(statesArr, model.rows, model.cols, P, boardSize);
     return tf.tensor2d(flatJ, [n, boardSize], 'int32');
   }
-  return tf.tensor2d(flattenObservationRowsForFloatModel(statesArr, boardSize, n), [n, boardSize]);
+  return tf.tensor2d(flattenBoardRowsForFloatNn(statesArr, boardSize, n), [n, boardSize]);
 }
 
 /**

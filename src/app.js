@@ -9,7 +9,9 @@ import { probeCapabilities } from './nextgen/capability_probe';
 import { chooseRuntimeTier } from './nextgen/runtime_planner';
 import { CheckpointPool } from './checkpoint_pool';
 import { resolveRuntimeSpec, listRuntimeTypes } from './runtime/runtime_registry';
+import * as tf from '@tensorflow/tfjs';
 import { UI } from './ui';
+import { ensureBestTfBackendOnce } from './tf_backend_bootstrap';
 
 // --- Configuration ---
 var ROWS = 20;
@@ -198,6 +200,13 @@ function mapTierToPipelineType(tier) {
 }
 
 async function start() {
+  await ensureBestTfBackendOnce();
+  var tfBackendMain = 'unknown';
+  try {
+    tfBackendMain = tf.getBackend();
+  } catch (e) {
+    tfBackendMain = 'unknown';
+  }
   var pipelineType = 'cpu_actors_gpu_learner';
   try {
     var cap = await probeCapabilities();
@@ -234,7 +243,8 @@ async function start() {
     listModelTypes: listModelTypes,
     listAlgorithmTypes: listAlgorithmTypes,
     listRuntimeTypes: listRuntimeTypes,
-    benchRuntimeExtras: benchExtras
+    benchRuntimeExtras: benchExtras,
+    tfBackendMain: tfBackendMain
   });
   window.__alphaPlague = ui;
 }

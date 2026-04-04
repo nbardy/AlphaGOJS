@@ -39,6 +39,9 @@ export class UI {
 
   destroy() {
     this._destroyed = true;
+    var pill = document.getElementById('webgpu-status-pill');
+    if (pill) pill.remove();
+    this._webgpuPillEl = null;
     if (this.trainer && typeof this.trainer.dispose === 'function') {
       this.trainer.dispose();
     }
@@ -95,6 +98,7 @@ export class UI {
     document.getElementById('training-section').style.display = 'block';
     document.getElementById('human-section').style.display = 'none';
     this._renderCharts();
+    this._buildWebGpuStatusPill();
   }
 
   _injectStyles() {
@@ -139,9 +143,90 @@ export class UI {
       '#charts-section { margin-top:20px; }',
       '#charts-section h2 { font-size:15px; color:#4488ff; margin-bottom:10px; text-align:center; }',
       '#charts-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; max-width:820px; margin:0 auto; }',
-      '@media (max-width:600px) { #charts-grid { grid-template-columns:1fr; } }'
+      '@media (max-width:600px) { #charts-grid { grid-template-columns:1fr; } }',
+      '#webgpu-status-pill { position:fixed; top:10px; right:10px; z-index:9999; font-size:11px; font-family:"Courier New",monospace; padding:7px 11px; border-radius:7px; border:1px solid; max-width:min(300px,calc(100vw - 20px)); text-align:right; line-height:1.35; box-shadow:0 2px 12px rgba(0,0,0,0.35); cursor:default; }',
+      '#webgpu-status-pill.ok { background:#0d2218; border-color:#2a8a5a; color:#8ef5bc; }',
+      '#webgpu-status-pill.warn { background:#221a0d; border-color:#8a6a2a; color:#eecc88; }',
+      '#webgpu-status-pill.err { background:#221014; border-color:#8a3a4a; color:#ff99aa; }',
+      '#webgpu-status-pill .webgpu-line1 { font-weight:bold; }',
+      '#webgpu-status-pill .webgpu-line2 { font-size:9px; color:#8899aa; margin-top:4px; }',
+      '#webgpu-status-pill.ok .webgpu-line2 { color:#6a9a7a; }',
+      '#webgpu-status-pill.warn .webgpu-line2 { color:#aa8866; }',
+      '#webgpu-status-pill.err .webgpu-line2 { color:#aa7788; }'
     ].join('\n');
     document.head.appendChild(style);
+  }
+
+  _isGpuWorkerPipeline() {
+    var p = this.pipelineType || '';
+    return (
+      p === 'single_gpu_phased' ||
+      p === 'full_gpu_resident' ||
+      p === 'gpu_worker' ||
+      p === 'gpu'
+    );
+  }
+
+  _buildWebGpuStatusPill() {
+    var existing = document.getElementById('webgpu-status-pill');
+    if (existing) existing.remove();
+
+    var navGpu = typeof navigator !== 'undefined' && !!navigator.gpu;
+    var secure =
+      typeof window !== 'undefined' &&
+      (window.isSecureContext || (typeof location !== 'undefined' && location.hostname === 'localhost'));
+    var bench = this.config.benchRuntimeExtras || {};
+    var wgslSim = !!bench.useWebGPUGameEngine;
+    var tfMain = this.config.tfBackendMain || 'unknown';
+
+    var pill = document.createElement('div');
+    pill.id = 'webgpu-status-pill';
+
+    var line1 = document.createElement('div');
+    line1.className = 'webgpu-line1';
+    var line2 = document.createElement('div');
+    line2.className = 'webgpu-line2';
+
+    if (!secure) {
+      pill.className = 'err';
+      line1.textContent = '\u26A0 Not a secure context';
+      line2.textContent = 'WebGPU may be blocked; use HTTPS or localhost.';
+    } else if (navGpu) {
+      pill.className = 'ok';
+      line1.textContent = '\u2713 WebGPU API available';
+      var parts = ['TF (this tab): ' + tfMain];
+      if (this._isGpuWorkerPipeline()) {
+        parts.push('NN in GPU worker — see console for [tf] backend');
+      }
+      line2.textContent = parts.join(' · ');
+    } else {
+      pill.className = 'warn';
+      line1.textContent = '\u26A0 No WebGPU API';
+      line2.textContent =
+        'Browser or build has no navigator.gpu. TF (this tab): ' +
+        tfMain +
+        (this._isGpuWorkerPipeline() ? ' · worker uses own GPU path' : '');
+    }
+
+    var line3 = document.createElement('div');
+    line3.className = 'webgpu-line2';
+    line3.textContent = wgslSim
+      ? 'WGSL plague sim: on (?webgpuEnv=1)'
+      : 'WGSL plague sim: off (default TF sim)';
+    pill.appendChild(line1);
+    pill.appendChild(line2);
+    pill.appendChild(line3);
+
+    var titleParts = [
+      'navigator.gpu: ' + (navGpu ? 'yes' : 'no'),
+      'secure context: ' + (secure ? 'yes' : 'no'),
+      'pipeline: ' + (this.pipelineType || ''),
+      'TF main thread: ' + tfMain
+    ];
+    pill.setAttribute('title', titleParts.join('\n'));
+
+    document.body.appendChild(pill);
+    this._webgpuPillEl = pill;
   }
 
   _buildDOM() {
@@ -400,6 +485,8 @@ export class UI {
 
     humanSection.appendChild(ctrlRow);
     app.appendChild(humanSection);
+
+    this._buildWebGpuStatusPill();
   }
 
   _startHumanGame() {

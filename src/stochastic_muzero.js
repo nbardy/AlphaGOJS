@@ -1,5 +1,5 @@
 import * as tf from '@tensorflow/tfjs';
-import { flattenStates, maskedSoftmax, sampleFromProbs } from './action';
+import { boardRowToFloatNnInput, flattenBoardRowsForFloatNn, maskedSoftmax, sampleFromProbs } from './action';
 
 // Stochastic MuZero-style planner (lightweight, JS/TF.js friendly).
 //
@@ -61,7 +61,7 @@ export class StochasticMuZero {
     var boardSize = this.boardSize;
     if (n === 0) return [];
 
-    var statesTensor = tf.tensor2d(flattenStates(states, boardSize), [n, boardSize]);
+    var statesTensor = tf.tensor2d(flattenBoardRowsForFloatNn(states, boardSize, n), [n, boardSize]);
     var out = this.model.forward(statesTensor);
     var logitsData = out.policy.dataSync();
     out.policy.dispose();
@@ -110,7 +110,7 @@ export class StochasticMuZero {
     var flatActions = new Float32Array(m * boardSize);
     for (var c = 0; c < m; c++) {
       var si = candState[c];
-      flatStates.set(states[si], c * boardSize);
+      flatStates.set(boardRowToFloatNnInput(states[si], boardSize), c * boardSize);
       flatActions[c * boardSize + candAction[c]] = 1;
     }
 
@@ -287,8 +287,8 @@ export class StochasticMuZero {
       masksArr.push(batch[i].mask);
     }
 
-    var statesT = tf.tensor2d(flattenStates(statesArr, boardSize), [n, boardSize]);
-    var nextStatesT = tf.tensor2d(flattenStates(nextStatesArr, boardSize), [n, boardSize]);
+    var statesT = tf.tensor2d(flattenBoardRowsForFloatNn(statesArr, boardSize, n), [n, boardSize]);
+    var nextStatesT = tf.tensor2d(flattenBoardRowsForFloatNn(nextStatesArr, boardSize, n), [n, boardSize]);
     var rewardsT = tf.tensor1d(rewards);
     var returnsT = tf.tensor1d(returns);
 
