@@ -34,6 +34,12 @@ At the revision when this file was added, **training was observed to converge** 
 - **Readback reduction** (partial board sync, batched policy, action-only checkpoint sampling) mainly cuts **GPU→CPU** cost; it **does not replace** correct masking and PPO math. It can **indirectly** help by allowing more useful samples per wall-clock.
 - **Re-forward on replayed states during PPO** is **required** for gradients w.r.t. **current** weights; storing rollout-time gradients is **not** a drop-in substitute (stale θ, huge memory). See THREAD_RECAP “rollout vs train gradients.”
 
+### Mental model: WebGPU / worker — rollouts cheap, gradients expensive
+
+- **Rollouts** (GPU sim + batched policy forward + `multinomial` / readback of actions, log π, V): dominated by **inference** and bounded **GPU→CPU** sync — typically **cheap per env step** relative to training once the hot path is tuned.
+- **Gradients** (`ppo.train()`, TF.js **forward + backward** over the replay batch, **Adam**, multiple minibatches): **much more work per sample** than a single rollout forward; in practice often the **wall-clock bottleneck** under fixed model size and update schedule.
+- **Design lever:** extra **parallel games** or **higher tick rate** may not shorten “time to good policy” if **`train()`** or **queue/back-pressure** caps learning throughput — profile **train interval**, **batch size**, and **epochs** alongside `games/s`.
+
 ---
 
 ## 4. Pitfalls we explicitly avoided or fixed along the way
