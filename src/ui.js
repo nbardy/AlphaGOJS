@@ -58,7 +58,8 @@ export class UI {
       this.config.numGames || this.trainer.numGames,
       this.pipelineType,
       this.gameType,
-      this.config.benchRuntimeExtras || {}
+      this.config.benchRuntimeExtras || {},
+      this.config.leagueRuntimeOverrides
     );
     this.pipelineType = pipeline.pipelineType || this.pipelineType;
     this.trainer = pipeline.trainer;
