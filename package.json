@@ -24,7 +24,10 @@
     "bench:webgpu:browser": "echo \"Open benchmarks/browser_webgpu_benchmark.html in a WebGPU-capable browser\"",
     "bench:webgpu:headless": "node benchmarks/headless_browser_webgpu_benchmark.mjs",
     "bench:system:headless": "node benchmarks/system_interface_benchmark.mjs",
-    "bench:system:algos": "node benchmarks/system_interface_benchmark.mjs --algos=ppo,reinforce"
+    "bench:system:algos": "node benchmarks/system_interface_benchmark.mjs --algos=ppo,reinforce",
+    "bench:loop": "node benchmarks/loop_decomposition_benchmark.mjs",
+    "bench:webgpu:parity": "node benchmarks/webgpu_plague_spread_parity.mjs",
+    "bench:webgpu:spread": "node benchmarks/webgpu_plague_spread_throughput.mjs"
   },
   "keywords": [],
   "author": "",

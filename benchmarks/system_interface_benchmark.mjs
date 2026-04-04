@@ -58,7 +58,7 @@ function parseArgs(argv) {
     inferenceRuns: 60,
     inferenceTimeoutMs: 5000,
     protocolTimeoutMs: 600000,
-    model: 'dense',
+    model: 'spatial_lite',
     algo: 'ppo',
     algos: [],
     qualityWindowsSec: [],

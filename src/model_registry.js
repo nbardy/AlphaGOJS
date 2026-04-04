@@ -1,11 +1,19 @@
 import { DenseModel } from './dense_model';
 import { SpatialModel } from './spatial_model';
+import { SpatialLiteModel } from './spatial_lite_model';
 
 // Model registry: single source of truth for UI labels and constructors.
 // Add new model types here only.
 var MODEL_TYPES = [
+  {
+    id: 'spatial_lite',
+    label: 'Spatial lite (sep conv)',
+    create: function (rows, cols) {
+      return new SpatialLiteModel(rows, cols);
+    }
+  },
   { id: 'dense', label: 'Dense', create: function (rows, cols) { return new DenseModel(rows, cols); } },
-  { id: 'spatial', label: 'Spatial (slow)', create: function (rows, cols) { return new SpatialModel(rows, cols); } }
+  { id: 'spatial', label: 'Spatial (deep res, slow)', create: function (rows, cols) { return new SpatialModel(rows, cols); } }
 ];
 
 export function listModelTypes() {

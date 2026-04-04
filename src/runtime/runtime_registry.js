@@ -1,20 +1,39 @@
 // Runtime registry controls high-level execution topology selection.
 // A runtime maps to an underlying pipeline kind plus tuned options.
 
+// Order: default/smooth GPU mode first; full resident for max throughput (can stall / feel janky).
 var RUNTIME_TYPES = [
   {
     id: 'single_gpu_phased',
-    label: 'Single GPU (phased)',
+    label: 'Single GPU phased (default)',
     pipelineKind: 'gpu_worker',
     options: {
       pipelineTypeOverride: 'single_gpu_phased',
       trainBatchSize: 512,
-      trainInterval: 90,
+      trainInterval: 30,
       snapshotEveryTicks: 2,
       maxTickBatch: 4,
       maxQueuedSteps: 512,
       pauseTicksWhenTraining: true,
-      trainInFlightQueueCap: 0
+      trainInFlightQueueCap: 0,
+      uiSnapshotMaxGames: 48
+    }
+  },
+  {
+    id: 'full_gpu_resident',
+    label: 'Full GPU resident (max throughput)',
+    pipelineKind: 'gpu_worker',
+    options: {
+      pipelineTypeOverride: 'full_gpu_resident',
+      trainBatchSize: 512,
+      trainInterval: 30,
+      snapshotEveryTicks: 1,
+      maxTickBatch: 16,
+      maxQueuedSteps: 4096,
+      queueSoftCapFraction: 0.75,
+      pauseTicksWhenTraining: false,
+      trainInFlightQueueCap: 64,
+      uiSnapshotMaxGames: 48
     }
   },
   {
@@ -24,22 +43,7 @@ var RUNTIME_TYPES = [
     options: {
       pipelineTypeOverride: 'cpu_actors_gpu_learner',
       trainBatchSize: 512,
-      trainInterval: 90
-    }
-  },
-  {
-    id: 'full_gpu_resident',
-    label: 'Full GPU Resident',
-    pipelineKind: 'gpu_worker',
-    options: {
-      pipelineTypeOverride: 'full_gpu_resident',
-      trainBatchSize: 512,
-      trainInterval: 30,
-      snapshotEveryTicks: 1,
-      maxTickBatch: 16,
-      maxQueuedSteps: 8192,
-      pauseTicksWhenTraining: false,
-      trainInFlightQueueCap: 64
+      trainInterval: 30
     }
   },
   // Legacy aliases kept for backwards compatibility with existing scripts.

@@ -195,8 +195,17 @@ export class PPO {
     var self = this;
     var mbSize = this.minibatchSize;
 
-    // Build full tensors once
+    // Build full tensors once; masksFull reused for tf.gather per minibatch (disposed after all epochs).
     var statesFull = tf.tensor2d(flattenStates(statesArr, boardSize), [n, boardSize]);
+    var masksFlat = new Float32Array(n * boardSize);
+    for (var ri = 0; ri < n; ri++) {
+      var row = ri * boardSize;
+      var mrow = masksArr[ri];
+      for (var rj = 0; rj < boardSize; rj++) {
+        masksFlat[row + rj] = mrow[rj];
+      }
+    }
+    var masksFull = tf.tensor2d(masksFlat, [n, boardSize]);
 
     for (var epoch = 0; epoch < this.epochs; epoch++) {
       // Shuffle indices
@@ -212,32 +221,32 @@ export class PPO {
         var mbIndices = indices.slice(start, start + mbSize);
 
         // Gather minibatch data
-        var mbActionMask = new Float32Array(mbSize * boardSize);
         var mbOldLogProbs = new Float32Array(mbSize);
         var mbAdvantages = new Float32Array(mbSize);
         var mbReturns = new Float32Array(mbSize);
         var mbGatherIndices = new Int32Array(mbSize);
+        var mbActions = new Int32Array(mbSize);
 
-        var mbValidMask = new Float32Array(mbSize * boardSize);
         for (var mi = 0; mi < mbSize; mi++) {
           var idx = mbIndices[mi];
-          mbActionMask[mi * boardSize + actionsArr[idx]] = 1;
           mbOldLogProbs[mi] = oldLogProbsArr[idx];
           mbAdvantages[mi] = advantagesArr[idx];
           mbReturns[mi] = returnsArr[idx];
           mbGatherIndices[mi] = idx;
-          for (var mj = 0; mj < boardSize; mj++) {
-            mbValidMask[mi * boardSize + mj] = masksArr[idx][mj];
-          }
+          mbActions[mi] = actionsArr[idx];
         }
 
-        // Gather states for this minibatch
-        var mbStates = tf.gather(statesFull, Array.from(mbGatherIndices));
-        var actionMaskT = tf.tensor2d(mbActionMask, [mbSize, boardSize]);
+        var mbGatherIdxT = tf.tensor1d(mbGatherIndices, 'int32');
+        var mbStates = tf.gather(statesFull, mbGatherIdxT);
+        var validMaskT = tf.gather(masksFull, mbGatherIdxT);
+        mbGatherIdxT.dispose();
+
+        var actionsT = tf.tensor1d(mbActions, 'int32');
+        var oneHot = tf.oneHot(actionsT, boardSize);
+
         var oldLogProbsT = tf.tensor1d(mbOldLogProbs);
         var advantagesT = tf.tensor1d(mbAdvantages);
         var returnsT = tf.tensor1d(mbReturns);
-        var validMaskT = tf.tensor2d(mbValidMask, [mbSize, boardSize]);
 
         try {
           var loss = self.optimizer.minimize(function () {
@@ -251,8 +260,7 @@ export class PPO {
             // so training matches inference (which uses maskedSoftmax).
             var maskedLogits = policyLogits.add(validMaskT.sub(1).mul(1e9));
             var probs = maskedLogits.softmax();
-            var selectedProbs = probs.mul(actionMaskT).sum(1);
-            var newLogProbs = selectedProbs.add(tf.scalar(1e-8)).log();
+            var newLogProbs = tf.logSoftmax(maskedLogits).mul(oneHot).sum(1);
 
             // PPO clipped surrogate objective
             var ratio = newLogProbs.sub(oldLogProbsT).exp();
@@ -281,15 +289,17 @@ export class PPO {
         }
 
         mbStates.dispose();
-        actionMaskT.dispose();
+        validMaskT.dispose();
+        actionsT.dispose();
+        oneHot.dispose();
         oldLogProbsT.dispose();
         advantagesT.dispose();
         returnsT.dispose();
-        validMaskT.dispose();
       }
     }
 
     statesFull.dispose();
+    masksFull.dispose();
 
     // Adapt entropy coefficient toward target using lastEntropy from inference (CPU-side).
     // OUTSIDE minimize() — never put adaptation/dataSync inside the gradient tape.

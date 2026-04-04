@@ -25,6 +25,16 @@ export class GPUOrchestrator {
     this.checkpointPool = config.checkpointPool || null;
     this.enableAsyncEloEval = !!config.enableAsyncEloEval;
 
+    var uim = config.uiSnapshotMaxGames;
+    if (typeof uim === 'number' && uim > 0) {
+      this.uiSnapshotMaxGames = Math.min(uim, this.numGames);
+    } else {
+      this.uiSnapshotMaxGames = Math.min(48, this.numGames);
+    }
+    this._boardRenderCache = new Float32Array(this.numGames * this.boardSize);
+    this._gpuUiPrimed = false;
+    this._boardSnapshotCounter = 0;
+
     this.engine = new GPUGameEngine({
       numGames: this.numGames,
       rows: this.rows,
@@ -483,8 +493,40 @@ export class GPUOrchestrator {
     return sampleFromProbs(probs);
   }
 
+  _uiBoardSnapshotSlots(N, maxG, counter) {
+    var m = Math.min(maxG, N);
+    var pageCount = Math.ceil(N / m);
+    var page = counter % pageCount;
+    var start = page * m;
+    var out = [];
+    for (var j = 0; j < m && start + j < N; j++) out.push(start + j);
+    return out;
+  }
+
   getBoardsForRender() {
-    return this.engine.getBoardsForRender();
+    var N = this.numGames;
+    var B = this.boardSize;
+    var maxG = this.uiSnapshotMaxGames;
+    if (maxG >= N) {
+      var full = this.engine.getBoardsForRender();
+      this._boardRenderCache.set(full.boards);
+      this._gpuUiPrimed = true;
+      return { boards: this._boardRenderCache, done: full.done, winners: full.winners };
+    }
+    if (!this._gpuUiPrimed) {
+      var fr = this.engine.getBoardsForRender();
+      this._boardRenderCache.set(fr.boards);
+      this._gpuUiPrimed = true;
+      return { boards: this._boardRenderCache, done: fr.done, winners: fr.winners };
+    }
+    this._boardSnapshotCounter++;
+    var slotIds = this._uiBoardSnapshotSlots(N, maxG, this._boardSnapshotCounter);
+    var part = this.engine.getBoardsForRenderGather(slotIds);
+    for (var i = 0; i < slotIds.length; i++) {
+      var slot = slotIds[i];
+      this._boardRenderCache.set(part.boards.subarray(i * B, (i + 1) * B), slot * B);
+    }
+    return { boards: this._boardRenderCache, done: part.done, winners: part.winners };
   }
 
   shouldTrain(gamesSinceLastTrain, trainInterval, trainBatchSize) {
@@ -506,6 +548,9 @@ export class GPUOrchestrator {
       for (var i = 0; i < this.recentLengths.length; i++) sum += this.recentLengths[i];
       avgLen = sum / this.recentLengths.length;
     }
+    var ent = this.algo && this.algo.algo && typeof this.algo.algo.lastEntropy === 'number'
+      ? this.algo.algo.lastEntropy
+      : this.lastEntropy;
     return {
       gamesCompleted: this.gamesCompleted,
       generation: this.generation,
@@ -516,7 +561,8 @@ export class GPUOrchestrator {
       avgGameLength: avgLen,
       bufferSize: this.getBufferSize(),
       elo: this.checkpointPool ? this.checkpointPool.getCurrentElo() : 0,
-      checkpointWinRate: this.checkpointPool ? this.checkpointPool.getRecentWinRate() : 0
+      checkpointWinRate: this.checkpointPool ? this.checkpointPool.getRecentWinRate() : 0,
+      entropy: Number.isFinite(ent) ? ent : 0
     };
   }
 

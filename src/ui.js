@@ -57,7 +57,8 @@ export class UI {
       this.config.cols || this.cols,
       this.config.numGames || this.trainer.numGames,
       this.pipelineType,
-      this.gameType
+      this.gameType,
+      this.config.benchRuntimeExtras || {}
     );
     this.pipelineType = pipeline.pipelineType || this.pipelineType;
     this.trainer = pipeline.trainer;
@@ -192,13 +193,16 @@ export class UI {
       { id: 'spatial', label: 'Spatial (slow)' }
     ];
     var modelOptionsHTML = '';
+    var hasSpatialLite = false;
     var hasDense = false;
     for (var mi = 0; mi < modelTypes.length; mi++) {
+      if (modelTypes[mi].id === 'spatial_lite') hasSpatialLite = true;
       if (modelTypes[mi].id === 'dense') hasDense = true;
       modelOptionsHTML += '<option value="' + modelTypes[mi].id + '">' + modelTypes[mi].label + '</option>';
     }
     modelSel.innerHTML = modelOptionsHTML;
-    if (hasDense) modelSel.value = 'dense';
+    if (hasSpatialLite) modelSel.value = 'spatial_lite';
+    else if (hasDense) modelSel.value = 'dense';
     else if (modelTypes.length > 0) modelSel.value = modelTypes[0].id;
     controls.appendChild(modelSel);
 
@@ -579,8 +583,13 @@ export class UI {
   }
 
   _snapshotMetrics(stats) {
-    // GPU pipeline has no algo object; entropy unavailable (reported as 0).
-    var entropy = (this.algo && this.algo.lastEntropy) ? this.algo.lastEntropy : 0;
+    // Prefer trainer-reported entropy (GPU worker uses stats; proxy has no lastEntropy).
+    var entropy = 0;
+    if (typeof stats.entropy === 'number' && Number.isFinite(stats.entropy)) {
+      entropy = stats.entropy;
+    } else if (this.algo && typeof this.algo.lastEntropy === 'number' && Number.isFinite(this.algo.lastEntropy)) {
+      entropy = this.algo.lastEntropy;
+    }
     var totalSelf = stats.p1Wins + stats.p2Wins + stats.draws;
     var selfP1Rate = totalSelf > 0 ? stats.p1Wins / totalSelf : 0.5;
     var selfP2Rate = totalSelf > 0 ? stats.p2Wins / totalSelf : 0.5;

@@ -13,7 +13,10 @@ function makeDefaultStats() {
     trainSteps: 0,
     elo: 1000,
     checkpointWinRate: 0,
-    trainInFlight: false
+    entropy: 0,
+    trainInFlight: false,
+    gpuReadbackCalls: 0,
+    gpuReadbackBytes: 0
   };
 }
 
@@ -36,6 +39,11 @@ export class GPUWorkerTrainerProxy {
     this._tickInFlight = false;
     this._maxTickBatch = Math.max(1, config.maxTickBatch || 8);
     this._maxQueuedSteps = Math.max(1, config.maxQueuedSteps || 4096);
+    var qscf = config.queueSoftCapFraction;
+    if (typeof qscf !== 'number' || !isFinite(qscf)) {
+      qscf = config.pipelineTypeOverride === 'full_gpu_resident' ? 0.75 : 1.0;
+    }
+    this._queueSoftCapFraction = Math.min(1, Math.max(0, qscf));
     this._pauseTicksWhenTraining = !!config.pauseTicksWhenTraining;
     this._trainInFlightQueueCap = Math.max(0, config.trainInFlightQueueCap || 0);
     this._nextRequestId = 1;
@@ -44,6 +52,10 @@ export class GPUWorkerTrainerProxy {
     this._onMessage = this._onMessage.bind(this);
     this.worker.addEventListener('message', this._onMessage);
     this.worker.postMessage(makeInit(config));
+  }
+
+  _queueSoftCapSteps() {
+    return Math.max(1, Math.floor(this._maxQueuedSteps * this._queueSoftCapFraction));
   }
 
   _onMessage(ev) {
@@ -58,9 +70,30 @@ export class GPUWorkerTrainerProxy {
 
     if (data.type === MSG.TICK_RESULT) {
       if (data.stats) this._stats = data.stats;
-      if (data.boards) this._boards = data.boards;
-      if (data.done) this._done = data.done;
-      if (data.winners) this._winners = data.winners;
+      if (data.boards) {
+        var B = this.boardSize;
+        if (data.boardSampleSlots && data.boardSampleSlots.length > 0) {
+          var slots = data.boardSampleSlots;
+          for (var si = 0; si < slots.length; si++) {
+            var slot = slots[si];
+            var dst = slot * B;
+            var src = si * B;
+            for (var j = 0; j < B; j++) {
+              this._boards[dst + j] = data.boards[src + j];
+            }
+          }
+        } else if (data.boards.length === this._boards.length) {
+          this._boards.set(data.boards);
+        } else {
+          this._boards = new Int8Array(data.boards);
+        }
+      }
+      if (data.done && data.done.length === this._done.length) {
+        this._done.set(data.done);
+      }
+      if (data.winners && data.winners.length === this._winners.length) {
+        this._winners.set(data.winners);
+      }
       this._tickInFlight = false;
       this._flushTicks();
       return;
@@ -97,7 +130,8 @@ export class GPUWorkerTrainerProxy {
     if (this._pauseTicksWhenTraining && this._stats && this._stats.trainInFlight) {
       if (this._queuedSteps > this._trainInFlightQueueCap) return;
     }
-    if (this._queuedSteps >= this._maxQueuedSteps) return;
+    var softCap = this._queueSoftCapSteps();
+    if (this._queuedSteps >= softCap) return;
     this._queuedSteps++;
     this._flushTicks();
   }
@@ -121,7 +155,13 @@ export class GPUWorkerTrainerProxy {
   }
 
   getStats() {
-    return this._stats;
+    var softCap = this._queueSoftCapSteps();
+    return Object.assign({}, this._stats, {
+      queueDepth: this._queuedSteps,
+      queueSoftCap: softCap,
+      queueSoftCapFraction: this._queueSoftCapFraction,
+      tickInFlight: this._tickInFlight
+    });
   }
 
   getBufferSize() {

@@ -599,6 +599,7 @@ export class GPUTrainer {
       for (var i = 0; i < this.recentLengths.length; i++) sum += this.recentLengths[i];
       avgLen = sum / this.recentLengths.length;
     }
+    var ent = typeof this.lastEntropy === 'number' ? this.lastEntropy : NaN;
     return {
       gamesCompleted: this.gamesCompleted,
       generation: this.generation,
@@ -609,7 +610,8 @@ export class GPUTrainer {
       avgGameLength: avgLen,
       bufferSize: this.buffer.length,
       elo: this.checkpointPool ? this.checkpointPool.getCurrentElo() : 0,
-      checkpointWinRate: this.checkpointPool ? this.checkpointPool.getRecentWinRate() : 0
+      checkpointWinRate: this.checkpointPool ? this.checkpointPool.getRecentWinRate() : 0,
+      entropy: Number.isFinite(ent) ? ent : 0
     };
   }
 

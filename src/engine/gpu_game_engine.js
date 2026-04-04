@@ -1,7 +1,8 @@
 import * as tf from '@tensorflow/tfjs';
 
 // GPU simulation engine: owns only environment state and transitions.
-// No RL math, no replay logic.
+// Hot path avoids full-board readback: gather rows for inference, small
+// stats tensor for terminals, tensor reset for finished games.
 
 export class GPUGameEngine {
   constructor(config) {
@@ -21,6 +22,31 @@ export class GPUGameEngine {
     this.done = new Uint8Array(this.numGames);
     this.winners = new Int8Array(this.numGames);
     this.doneTimes = new Float64Array(this.numGames);
+
+    this.readbackCallsThisFrame = 0;
+    this.readbackFloatsThisFrame = 0;
+  }
+
+  beginReadbackFrame() {
+    this.readbackCallsThisFrame = 0;
+    this.readbackFloatsThisFrame = 0;
+  }
+
+  _trackReadback(floatCount) {
+    this.readbackCallsThisFrame++;
+    this.readbackFloatsThisFrame += floatCount;
+  }
+
+  consumeReadbackFrame() {
+    var f = this.readbackFloatsThisFrame;
+    var c = this.readbackCallsThisFrame;
+    this.readbackFloatsThisFrame = 0;
+    this.readbackCallsThisFrame = 0;
+    return {
+      calls: c,
+      floats: f,
+      bytes: f * 4
+    };
   }
 
   getActiveSlots() {
@@ -87,28 +113,27 @@ export class GPUGameEngine {
 
   resolveTerminals() {
     var N = this.numGames;
-    var boardSize = this.boardSize;
+    var self = this;
+    var packed = tf.tidy(function () {
+      var s = self.state;
+      var empty = s.equal(0).cast('float32').sum(1).expandDims(1);
+      var pos = s.greater(0).cast('float32').sum(1).expandDims(1);
+      var neg = s.less(0).cast('float32').sum(1).expandDims(1);
+      return tf.concat([empty, pos, neg], 1);
+    });
+    this._trackReadback(N * 3);
+    var data = packed.dataSync();
+    packed.dispose();
 
-    var emptyCounts = tf.tidy(function () {
-      return this.state.equal(0).cast('float32').sum(1);
-    }.bind(this));
-    var emptyData = emptyCounts.dataSync();
-    emptyCounts.dispose();
-
-    var stateData = this.state.dataSync();
     var doneSlots = [];
     var winners = [];
     for (var i = 0; i < N; i++) {
       if (this.done[i]) continue;
-      if (emptyData[i] !== 0) continue;
+      var base = i * 3;
+      if (data[base] !== 0) continue;
 
-      var p1 = 0, p2 = 0;
-      var offset = i * boardSize;
-      for (var j = 0; j < boardSize; j++) {
-        var v = stateData[offset + j];
-        if (v > 0) p1++;
-        else if (v < 0) p2++;
-      }
+      var p1 = data[base + 1];
+      var p2 = data[base + 2];
       var winner = p1 > p2 ? 1 : (p2 > p1 ? -1 : 0);
       this.done[i] = 1;
       this.winners[i] = winner;
@@ -121,20 +146,38 @@ export class GPUGameEngine {
 
   resetSlots(indices) {
     if (!indices || indices.length === 0) return;
-    var stateData = this.state.dataSync();
-    var newData = Float32Array.from(stateData);
+    var N = this.numGames;
+    var oldState = this.state;
+    this.state = tf.tidy(function () {
+      var idxT = tf.tensor1d(indices, 'int32');
+      var oh = tf.oneHot(idxT, N);
+      var rowReset = oh.max(0).expandDims(1);
+      var keep = tf.sub(1, rowReset);
+      return oldState.mul(keep);
+    });
+    oldState.dispose();
+
     for (var k = 0; k < indices.length; k++) {
       var i = indices[k];
-      var offset = i * this.boardSize;
-      for (var j = 0; j < this.boardSize; j++) newData[offset + j] = 0;
       this.done[i] = 0;
       this.winners[i] = 0;
       this.turns[i] = 0;
       this.doneTimes[i] = 0;
     }
-    var oldState = this.state;
-    this.state = tf.tensor2d(newData, [this.numGames, this.boardSize]);
-    oldState.dispose();
+  }
+
+  /**
+   * Gather state rows for listed slots. Returns NEW tensors (caller must dispose):
+   * raw board rows shaped [k, boardSize]. On GPU, legal cells are empty iff
+   * `raw.equal(0)` (mask for policy: `.cast('float32')`); player observation is
+   * `raw.mul(player)` for player ∈ {1, -1}.
+   */
+  gatherSlotsTensor(slotIds) {
+    if (!slotIds || slotIds.length === 0) return null;
+    var indices = tf.tensor1d(slotIds, 'int32');
+    var raw = tf.gather(this.state, indices, 0);
+    indices.dispose();
+    return raw;
   }
 
   extractStatesMasksCPU(slotIds, player) {
@@ -142,13 +185,20 @@ export class GPUGameEngine {
     var outMasks = [];
     if (!slotIds || slotIds.length === 0) return { states: outStates, masks: outMasks };
 
-    var stateData = this.state.dataSync();
-    for (var s = 0; s < slotIds.length; s++) {
-      var slot = slotIds[s];
-      var offset = slot * this.boardSize;
-      var state = new Float32Array(this.boardSize);
-      var mask = new Float32Array(this.boardSize);
-      for (var j = 0; j < this.boardSize; j++) {
+    var boardSize = this.boardSize;
+    var k = slotIds.length;
+    var indices = tf.tensor1d(slotIds, 'int32');
+    var gathered = tf.gather(this.state, indices, 0);
+    indices.dispose();
+    this._trackReadback(k * boardSize);
+    var stateData = gathered.dataSync();
+    gathered.dispose();
+
+    for (var s = 0; s < k; s++) {
+      var offset = s * boardSize;
+      var state = new Float32Array(boardSize);
+      var mask = new Float32Array(boardSize);
+      for (var j = 0; j < boardSize; j++) {
         var v = stateData[offset + j];
         state[j] = v * player;
         mask[j] = v === 0 ? 1 : 0;
@@ -159,9 +209,40 @@ export class GPUGameEngine {
     return { states: outStates, masks: outMasks };
   }
 
+  /**
+   * Full board readback (e.g. one-time UI warm-up or when maxSlots >= numGames).
+   */
   getBoardsForRender() {
+    var boards = this.state.dataSync();
+    this._trackReadback(this.numGames * this.boardSize);
     return {
-      boards: this.state.dataSync(),
+      boards: boards,
+      done: this.done,
+      winners: this.winners
+    };
+  }
+
+  /**
+   * Partial readback: only listed slot rows (hot path for UI / worker transfer).
+   */
+  getBoardsForRenderGather(slotIds) {
+    if (!slotIds || slotIds.length === 0) {
+      return {
+        boards: new Float32Array(0),
+        done: this.done,
+        winners: this.winners
+      };
+    }
+    var boardSize = this.boardSize;
+    var k = slotIds.length;
+    var indices = tf.tensor1d(slotIds, 'int32');
+    var gathered = tf.gather(this.state, indices, 0);
+    indices.dispose();
+    this._trackReadback(k * boardSize);
+    var boards = gathered.dataSync();
+    gathered.dispose();
+    return {
+      boards: boards,
       done: this.done,
       winners: this.winners
     };

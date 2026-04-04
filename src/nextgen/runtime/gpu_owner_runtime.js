@@ -1,3 +1,5 @@
+import * as tf from '@tensorflow/tfjs';
+import { flattenStates } from '../../action';
 import { createModel } from '../../model_registry';
 import { createAlgorithm } from '../../algo_registry';
 import { CheckpointPool } from '../../checkpoint_pool';
@@ -11,8 +13,8 @@ function defaultCheckpointConfig(cfg) {
     maxCheckpoints: cfg.maxCheckpoints || 50,
     recentWindow: cfg.recentWindow || 50,
     sampleMode: cfg.sampleMode || 'uniform_recent',
-    checkpointFraction: typeof cfg.checkpointFraction === 'number' ? cfg.checkpointFraction : 0.25,
-    saveInterval: cfg.saveInterval || 20
+    checkpointFraction: typeof cfg.checkpointFraction === 'number' ? cfg.checkpointFraction : 0.3,
+    saveInterval: cfg.saveInterval || 15
   };
 }
 
@@ -75,8 +77,10 @@ export class GPUOwnerRuntime {
     this.pauseTicksWhenTraining = !!config.pauseTicksWhenTraining;
     this.gameType = config.gameType || 'plague_walls';
 
-    var modelType = config.modelType || 'dense';
+    var modelType = config.modelType || 'spatial_lite';
     var algoType = config.algoType || 'ppo';
+    this._algoKind = algoType;
+    this._useGpuBatchedPolicySelect = config.useGpuBatchedPolicySelect !== false;
     this.model = createModel(modelType, this.rows, this.cols);
     this.algo = createAlgorithm(algoType, this.model);
 
@@ -111,6 +115,29 @@ export class GPUOwnerRuntime {
     this.lastEntropy = 0;
     this._trainInFlight = false;
 
+    var uim = config.uiSnapshotMaxGames;
+    if (typeof uim === 'number' && uim > 0) {
+      this._uiSnapshotMaxGames = Math.min(uim, this.numGames);
+    } else {
+      this._uiSnapshotMaxGames = Math.min(48, this.numGames);
+    }
+    this._hasDoneFullBoardSync = false;
+    this._boardSnapshotPage = 0;
+
+    this._benchLoopMode = (config.benchLoopMode === 'sim_random' || config.benchLoopMode === 'sim_forward')
+      ? config.benchLoopMode
+      : 'off';
+    this._benchInstrument = !!config.benchInstrument;
+    this._benchDisableTrain = this._benchLoopMode !== 'off';
+    this._benchTrainMsPending = 0;
+    this._benchTrainCallsPending = 0;
+    if (config.benchMinimalUi) {
+      this._snapshotEveryTicks = 1000;
+    }
+    this._benchPolicyMsBatch = 0;
+    this._benchPhysicsMsBatch = 0;
+    this._benchTickSamplesBatch = 0;
+
     var initSlots = [];
     for (var s = 0; s < this.numGames; s++) initSlots.push(s);
     this._resetSlotMetadata(initSlots);
@@ -128,6 +155,62 @@ export class GPUOwnerRuntime {
       if (mask[i] > 0) return i;
     }
     return 0;
+  }
+
+  _benchMinimalReplay() {
+    return this._benchLoopMode === 'sim_random' || this._benchLoopMode === 'sim_forward';
+  }
+
+  _randomActionFromMask(mask) {
+    var legals = [];
+    for (var j = 0; j < mask.length; j++) {
+      if (mask[j] > 0) legals.push(j);
+    }
+    if (legals.length === 0) return this._fallbackAction(mask);
+    var seed = (this._ticks * 1103515245 + legals.length * 17 + 12345) >>> 0;
+    seed = (1664525 * seed + 1013904223) >>> 0;
+    return legals[Math.floor((seed / 4294967296) * legals.length)];
+  }
+
+  _selectRandomLegal(batch) {
+    var N = this.numGames;
+    var k = batch.slotIds.length;
+    var actionsBySlot = new Int32Array(N);
+    var actions = new Int32Array(k);
+    var logProbs = new Float32Array(k);
+    var values = new Float32Array(k);
+    for (var z = 0; z < k; z++) {
+      logProbs[z] = NaN;
+      values[z] = NaN;
+    }
+    for (var i = 0; i < k; i++) {
+      var slot = batch.slotIds[i];
+      var a = this._randomActionFromMask(batch.masks[i]);
+      actions[i] = a;
+      actionsBySlot[slot] = a;
+    }
+    return {
+      slotIds: batch.slotIds,
+      actionsBySlot: actionsBySlot,
+      actions: actions,
+      logProbs: logProbs,
+      values: values,
+      entropySum: 0,
+      entropyCount: 0
+    };
+  }
+
+  _selectRandomCheckpointBatch(batch) {
+    var N = this.numGames;
+    var actionsBySlot = new Int32Array(N);
+    var applied = [];
+    for (var i = 0; i < batch.slotIds.length; i++) {
+      var slot = batch.slotIds[i];
+      var a = this._randomActionFromMask(batch.masks[i]);
+      actionsBySlot[slot] = a;
+      applied.push(slot);
+    }
+    return { actionsBySlot: actionsBySlot, slotIds: applied };
   }
 
   _splitP2Slots(activeSlots) {
@@ -162,7 +245,277 @@ export class GPUOwnerRuntime {
     return out;
   }
 
+  /**
+   * Self-play GPU path: gather rows on GPU, filter rows with no legal moves via a
+   * small (k-float) readback. Caller passes batch to _selectWithAlgorithm; tensors
+   * are disposed inside GPU batched tensor select (or on fallback error).
+   */
+  _buildActionBatchGpu(slotIds, player) {
+    var empty = { slotIds: [], states: [], masks: [], _obsTensor: null, _maskTensor: null, _gpuPerspective: player };
+    if (!slotIds || slotIds.length === 0) return empty;
+
+    var raw = this.engine.gatherSlotsTensor(slotIds);
+    var mask = raw.equal(0).cast('float32');
+    var rowSums = mask.sum(1);
+    this.engine._trackReadback(slotIds.length);
+    var sumData = rowSums.dataSync();
+    rowSums.dispose();
+
+    var keepIdx = [];
+    for (var i = 0; i < slotIds.length; i++) {
+      if (sumData[i] > 0) keepIdx.push(i);
+    }
+    if (keepIdx.length === 0) {
+      raw.dispose();
+      mask.dispose();
+      return empty;
+    }
+
+    var idxT = tf.tensor1d(keepIdx, 'int32');
+    var rawK = tf.gather(raw, idxT, 0);
+    var maskK = tf.gather(mask, idxT, 0);
+    raw.dispose();
+    mask.dispose();
+    idxT.dispose();
+
+    var pSc = tf.scalar(player);
+    var obs = rawK.mul(pSc);
+    rawK.dispose();
+    pSc.dispose();
+
+    var out = {
+      slotIds: keepIdx.map(function (j) { return slotIds[j]; }),
+      states: [],
+      masks: [],
+      _obsTensor: obs,
+      _maskTensor: maskK,
+      _gpuPerspective: player
+    };
+    return out;
+  }
+
+  _policySelectUsesGpuBatchedPath() {
+    if (!this._useGpuBatchedPolicySelect || !this.model || typeof this.model.forward !== 'function') {
+      return false;
+    }
+    var k = this._algoKind;
+    return k === 'ppo' || k === 'reinforce' || k === 'ppg';
+  }
+
+  /**
+   * Batched policy forward + tf.multinomial on GPU, readback only actions, log π(a|s), and V(s)
+   * per row (see gpu_trainer.js). Matches training: masked logits = logits + (mask-1)*1e9, then
+   * logSoftmax for log probs. PPO/REINFORCE/PPG only; other algos use algo.selectActions.
+   */
+  _selectWithAlgorithmGpuBatched(batch) {
+    var self = this;
+    var k = batch.slotIds.length;
+    var boardSize = this.boardSize;
+    var N = this.numGames;
+    var flatStates = flattenStates(batch.states, boardSize);
+    var maskFlat = new Float32Array(k * boardSize);
+    for (var i = 0; i < k; i++) {
+      maskFlat.set(batch.masks[i], i * boardSize);
+    }
+
+    var entropyScalar = 0;
+    var actionsKept;
+    var logProbKept;
+    var valueKept;
+
+    tf.tidy(function () {
+      var statesT = tf.tensor2d(flatStates, [k, boardSize]);
+      var fwd = self.model.forward(statesT);
+      var logits = fwd.policy;
+      var vals = fwd.value;
+      var maskT = tf.tensor2d(maskFlat, [k, boardSize]);
+      var maskedLogits = logits.add(maskT.sub(1).mul(1e9));
+      var probs = tf.softmax(maskedLogits);
+      var entMean = probs.mul(tf.log(probs.add(1e-8))).sum(1).neg().mean();
+      entropyScalar = entMean.dataSync()[0];
+
+      var multinom = tf.multinomial(maskedLogits, 2);
+      var actionsT = multinom.slice([0, 1], [-1, 1]).squeeze([1]);
+      var logSM = tf.logSoftmax(maskedLogits);
+      var oh = tf.oneHot(actionsT.cast('int32'), boardSize);
+      var logProbT = logSM.mul(oh).sum(1);
+
+      actionsKept = tf.keep(actionsT.clone());
+      logProbKept = tf.keep(logProbT.clone());
+      valueKept = tf.keep(vals.clone());
+    });
+
+    var ad = actionsKept.dataSync();
+    var lp = logProbKept.dataSync();
+    var vd = valueKept.dataSync();
+    actionsKept.dispose();
+    logProbKept.dispose();
+    valueKept.dispose();
+
+    var actionsBySlot = new Int32Array(N);
+    var actions = new Int32Array(k);
+    var logProbs = new Float32Array(k);
+    var values = new Float32Array(k);
+    for (var i = 0; i < k; i++) {
+      var slot = batch.slotIds[i];
+      var ai = Math.round(ad[i]);
+      if (ai < 0 || ai >= boardSize || batch.masks[i][ai] <= 0) {
+        ai = self._fallbackAction(batch.masks[i]);
+      }
+      actionsBySlot[slot] = ai;
+      actions[i] = ai;
+      logProbs[i] = lp[i];
+      values[i] = vd[i];
+    }
+
+    return {
+      slotIds: batch.slotIds,
+      actionsBySlot: actionsBySlot,
+      actions: actions,
+      logProbs: logProbs,
+      values: values,
+      entropySum: entropyScalar * k,
+      entropyCount: k
+    };
+  }
+
+  /**
+   * Same masked policy forward + multinomial as _selectWithAlgorithmGpuBatched, but obs/mask
+   * stay on GPU (no flattenStates / CPU mask upload). Fills batch.states / batch.masks from one
+   * obs readback after actions for snapshots and trajectory.
+   */
+  _selectWithAlgorithmGpuBatchedTensors(obsTensor, maskTensor, batch) {
+    var self = this;
+    var k = batch.slotIds.length;
+    var boardSize = this.boardSize;
+    var N = this.numGames;
+
+    var entropyScalar = 0;
+    var actionsKept;
+    var logProbKept;
+    var valueKept;
+    try {
+      tf.tidy(function () {
+        var fwd = self.model.forward(obsTensor);
+        var logits = fwd.policy;
+        var vals = fwd.value;
+        var maskedLogits = logits.add(maskTensor.sub(1).mul(1e9));
+        var probs = tf.softmax(maskedLogits);
+        var entMean = probs.mul(tf.log(probs.add(1e-8))).sum(1).neg().mean();
+        entropyScalar = entMean.dataSync()[0];
+
+        var multinom = tf.multinomial(maskedLogits, 2);
+        var actionsT = multinom.slice([0, 1], [-1, 1]).squeeze([1]);
+        var logSM = tf.logSoftmax(maskedLogits);
+        var oh = tf.oneHot(actionsT.cast('int32'), boardSize);
+        var logProbT = logSM.mul(oh).sum(1);
+
+        actionsKept = tf.keep(actionsT.clone());
+        logProbKept = tf.keep(logProbT.clone());
+        valueKept = tf.keep(vals.clone());
+      });
+    } catch (err) {
+      obsTensor.dispose();
+      maskTensor.dispose();
+      batch._obsTensor = null;
+      batch._maskTensor = null;
+      throw err;
+    }
+
+    var ad = actionsKept.dataSync();
+    var lp = logProbKept.dataSync();
+    var vd = valueKept.dataSync();
+    actionsKept.dispose();
+    logProbKept.dispose();
+    valueKept.dispose();
+
+    this.engine._trackReadback(k * boardSize);
+    var obsFlat = obsTensor.dataSync();
+    obsTensor.dispose();
+    maskTensor.dispose();
+    batch._obsTensor = null;
+    batch._maskTensor = null;
+
+    batch.states = [];
+    batch.masks = [];
+    var EPS = 1e-6;
+    for (var r = 0; r < k; r++) {
+      var offset = r * boardSize;
+      var row = new Float32Array(boardSize);
+      row.set(obsFlat.subarray(offset, offset + boardSize));
+      batch.states.push(row);
+      var maskRow = new Float32Array(boardSize);
+      for (var j = 0; j < boardSize; j++) {
+        maskRow[j] = Math.abs(row[j]) < EPS ? 1 : 0;
+      }
+      batch.masks.push(maskRow);
+    }
+
+    var actionsBySlot = new Int32Array(N);
+    var actions = new Int32Array(k);
+    var logProbs = new Float32Array(k);
+    var values = new Float32Array(k);
+    for (var i = 0; i < k; i++) {
+      var slot = batch.slotIds[i];
+      var ai = Math.round(ad[i]);
+      if (ai < 0 || ai >= boardSize || batch.masks[i][ai] <= 0) {
+        ai = self._fallbackAction(batch.masks[i]);
+      }
+      actionsBySlot[slot] = ai;
+      actions[i] = ai;
+      logProbs[i] = lp[i];
+      values[i] = vd[i];
+    }
+
+    return {
+      slotIds: batch.slotIds,
+      actionsBySlot: actionsBySlot,
+      actions: actions,
+      logProbs: logProbs,
+      values: values,
+      entropySum: entropyScalar * k,
+      entropyCount: k
+    };
+  }
+
   _selectWithAlgorithm(batch) {
+    if (this._benchLoopMode === 'sim_random') {
+      return this._selectRandomLegal(batch);
+    }
+    if (this._policySelectUsesGpuBatchedPath() && batch.slotIds.length > 0) {
+      if (batch._obsTensor != null && batch._maskTensor != null) {
+        try {
+          return this._selectWithAlgorithmGpuBatchedTensors(batch._obsTensor, batch._maskTensor, batch);
+        } catch (e) {
+          if (batch._obsTensor) {
+            try { batch._obsTensor.dispose(); } catch (e2) { /* noop */ }
+          }
+          if (batch._maskTensor) {
+            try { batch._maskTensor.dispose(); } catch (e2) { /* noop */ }
+          }
+          batch._obsTensor = null;
+          batch._maskTensor = null;
+          console.warn('[gpu_owner] GPU batched tensor select failed, CPU rebuild:', e.message);
+          try {
+            var ex = this.engine.extractStatesMasksCPU(batch.slotIds, batch._gpuPerspective);
+            batch.states = ex.states;
+            batch.masks = ex.masks;
+            return this._selectWithAlgorithmGpuBatched(batch);
+          } catch (e3) {
+            console.warn('[gpu_owner] GPU batched (CPU states) failed, using algo.selectActions:', e3.message);
+            var ex2 = this.engine.extractStatesMasksCPU(batch.slotIds, batch._gpuPerspective);
+            batch.states = ex2.states;
+            batch.masks = ex2.masks;
+          }
+        }
+      } else {
+        try {
+          return this._selectWithAlgorithmGpuBatched(batch);
+        } catch (e) {
+          console.warn('[gpu_owner] GPU batched policy select failed, using CPU path:', e.message);
+        }
+      }
+    }
     var N = this.numGames;
     var actionsBySlot = new Int32Array(N);
     var k = batch.slotIds.length;
@@ -204,6 +557,9 @@ export class GPUOwnerRuntime {
   }
 
   _selectWithCheckpoint(batch) {
+    if (this._benchLoopMode === 'sim_random') {
+      return this._selectRandomCheckpointBatch(batch);
+    }
     var N = this.numGames;
     var actionsBySlot = new Int32Array(N);
     var grouped = {};
@@ -321,14 +677,15 @@ export class GPUOwnerRuntime {
   }
 
   _finishSlots(doneSlots, winners) {
+    var minimal = this._benchMinimalReplay();
     for (var i = 0; i < doneSlots.length; i++) {
       var slot = doneSlots[i];
       var winner = winners[i];
       var vsCheckpoint = !!this._vsCheckpoint[slot];
-      var trajectory = this._downloadTrajectory(slot, !vsCheckpoint);
-      if (trajectory.length > 0) this.algo.onGameFinished(trajectory, winner);
+      var trajectory = minimal ? [] : this._downloadTrajectory(slot, !vsCheckpoint);
+      if (!minimal && trajectory.length > 0) this.algo.onGameFinished(trajectory, winner);
 
-      if (vsCheckpoint && this.pool) {
+      if (!minimal && vsCheckpoint && this.pool) {
         var checkpointId = this._slotCheckpointId[slot];
         if (checkpointId >= 0) this.pool.updateEloForId(checkpointId, winner === 1, winner === 0);
         else this.pool.updateElo(winner === 1, winner === 0);
@@ -387,6 +744,7 @@ export class GPUOwnerRuntime {
 
   _maybeScheduleTrain() {
     if (this._disposed) return;
+    if (this._benchDisableTrain) return;
     if (!this.trainQueue || this.trainQueue.hasKey('train')) return;
     if (!this.algo.shouldTrain(this.gamesSinceLastTrain, this.trainInterval, this.trainBatchSize)) return;
 
@@ -394,6 +752,7 @@ export class GPUOwnerRuntime {
     this.trainQueue.enqueue('train', function () {
       if (self._disposed || !self.algo) return;
       self._trainInFlight = true;
+      var tTrain0 = self._benchInstrument ? performance.now() : 0;
       try {
         self.lastLoss = self.algo.train(self.trainBatchSize);
         self.generation++;
@@ -408,57 +767,56 @@ export class GPUOwnerRuntime {
       } catch (e) {
         console.warn('GPUOwnerRuntime train error:', e.message);
       } finally {
+        if (self._benchInstrument && tTrain0) {
+          self._benchTrainMsPending += performance.now() - tTrain0;
+          self._benchTrainCallsPending++;
+        }
         self._trainInFlight = false;
       }
     });
   }
 
   _tickOne() {
+    var ins = this._benchInstrument;
+    var t0 = ins ? performance.now() : 0;
+
     var entropySum = 0;
     var entropyCount = 0;
+    var minimal = this._benchMinimalReplay();
 
-    // P1 moves (current algorithm)
     var p1Active = this.engine.getActiveSlots();
-    var p1Batch = this._buildActionBatch(p1Active, 1);
+    var p1Batch = (this._benchLoopMode === 'sim_random' || !this._policySelectUsesGpuBatchedPath())
+      ? this._buildActionBatch(p1Active, 1)
+      : this._buildActionBatchGpu(p1Active, 1);
+    var p1Sel = null;
     if (p1Batch.slotIds.length > 0) {
-      var p1Sel = this._selectWithAlgorithm(p1Batch);
-      this.engine.applyActions(1, p1Batch.slotIds, p1Sel.actionsBySlot);
-      this._recordSnapshot(1, p1Batch, p1Sel);
+      p1Sel = this._selectWithAlgorithm(p1Batch);
       entropySum += p1Sel.entropySum;
       entropyCount += p1Sel.entropyCount;
     }
+    if (ins) {
+      this._benchPolicyMsBatch += performance.now() - t0;
+      t0 = performance.now();
+    }
 
-    // P2 moves (self-play + checkpoint slots)
+    if (p1Batch.slotIds.length > 0 && p1Sel) {
+      this.engine.applyActions(1, p1Batch.slotIds, p1Sel.actionsBySlot);
+      if (!minimal) this._recordSnapshot(1, p1Batch, p1Sel);
+    }
+    if (ins) {
+      this._benchPhysicsMsBatch += performance.now() - t0;
+      t0 = performance.now();
+    }
+
+    var p2ActionsBySlot = new Int32Array(this.numGames);
+    var p2ApplySlots = [];
     var p2Active = this.engine.getActiveSlots();
     if (p2Active.length > 0) {
-      var p2ActionsBySlot = new Int32Array(this.numGames);
-      var p2ApplySlots = [];
-      var p2CPU = this.engine.extractStatesMasksCPU(p2Active, -1);
-      var selfBatch = { slotIds: [], states: [], masks: [] };
-      var ckptBatch = { slotIds: [], states: [], masks: [] };
-
-      for (var bi = 0; bi < p2Active.length; bi++) {
-        var slotForP2 = p2Active[bi];
-        var maskForP2 = p2CPU.masks[bi];
-        var hasValidP2 = false;
-        for (var mv = 0; mv < maskForP2.length; mv++) {
-          if (maskForP2[mv] > 0) {
-            hasValidP2 = true;
-            break;
-          }
-        }
-        if (!hasValidP2) continue;
-
-        if (this._vsCheckpoint[slotForP2]) {
-          ckptBatch.slotIds.push(slotForP2);
-          ckptBatch.states.push(p2CPU.states[bi]);
-          ckptBatch.masks.push(maskForP2);
-        } else {
-          selfBatch.slotIds.push(slotForP2);
-          selfBatch.states.push(p2CPU.states[bi]);
-          selfBatch.masks.push(maskForP2);
-        }
-      }
+      var splitP2 = this._splitP2Slots(p2Active);
+      var selfBatch = (this._benchLoopMode === 'sim_random' || !this._policySelectUsesGpuBatchedPath())
+        ? this._buildActionBatch(splitP2.selfSlots, -1)
+        : this._buildActionBatchGpu(splitP2.selfSlots, -1);
+      var ckptBatch = this._buildActionBatch(splitP2.ckptSlots, -1);
 
       if (selfBatch.slotIds.length > 0) {
         var p2Sel = this._selectWithAlgorithm(selfBatch);
@@ -467,7 +825,7 @@ export class GPUOwnerRuntime {
           p2ActionsBySlot[slot] = p2Sel.actionsBySlot[slot];
           p2ApplySlots.push(slot);
         }
-        this._recordSnapshot(-1, selfBatch, p2Sel);
+        if (!minimal) this._recordSnapshot(-1, selfBatch, p2Sel);
         entropySum += p2Sel.entropySum;
         entropyCount += p2Sel.entropyCount;
       }
@@ -480,10 +838,18 @@ export class GPUOwnerRuntime {
           p2ApplySlots.push(cslot);
         }
       }
+    }
+    if (ins) {
+      this._benchPolicyMsBatch += performance.now() - t0;
+      t0 = performance.now();
+    }
 
-      if (p2ApplySlots.length > 0) {
-        this.engine.applyActions(-1, p2ApplySlots, p2ActionsBySlot);
-      }
+    if (p2ApplySlots.length > 0) {
+      this.engine.applyActions(-1, p2ApplySlots, p2ActionsBySlot);
+    }
+    if (ins) {
+      this._benchPhysicsMsBatch += performance.now() - t0;
+      t0 = performance.now();
     }
 
     this.engine.spread();
@@ -495,6 +861,11 @@ export class GPUOwnerRuntime {
       this.engine.resetSlots(finished.doneSlots);
       this._resetSlotMetadata(finished.doneSlots);
       this._pruneSnapshots();
+    }
+
+    if (ins) {
+      this._benchPhysicsMsBatch += performance.now() - t0;
+      this._benchTickSamplesBatch++;
     }
 
     if (entropyCount > 0) {
@@ -512,7 +883,8 @@ export class GPUOwnerRuntime {
       for (var i = 0; i < this.recentLengths.length; i++) sum += this.recentLengths[i];
       avgLen = sum / this.recentLengths.length;
     }
-    return {
+    var rb = this.engine ? this.engine.consumeReadbackFrame() : { calls: 0, bytes: 0 };
+    var stats = {
       gamesCompleted: this.gamesCompleted,
       generation: this.generation,
       loss: this.lastLoss,
@@ -525,18 +897,69 @@ export class GPUOwnerRuntime {
       elo: this.pool ? this.pool.getCurrentElo() : 0,
       checkpointWinRate: this.pool ? this.pool.getRecentWinRate() : 0,
       entropy: this.lastEntropy,
-      trainInFlight: !!this._trainInFlight
+      trainInFlight: !!this._trainInFlight,
+      gpuReadbackCalls: rb.calls,
+      gpuReadbackBytes: rb.bytes
     };
+
+    if (this._benchLoopMode !== 'off') {
+      stats.benchLoopMode = this._benchLoopMode;
+    }
+    if (this._benchInstrument && this._benchTickSamplesBatch > 0) {
+      stats.benchAvgPolicyMsPerSimTick = this._benchPolicyMsBatch / this._benchTickSamplesBatch;
+      stats.benchAvgPhysicsMsPerSimTick = this._benchPhysicsMsBatch / this._benchTickSamplesBatch;
+    }
+    if (this._benchInstrument) {
+      stats.benchInstrument = true;
+    }
+    this._benchPolicyMsBatch = 0;
+    this._benchPhysicsMsBatch = 0;
+    this._benchTickSamplesBatch = 0;
+
+    if (this._benchTrainCallsPending > 0) {
+      stats.benchTrainMs = this._benchTrainMsPending;
+      stats.benchTrainCalls = this._benchTrainCallsPending;
+    }
+    this._benchTrainMsPending = 0;
+    this._benchTrainCallsPending = 0;
+
+    return stats;
+  }
+
+  _boardUiSlotIdsForSnapshot() {
+    var N = this.numGames;
+    var m = this._uiSnapshotMaxGames;
+    if (m >= N) {
+      var all = new Array(N);
+      for (var i = 0; i < N; i++) all[i] = i;
+      return all;
+    }
+    if (!this._hasDoneFullBoardSync) {
+      var warm = new Array(N);
+      for (var j = 0; j < N; j++) warm[j] = j;
+      return warm;
+    }
+    var pageCount = Math.ceil(N / m);
+    var page = this._boardSnapshotPage % pageCount;
+    this._boardSnapshotPage++;
+    var start = page * m;
+    var out = [];
+    for (var k = 0; k < m && start + k < N; k++) out.push(start + k);
+    return out;
   }
 
   _emitTickResult() {
-    var payload = {
-      type: MSG.TICK_RESULT,
-      stats: this._collectStats()
-    };
+    var payload = { type: MSG.TICK_RESULT };
+    var xfer = null;
 
     if (this._ticks % this._snapshotEveryTicks === 0) {
-      var boards = this.engine.getBoardsForRender();
+      var slotIds = this._boardUiSlotIdsForSnapshot();
+      var boards = slotIds.length === this.numGames
+        ? this.engine.getBoardsForRender()
+        : this.engine.getBoardsForRenderGather(slotIds);
+      if (slotIds.length === this.numGames) {
+        this._hasDoneFullBoardSync = true;
+      }
       var srcBoards = boards.boards;
       var packedBoards = new Int8Array(srcBoards.length);
       for (var i = 0; i < srcBoards.length; i++) {
@@ -549,11 +972,22 @@ export class GPUOwnerRuntime {
       payload.boards = packedBoards;
       payload.done = done;
       payload.winners = winners;
-      this._post(payload, [payload.boards.buffer, payload.done.buffer, payload.winners.buffer]);
-      return;
+      xfer = [payload.boards.buffer, payload.done.buffer, payload.winners.buffer];
+      if (slotIds.length < this.numGames) {
+        var slotsU16 = new Uint16Array(slotIds.length);
+        for (var si = 0; si < slotIds.length; si++) slotsU16[si] = slotIds[si];
+        payload.boardSampleSlots = slotsU16;
+        xfer.push(payload.boardSampleSlots.buffer);
+      }
     }
 
-    this._post(payload);
+    payload.stats = this._collectStats();
+
+    if (xfer) {
+      this._post(payload, xfer);
+    } else {
+      this._post(payload);
+    }
   }
 
   async tick(steps) {
@@ -562,6 +996,7 @@ export class GPUOwnerRuntime {
       this._emitTickResult();
       return;
     }
+    this.engine.beginReadbackFrame();
     var n = Math.max(1, steps || 1);
     for (var i = 0; i < n; i++) {
       this._tickOne();

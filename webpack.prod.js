@@ -4,6 +4,11 @@ const CopyPlugin = require('copy-webpack-plugin');
 
 module.exports = {
   entry: './src/app.js',
+  module: {
+    rules: [
+      { test: /\.wgsl$/i, type: 'asset/source' }
+    ]
+  },
   output: {
     path: path.resolve(__dirname, 'docs'),
     filename: 'app.bundle.js',

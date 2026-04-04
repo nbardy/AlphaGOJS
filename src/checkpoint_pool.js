@@ -1,5 +1,5 @@
 import * as tf from '@tensorflow/tfjs';
-import { maskedSoftmax, sampleFromProbs } from './action';
+import { maskedSoftmax, sampleFromProbs, flattenStates } from './action';
 
 // Checkpoint pool for Elo-rated self-play.
 // Saves model weight snapshots periodically. During training, some games
@@ -148,14 +148,16 @@ export class CheckpointPool {
     return this.loadOpponentByIndex(idx);
   }
 
-  // Batch action selection for the checkpoint opponent.
-  selectActions(states, masks) {
-    if (!this.opponentModel || states.length === 0) return [];
-    var boardSize = this.opponentModel.boardSize;
-    var n = states.length;
+  _firstLegalFromMask(mask) {
+    for (var i = 0; i < mask.length; i++) {
+      if (mask[i] > 0) return i;
+    }
+    return 0;
+  }
 
-    var flat = new Float32Array(n * boardSize);
-    for (var i = 0; i < n; i++) flat.set(states[i], i * boardSize);
+  // CPU path: full logits sync + maskedSoftmax per row (fallback).
+  _selectActionsCpuFallback(states, masks, boardSize, n) {
+    var flat = flattenStates(states, boardSize);
     var statesTensor = tf.tensor2d(flat, [n, boardSize]);
     var out = this.opponentModel.forward(statesTensor);
     var logitsData = out.policy.dataSync();
@@ -172,6 +174,54 @@ export class CheckpointPool {
       results.push({ action: action });
     }
     return results;
+  }
+
+  // Batched forward + masked multinomial on TF; sync only action indices (matches gpu_trainer / gpu_owner_runtime).
+  _selectActionsTfBatched(states, masks, boardSize, n) {
+    var self = this;
+    var flat = flattenStates(states, boardSize);
+    var maskFlat = new Float32Array(n * boardSize);
+    for (var i = 0; i < n; i++) maskFlat.set(masks[i], i * boardSize);
+
+    var actionsKept = null;
+    try {
+      tf.tidy(function () {
+        var statesT = tf.tensor2d(flat, [n, boardSize]);
+        var fwd = self.opponentModel.forward(statesT);
+        var logits = fwd.policy;
+        var maskT = tf.tensor2d(maskFlat, [n, boardSize]);
+        var maskedLogits = logits.add(maskT.sub(1).mul(1e9));
+        // tf.multinomial WebGPU bug: first sample always 0 — request 2, take second column.
+        var actionsT = tf.multinomial(maskedLogits, 2).slice([0, 1], [-1, 1]).squeeze([1]);
+        actionsKept = tf.keep(actionsT.clone());
+      });
+
+      var ad = actionsKept.dataSync();
+      var results = [];
+      for (var i = 0; i < n; i++) {
+        var ai = Math.round(ad[i]);
+        if (ai < 0 || ai >= boardSize || masks[i][ai] <= 0) {
+          ai = self._firstLegalFromMask(masks[i]);
+        }
+        results.push({ action: ai });
+      }
+      return results;
+    } finally {
+      if (actionsKept != null) actionsKept.dispose();
+    }
+  }
+
+  // Batch action selection for the checkpoint opponent.
+  selectActions(states, masks) {
+    if (!this.opponentModel || states.length === 0) return [];
+    var boardSize = this.opponentModel.boardSize;
+    var n = states.length;
+
+    try {
+      return this._selectActionsTfBatched(states, masks, boardSize, n);
+    } catch (e) {
+      return this._selectActionsCpuFallback(states, masks, boardSize, n);
+    }
   }
 
   // Update Elo after a checkpoint game finishes.
