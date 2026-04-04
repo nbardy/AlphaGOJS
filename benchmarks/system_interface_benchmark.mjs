@@ -8,6 +8,9 @@
  * The **`bench:all`** aggregator passes fewer pipelines + `--inferenceRuns=24` unless `--full-system`.
  *
  * **Chrome:** `npx puppeteer browsers install chrome` if Puppeteer cannot find the binary.
+ *
+ * **URL query:** `--pageQuery=webgpuEnv=1` merges into `docs/index.html` URL (WGSL plague sim, etc.).
+ * Example: `node benchmarks/system_interface_benchmark.mjs --pageQuery=webgpuEnv=1 --pipelines=single_gpu_phased`
  */
 import {
   getPuppeteerLaunchOptions,
@@ -85,7 +88,8 @@ function parseArgs(argv) {
     game: 'plague_walls',
     pipelines: ['single_gpu_phased', 'cpu_actors_gpu_learner', 'full_gpu_resident'],
     timeoutMs: 180000,
-    headless: true
+    headless: true,
+    pageQuery: ''
   };
 
   for (const arg of argv) {
@@ -106,9 +110,20 @@ function parseArgs(argv) {
     else if (key === 'pipelines') out.pipelines = value.split(',').map((s) => s.trim()).filter(Boolean);
     else if (key === 'timeoutMs') out.timeoutMs = clampInt(value, out.timeoutMs, 10000, 900000);
     else if (key === 'headless') out.headless = value !== 'false';
+    else if (key === 'pageQuery') out.pageQuery = value || '';
   }
 
   return out;
+}
+
+function applyPageQueryToFileUrl(fileUrl, pageQuery) {
+  if (!pageQuery || !String(pageQuery).trim()) return fileUrl;
+  const u = new URL(fileUrl);
+  const q = new URLSearchParams(String(pageQuery).replace(/^\?/, ''));
+  q.forEach((v, k) => {
+    u.searchParams.set(k, v);
+  });
+  return u.toString();
 }
 
 async function configureAndRestart(page, cfg, pipeline, algoOverride) {
@@ -381,7 +396,8 @@ async function main() {
   const algoList = cfg.algos.length > 0 ? cfg.algos : [cfg.algo];
   const puppeteer = await loadPuppeteer();
 
-  const { fileUrl: url } = resolveBuiltAppFileUrl(process.cwd());
+  const { fileUrl: baseUrl } = resolveBuiltAppFileUrl(process.cwd());
+  const url = applyPageQueryToFileUrl(baseUrl, cfg.pageQuery);
 
   const browser = await puppeteer.launch(
     getPuppeteerLaunchOptions({
@@ -407,6 +423,7 @@ async function main() {
       const ui = window.__alphaPlague;
       return {
         userAgent: navigator.userAgent,
+        pageHref: typeof location !== 'undefined' ? location.href : '',
         initialPipeline: ui ? ui.pipelineType : 'unknown',
         hasNavigatorGPU: !!navigator.gpu,
         rows: ui ? ui.rows : 0,

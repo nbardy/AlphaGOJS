@@ -17,7 +17,13 @@ module.exports = {
     clean: true
   },
   devServer: {
-    hot: true
+    hot: true,
+    client: {
+      overlay: {
+        errors: true,
+        warnings: false
+      }
+    }
   },
   devtool: 'eval-source-map',
   plugins: [

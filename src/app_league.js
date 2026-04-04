@@ -4,9 +4,7 @@ import { listRuntimeTypes } from './runtime/runtime_registry';
 import { createLeaguePipeline } from './league_pipeline';
 import { probeCapabilities } from './nextgen/capability_probe';
 import { chooseRuntimeTier } from './nextgen/runtime_planner';
-import * as tf from '@tensorflow/tfjs';
 import { UI } from './ui';
-import { ensureBestTfBackendOnce } from './tf_backend_bootstrap';
 
 var DEFAULT_ALGO = 'ppo';
 var ROWS = 20;
@@ -85,7 +83,9 @@ function parseLeagueQuery() {
   var bench = {};
   if (p.get('benchInstrument') === '1') bench.benchInstrument = true;
   if (p.get('benchMinimalUi') === '1') bench.benchMinimalUi = true;
-  if (p.get('webgpuEnv') === '1') bench.useWebGPUGameEngine = true;
+  if (p.get('webgpuEnv') === '1' || p.get('webgpuEnv') === 'true') {
+    bench.useWebGPUGameEngine = true;
+  }
   var preset = p.get('preset');
   var presetFast = preset === 'fast' || preset === 'interactive';
 
@@ -121,13 +121,7 @@ function mapTierToPipelineType(tier) {
 }
 
 async function startLeague() {
-  await ensureBestTfBackendOnce();
-  var tfBackendMain = 'unknown';
-  try {
-    tfBackendMain = tf.getBackend();
-  } catch (e) {
-    tfBackendMain = 'unknown';
-  }
+  var tfBackendMain = 'gpu worker';
   var pipelineType = 'single_gpu_phased';
   try {
     var cap = await probeCapabilities();

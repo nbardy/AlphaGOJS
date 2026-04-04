@@ -91,3 +91,9 @@ export function listRuntimeTypes() {
   }
   return out;
 }
+
+/** True when TensorFlow runs on this thread (not the GPU worker). */
+export function pipelineNeedsMainThreadTf(pipelineType) {
+  var spec = resolveRuntimeSpec(pipelineType || 'single_gpu_phased');
+  return spec.pipelineKind === 'cpu' || spec.pipelineKind === 'gpu';
+}

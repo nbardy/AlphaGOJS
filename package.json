@@ -35,7 +35,9 @@
     "bench:webgpu:parity:packed": "node benchmarks/webgpu_plague_spread_parity_packed.mjs",
     "bench:webgpu:spread": "node benchmarks/webgpu_plague_spread_throughput.mjs",
     "bench:all": "node benchmarks/run_all_benchmarks.mjs",
-    "bench:all:smoke": "node benchmarks/run_all_benchmarks.mjs --smoke"
+    "bench:all:smoke": "node benchmarks/run_all_benchmarks.mjs --smoke",
+    "bench:matrix:smoke": "node benchmarks/runtime_matrix_smoke.mjs",
+    "bench:matrix:smoke:skip-build": "node benchmarks/runtime_matrix_smoke.mjs --skip-build"
   },
   "keywords": [],
   "author": "",

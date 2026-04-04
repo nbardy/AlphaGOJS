@@ -1,6 +1,8 @@
 import { createGame, getRenderer, listGames } from './game';
 import { MetricsLog } from './metrics';
 import { createChartCanvas, drawLineChart } from './charts';
+import { pipelineNeedsMainThreadTf } from './runtime/runtime_registry';
+import { ensureBestTfBackendOnce } from './tf_backend_bootstrap';
 
 export class UI {
   constructor(trainer, algo, config) {
@@ -192,13 +194,18 @@ export class UI {
       line1.textContent = '\u26A0 Not a secure context';
       line2.textContent = 'WebGPU may be blocked; use HTTPS or localhost.';
     } else if (navGpu) {
-      pill.className = 'ok';
-      line1.textContent = '\u2713 WebGPU API available';
-      var parts = ['TF (this tab): ' + tfMain];
-      if (this._isGpuWorkerPipeline()) {
-        parts.push('NN in GPU worker — see console for [tf] backend');
+      pill.className = 'warn';
+      line1.textContent = 'WebGPU: checking adapter\u2026';
+      if (tfMain === 'gpu worker') {
+        line2.textContent = 'NN in GPU worker — [tf] line in worker console';
+      } else {
+        var parts2 = ['TF (this tab): ' + tfMain];
+        if (this._isGpuWorkerPipeline()) {
+          parts2.push('NN in GPU worker — worker console for [tf]');
+        }
+        line2.textContent = parts2.join(' · ');
       }
-      line2.textContent = parts.join(' · ');
+      this._finishWebGpuAdapterProbe(pill, line1);
     } else {
       pill.className = 'warn';
       line1.textContent = '\u26A0 No WebGPU API';
@@ -227,6 +234,44 @@ export class UI {
 
     document.body.appendChild(pill);
     this._webgpuPillEl = pill;
+  }
+
+  /**
+   * navigator.gpu can exist while requestAdapter() returns null (embedded preview, SES lockdown).
+   * "Failed to create WebGPU Context Provider" is from the browser when no real GPU is wired up.
+   */
+  _finishWebGpuAdapterProbe(pill, line1El) {
+    if (!pill || !line1El || typeof navigator === 'undefined' || !navigator.gpu) return;
+    var g = navigator.gpu;
+    Promise.resolve()
+      .then(function () {
+        return g.requestAdapter({ powerPreference: 'high-performance' });
+      })
+      .then(function (adapter) {
+        if (!document.body.contains(pill)) return;
+        var hint =
+          'Failed to create WebGPU Context Provider = browser could not attach a GPU (common in IDE preview). '
+          + 'Training falls back to CPU in the worker — use desktop Chrome on http://localhost:8080 for GPU.';
+        if (adapter) {
+          pill.className = 'ok';
+          line1El.textContent = '\u2713 WebGPU adapter OK';
+          var t0 = pill.getAttribute('title') || '';
+          pill.setAttribute('title', t0 + '\nrequestAdapter: got adapter');
+        } else {
+          pill.className = 'warn';
+          line1El.textContent = '\u26A0 WebGPU API only — no adapter';
+          pill.setAttribute('title', (pill.getAttribute('title') || '') + '\nrequestAdapter: null\n' + hint);
+        }
+      })
+      .catch(function () {
+        if (!document.body.contains(pill)) return;
+        pill.className = 'warn';
+        line1El.textContent = '\u26A0 WebGPU adapter failed';
+        pill.setAttribute(
+          'title',
+          (pill.getAttribute('title') || '') + '\nrequestAdapter: error (see console)'
+        );
+      });
   }
 
   _buildDOM() {
@@ -368,8 +413,24 @@ export class UI {
     restartBtn.className = 'restart-btn';
     restartBtn.textContent = 'Restart';
     restartBtn.onclick = function () {
-      var mt = self.config.leagueMode ? null : modelSel.value;
-      self._restart(mt, algoSel.value, pipeSel.value, gameSel.value);
+      var pipeVal = pipeSel.value;
+      var run = function () {
+        var mt = self.config.leagueMode ? null : modelSel.value;
+        self._restart(mt, algoSel.value, pipeVal, gameSel.value);
+      };
+      if (pipelineNeedsMainThreadTf(pipeVal)) {
+        ensureBestTfBackendOnce()
+          .then(function (b) {
+            self.config.tfBackendMain = b;
+            run();
+          })
+          .catch(function () {
+            run();
+          });
+      } else {
+        self.config.tfBackendMain = 'gpu worker';
+        run();
+      }
     };
     controls.appendChild(restartBtn);
 
@@ -385,8 +446,11 @@ export class UI {
     setTimeout(function () {
       var slider = document.getElementById('sspeed');
       if (slider) {
+        slider.value = String(self.ticksPerFrame);
+        var sval = document.getElementById('sval');
+        if (sval) sval.textContent = self.ticksPerFrame + 'x';
         slider.oninput = function () {
-          self.ticksPerFrame = parseInt(slider.value);
+          self.ticksPerFrame = parseInt(slider.value, 10);
           document.getElementById('sval').textContent = slider.value + 'x';
         };
       }

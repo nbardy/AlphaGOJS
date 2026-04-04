@@ -12,6 +12,10 @@
  *
  * Prerequisites: `npm run build` output in `docs/`; Puppeteer Chrome:
  *   npx puppeteer browsers install chrome
+ *
+ * For a **small multi-scenario** sweep (default URL vs `?webgpuEnv=1` × several pipelines), see:
+ *   npm run bench:matrix:smoke
+ * Full combinatorial “every flag” is not automated; layers differ (native WGSL vs TF.js vs Puppeteer).
  */
 import fs from 'node:fs';
 import { spawnSync } from 'node:child_process';

@@ -9,7 +9,6 @@ import { probeCapabilities } from './nextgen/capability_probe';
 import { chooseRuntimeTier } from './nextgen/runtime_planner';
 import { CheckpointPool } from './checkpoint_pool';
 import { resolveRuntimeSpec, listRuntimeTypes } from './runtime/runtime_registry';
-import * as tf from '@tensorflow/tfjs';
 import { UI } from './ui';
 import { ensureBestTfBackendOnce } from './tf_backend_bootstrap';
 
@@ -71,7 +70,7 @@ function parseRuntimeQueryOverrides() {
   if (p.get('benchMinimalUi') === '1') {
     bench.benchMinimalUi = true;
   }
-  if (p.get('webgpuEnv') === '1') {
+  if (p.get('webgpuEnv') === '1' || p.get('webgpuEnv') === 'true') {
     bench.useWebGPUGameEngine = true;
   }
   var pl = p.get('pipeline');
@@ -191,8 +190,6 @@ export { listModelTypes, listAlgorithmTypes, listRuntimeTypes };
 
 // --- Wiring ---
 
-// Tier A/C: GPU worker — phased mode avoids full_gpu queue stalls and long non-interactive bursts.
-// Use runtime dropdown "Full GPU Resident" when you want max throughput and can tolerate jank.
 function mapTierToPipelineType(tier) {
   if (tier === 'A' || tier === 'C') return 'single_gpu_phased';
   if (tier === 'B') return 'cpu_actors_gpu_learner';
@@ -200,13 +197,6 @@ function mapTierToPipelineType(tier) {
 }
 
 async function start() {
-  await ensureBestTfBackendOnce();
-  var tfBackendMain = 'unknown';
-  try {
-    tfBackendMain = tf.getBackend();
-  } catch (e) {
-    tfBackendMain = 'unknown';
-  }
   var pipelineType = 'cpu_actors_gpu_learner';
   try {
     var cap = await probeCapabilities();
@@ -220,6 +210,13 @@ async function start() {
   if (q.pipelineType) {
     pipelineType = q.pipelineType;
   }
+
+  var runtimeSpec = resolveRuntimeSpec(pipelineType);
+  var tfBackendMain = 'gpu worker';
+  if (runtimeSpec.pipelineKind !== 'gpu_worker') {
+    tfBackendMain = await ensureBestTfBackendOnce();
+  }
+
   var benchExtras = q.benchRuntimeExtras || {};
   var rows = q.rows;
   var cols = q.cols;
