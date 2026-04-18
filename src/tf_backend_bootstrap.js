@@ -1,11 +1,14 @@
 /**
  * Prefer TensorFlow.js WebGPU when the browser exposes navigator.gpu, then WebGL, then CPU.
+ * @tensorflow/tfjs-backend-webgpu is patched (patch-package): uploadToGPU uses queue.writeBuffer;
+ * BufferManager never uses mappedAtCreation (WebKit/Safari rejects STORAGE+mappable create).
  * The default @tensorflow/tfjs bundle registers WebGL but does not load the WebGPU backend;
  * importing @tensorflow/tfjs-backend-webgpu here registers it so setBackend('webgpu') can succeed.
  *
  * In a dedicated Worker, skips WebGL (no canvas). Uses one export so webpack worker chunks
  * cannot drop a separate "worker-only" symbol during split-chunk / HMR.
  */
+import './webgpu_queue_write_shim.js';
 import * as tf from '@tensorflow/tfjs';
 import '@tensorflow/tfjs-backend-webgpu';
 

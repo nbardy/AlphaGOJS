@@ -1,4 +1,4 @@
-import { listModelTypes } from './model_registry';
+import { listLeagueModelTypes } from './model_registry';
 import { createGPUWorkerPipeline } from './nextgen/create_gpu_worker_pipeline';
 import { resolveRuntimeSpec } from './runtime/runtime_registry';
 
@@ -17,7 +17,8 @@ export var LEAGUE_CHECKPOINT_POOL_CONFIG = {
 };
 
 /**
- * GPU worker only: train every registered model type in parallel with cross-arch league Elo.
+ * GPU worker only: train every league-eligible model type in parallel with cross-arch league Elo.
+ * (Discrete-observation architectures are omitted; see `listLeagueModelTypes` in model_registry.)
  *
  * @param {object} [leagueOverrides] Optional tuning (e.g. from league URL). Undefined fields keep defaults.
  * @param {number} [leagueOverrides.trainInterval]
@@ -42,7 +43,7 @@ export function createLeaguePipeline(
   if (runtimeSpec.pipelineKind !== 'gpu_worker') {
     throw new Error('League mode requires a GPU worker runtime (got ' + runtimeSpec.pipelineKind + ')');
   }
-  var modelTypes = listModelTypes().map(function (t) {
+  var modelTypes = listLeagueModelTypes().map(function (t) {
     return t.id;
   });
   if (modelTypes.length < 2) {

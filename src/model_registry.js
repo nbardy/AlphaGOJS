@@ -12,6 +12,8 @@ var MODEL_TYPES = [
   {
     id: 'patch3_token',
     label: 'Patch-3 token (3×3 tiles, coarse conv)',
+    /** Int32 discrete obs; GPUOwnerRuntime multi-model path not implemented. */
+    leagueMultiModel: false,
     create: function (rows, cols) {
       return new Patch3TokenDiscreteModel(rows, cols);
     }
@@ -19,6 +21,7 @@ var MODEL_TYPES = [
   {
     id: 'patch3_discrete',
     label: 'Patch-3 discrete periodic (per-cell 36-way)',
+    leagueMultiModel: false,
     create: function (rows, cols) {
       return new Patch3DiscreteModel(rows, cols);
     }
@@ -51,6 +54,16 @@ var MODEL_TYPES = [
 export function listModelTypes() {
   var out = [];
   for (var i = 0; i < MODEL_TYPES.length; i++) {
+    out.push({ id: MODEL_TYPES[i].id, label: MODEL_TYPES[i].label });
+  }
+  return out;
+}
+
+/** Architectures eligible for league.html (parallel multi-model GPU worker). Omits discrete-obs models. */
+export function listLeagueModelTypes() {
+  var out = [];
+  for (var i = 0; i < MODEL_TYPES.length; i++) {
+    if (MODEL_TYPES[i].leagueMultiModel === false) continue;
     out.push({ id: MODEL_TYPES[i].id, label: MODEL_TYPES[i].label });
   }
   return out;

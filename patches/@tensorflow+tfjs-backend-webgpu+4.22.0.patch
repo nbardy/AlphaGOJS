@@ -1,5 +1,88 @@
+diff --git a/node_modules/@tensorflow/tfjs-backend-webgpu/dist/backend_webgpu.js b/node_modules/@tensorflow/tfjs-backend-webgpu/dist/backend_webgpu.js
+index f001f89..dd0564d 100755
+--- a/node_modules/@tensorflow/tfjs-backend-webgpu/dist/backend_webgpu.js
++++ b/node_modules/@tensorflow/tfjs-backend-webgpu/dist/backend_webgpu.js
+@@ -24,6 +24,24 @@ import * as webgpu_util from './webgpu_util';
+ // Empirically determined constant used to determine size threshold for handing
+ // off execution to the CPU.
+ const CPU_HANDOFF_SIZE_THRESHOLD = env().getNumber('WEBGPU_CPU_HANDOFF_SIZE_THRESHOLD');
++/** Per-call queue.writeBuffer cap (strict WebKit/Safari can reject much larger single writes). */
++const MAX_QUEUE_WRITE_BUFFER_BYTES = 64 * 1024;
++function queueWriteBufferChunked(queue, gpuBuffer, dstOffset, src, totalBytes) {
++    let off = 0;
++    while (off < totalBytes) {
++        const chunk = Math.min(MAX_QUEUE_WRITE_BUFFER_BYTES, totalBytes - off);
++        queue.writeBuffer(gpuBuffer, dstOffset + off, src, off, chunk);
++        off += chunk;
++    }
++}
++function queueWriteArrayBufferChunked(queue, gpuBuffer, dstOffset, arrayBuffer, totalBytes) {
++    let off = 0;
++    while (off < totalBytes) {
++        const chunk = Math.min(MAX_QUEUE_WRITE_BUFFER_BYTES, totalBytes - off);
++        queue.writeBuffer(gpuBuffer, dstOffset + off, arrayBuffer, off, chunk);
++        off += chunk;
++    }
++}
+ // Reshape dispatch, not to exceed device limits.
+ const reshapeDispatch = (device, program) => {
+     const MAX_COMPUTE_PER_DIMENSION_DISPATCH_SIZE = device.limits.maxComputeWorkgroupsPerDimension;
+@@ -561,33 +579,20 @@ class WebGPUBackend extends KernelBackend {
+         const usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC |
+             GPUBufferUsage.COPY_DST;
+         if (tensorData.values) {
+-            buffer = this.bufferManager.acquireBuffer(size, usage, true);
+-            if (buffer.mapState === 'unmapped') {
+-                const stagingBuffer = this.bufferManager.acquireBuffer(size, GPUBufferUsage.MAP_WRITE | GPUBufferUsage.COPY_SRC, true, false);
+-                const arrayBuffer = stagingBuffer.getMappedRange();
+-                if (tensorData.dtype === 'int32' || tensorData.dtype === 'bool') {
+-                    new Int32Array(arrayBuffer).set(tensorData.values);
+-                }
+-                else {
+-                    new Float32Array(arrayBuffer).set(tensorData.values);
+-                }
+-                stagingBuffer.unmap();
+-                this.ensureCommandEncoderReady();
+-                this.endComputePassEncoder();
+-                this.commandEncoder.copyBufferToBuffer(stagingBuffer, 0, buffer, 0, size);
+-                this.stagingPendingDisposal.push(stagingBuffer);
++            // Avoid mappedAtCreation with STORAGE (invalid on strict WebGPU impls e.g. WebKit;
++            // error text may cite size). Use queue.writeBuffer — works for all batch sizes.
++            buffer = this.bufferManager.acquireBuffer(size, usage, false);
++            const src = tensorData.values;
++            if (tensorData.dtype === 'int32' || tensorData.dtype === 'bool') {
++                const arr = src instanceof Int32Array ? src : new Int32Array(src);
++                const writeBytes = Math.min(size, arr.byteLength);
++                queueWriteBufferChunked(this.queue, buffer, 0, arr, writeBytes);
+             }
+             else {
+-                const arrayBuffer = buffer.getMappedRange();
+-                if (tensorData.dtype === 'int32' || tensorData.dtype === 'bool') {
+-                    new Int32Array(arrayBuffer).set(tensorData.values);
+-                }
+-                else {
+-                    new Float32Array(arrayBuffer).set(tensorData.values);
+-                }
+-                buffer.unmap();
++                const arr = src instanceof Float32Array ? src : new Float32Array(src);
++                const writeBytes = Math.min(size, arr.byteLength);
++                queueWriteBufferChunked(this.queue, buffer, 0, arr, writeBytes);
+             }
+-            // Once uploaded, don't store the values on cpu.
+             tensorData.values = null;
+         }
+         else {
+@@ -655,7 +660,7 @@ class WebGPUBackend extends KernelBackend {
+             }
+         });
+         const uniformBuffer = this.bufferManager.acquireBuffer(currentOffset, GPUBufferUsage.COPY_DST | GPUBufferUsage.UNIFORM);
+-        this.queue.writeBuffer(uniformBuffer, 0, arrayBuffer, 0, currentOffset);
++        queueWriteArrayBufferChunked(this.queue, uniformBuffer, 0, arrayBuffer, currentOffset);
+         this.uniformPendingDisposal.push(uniformBuffer);
+         return { offset: 0, size: currentOffset, buffer: uniformBuffer };
+     }
 diff --git a/node_modules/@tensorflow/tfjs-backend-webgpu/dist/base.js b/node_modules/@tensorflow/tfjs-backend-webgpu/dist/base.js
-index 6fc8338..0f808f0 100755
+index 6fc8338..6c82cf2 100755
 --- a/node_modules/@tensorflow/tfjs-backend-webgpu/dist/base.js
 +++ b/node_modules/@tensorflow/tfjs-backend-webgpu/dist/base.js
 @@ -32,7 +32,10 @@ if (isWebGPUSupported()) {
@@ -14,8 +97,34 @@ index 6fc8338..0f808f0 100755
          }
          deviceDescriptor.requiredFeatures =
              requiredFeatures;
+@@ -44,6 +47,8 @@ if (isWebGPUSupported()) {
+             'maxBufferSize': adapterLimits.maxBufferSize,
+             'maxComputeWorkgroupSizeX': adapterLimits.maxComputeWorkgroupSizeX,
+             'maxComputeInvocationsPerWorkgroup': adapterLimits.maxComputeInvocationsPerWorkgroup,
++            // TF uniforms can exceed the default 64 KiB; omitting this caused writeBuffer to fail.
++            'maxUniformBufferBindingSize': adapterLimits.maxUniformBufferBindingSize,
+         };
+         const device = await adapter.requestDevice(deviceDescriptor);
+         const adapterInfo = 'info' in adapter
+diff --git a/node_modules/@tensorflow/tfjs-backend-webgpu/dist/buffer_manager.js b/node_modules/@tensorflow/tfjs-backend-webgpu/dist/buffer_manager.js
+index 434f8e6..c856308 100755
+--- a/node_modules/@tensorflow/tfjs-backend-webgpu/dist/buffer_manager.js
++++ b/node_modules/@tensorflow/tfjs-backend-webgpu/dist/buffer_manager.js
+@@ -25,6 +25,12 @@ export class BufferManager {
+         this.numBytesAllocated = 0;
+     }
+     acquireBuffer(size, usage, mappedAtCreation = false, reuse = true) {
++        // WebKit enforces the WebGPU rule: mapped-at-creation is incompatible with
++        // STORAGE (and TF.js historically combined them). Chrome often tolerates it;
++        // Safari throws (sometimes with a misleading "size too large"). Never pass
++        // mappedAtCreation into createBuffer — uploads use queue.writeBuffer instead
++        // (see backend_webgpu uploadToGPU patch).
++        mappedAtCreation = false;
+         let buffer;
+         const key = getBufferKey(size, usage);
+         if (reuse) {
 diff --git a/node_modules/@tensorflow/tfjs-backend-webgpu/dist/tf-backend-webgpu.node.js b/node_modules/@tensorflow/tfjs-backend-webgpu/dist/tf-backend-webgpu.node.js
-index 8244cf7..72ffad6 100755
+index 8244cf7..7ca74c8 100755
 --- a/node_modules/@tensorflow/tfjs-backend-webgpu/dist/tf-backend-webgpu.node.js
 +++ b/node_modules/@tensorflow/tfjs-backend-webgpu/dist/tf-backend-webgpu.node.js
 @@ -2128,7 +2128,10 @@ if (isWebGPUSupported()) {
@@ -30,3 +139,11 @@ index 8244cf7..72ffad6 100755
                      }
                      deviceDescriptor.requiredFeatures =
                          requiredFeatures;
+@@ -2140,6 +2143,7 @@ if (isWebGPUSupported()) {
+                         'maxBufferSize': adapterLimits.maxBufferSize,
+                         'maxComputeWorkgroupSizeX': adapterLimits.maxComputeWorkgroupSizeX,
+                         'maxComputeInvocationsPerWorkgroup': adapterLimits.maxComputeInvocationsPerWorkgroup,
++                        'maxUniformBufferBindingSize': adapterLimits.maxUniformBufferBindingSize,
+                     };
+                     return [4 /*yield*/, adapter.requestDevice(deviceDescriptor)];
+                 case 2:

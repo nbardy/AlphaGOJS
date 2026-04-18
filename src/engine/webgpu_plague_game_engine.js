@@ -14,6 +14,7 @@ import {
   encodePlagueWallsBoardToPacked,
   requestPlagueSpreadDevice
 } from './webgpu_plague_spread_engine.js';
+import { queueWriteBufferChunked } from './webgpu_queue_write_chunked.js';
 import { packedUintToNnCode } from '../nn_cell_codes';
 
 function packedRowToFloat32Row(packedRow, boardSize, out) {
@@ -549,7 +550,7 @@ export class WebGPUGameEngine {
       full.set(packed, s * B);
     }
     this._readIsA = true;
-    this.device.queue.writeBuffer(this.bufA, 0, full);
+    queueWriteBufferChunked(this.device.queue, this.bufA, 0, full, 0, full.byteLength);
     this._packedCache.set(full);
     this._tick = 0;
     this._boardCacheDirty = false;

@@ -173,6 +173,7 @@ async function main() {
       const gps = samples.map((s) => s.gamesPerSec);
       const last = samples[samples.length - 1];
       const es = last.endStats || {};
+      const gpm = samples.map((s) => s.generationsPerMin);
 
       rows.push({
         mode: m.id,
@@ -180,6 +181,7 @@ async function main() {
         gamesPerSecMedian: med(gps),
         gamesPerSecMin: Math.min(...gps),
         gamesPerSecMax: Math.max(...gps),
+        generationsPerMinMedian: med(gpm),
         trainStepsPerSecMedian: med(samples.map((s) => s.trainStepsPerSec)),
         benchAvgPolicyMsPerSimTick: es.benchAvgPolicyMsPerSimTick,
         benchAvgPhysicsMsPerSimTick: es.benchAvgPhysicsMsPerSimTick,
@@ -226,6 +228,7 @@ async function main() {
       let line = r.mode
         + ' games/s=' + formatNumber(r.gamesPerSecMedian, 1)
         + ' range=' + formatNumber(r.gamesPerSecMin, 1) + '..' + formatNumber(r.gamesPerSecMax, 1)
+        + ' gen/min=' + formatNumber(r.generationsPerMinMedian, 2)
         + ' trainSteps/s=' + formatNumber(r.trainStepsPerSecMedian, 3)
         + deltaText;
       if (typeof r.benchAvgPolicyMsPerSimTick === 'number') {

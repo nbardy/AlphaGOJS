@@ -1,4 +1,4 @@
-import { listModelTypes } from './model_registry';
+import { listLeagueModelTypes } from './model_registry';
 import { listAlgorithmTypes } from './algo_registry';
 import { listRuntimeTypes } from './runtime/runtime_registry';
 import { createLeaguePipeline } from './league_pipeline';
@@ -181,7 +181,7 @@ async function startLeague() {
         leagueRuntimeOverrides
       );
     },
-    listModelTypes: listModelTypes,
+    listModelTypes: listLeagueModelTypes,
     listAlgorithmTypes: listAlgorithmTypes,
     listRuntimeTypes: listRuntimeTypes,
     benchRuntimeExtras: q.benchRuntimeExtras,

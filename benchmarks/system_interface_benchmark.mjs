@@ -11,6 +11,9 @@
  *
  * **URL query:** `--pageQuery=webgpuEnv=1` merges into `docs/index.html` URL (WGSL plague sim, etc.).
  * Example: `node benchmarks/system_interface_benchmark.mjs --pageQuery=webgpuEnv=1 --pipelines=single_gpu_phased`
+ *
+ * **`--instrument` (default on):** adds `benchInstrument=1` unless `pageQuery` already sets `benchInstrument`.
+ * GPU worker pipelines then report policy/physics ms per sim tick in `runs[].endStats` and in `summary.*`.
  */
 import {
   getPuppeteerLaunchOptions,
@@ -89,7 +92,8 @@ function parseArgs(argv) {
     pipelines: ['single_gpu_phased', 'cpu_actors_gpu_learner', 'full_gpu_resident'],
     timeoutMs: 180000,
     headless: true,
-    pageQuery: ''
+    pageQuery: '',
+    instrument: true
   };
 
   for (const arg of argv) {
@@ -111,6 +115,7 @@ function parseArgs(argv) {
     else if (key === 'timeoutMs') out.timeoutMs = clampInt(value, out.timeoutMs, 10000, 900000);
     else if (key === 'headless') out.headless = value !== 'false';
     else if (key === 'pageQuery') out.pageQuery = value || '';
+    else if (key === 'instrument') out.instrument = value !== 'false' && value !== '0';
   }
 
   return out;
@@ -124,6 +129,15 @@ function applyPageQueryToFileUrl(fileUrl, pageQuery) {
     u.searchParams.set(k, v);
   });
   return u.toString();
+}
+
+/** Default `benchInstrument=1` first; `pageQuery` wins on conflicts. */
+function resolveSystemBenchPageUrl(fileUrl, pageQuery, useInstrument) {
+  const u = new URL(fileUrl);
+  if (useInstrument && !u.searchParams.has('benchInstrument')) {
+    u.searchParams.set('benchInstrument', '1');
+  }
+  return applyPageQueryToFileUrl(u.toString(), pageQuery);
 }
 
 async function configureAndRestart(page, cfg, pipeline, algoOverride) {
@@ -161,12 +175,27 @@ async function runThroughputSample(page, opts) {
     const ui = window.__alphaPlague;
     if (!ui || !ui.trainer) throw new Error('UI trainer not ready');
 
-    const toStats = (s) => ({
-      gamesCompleted: Number(s && s.gamesCompleted) || 0,
-      generation: Number(s && s.generation) || 0,
-      bufferSize: Number(s && s.bufferSize) || 0,
-      trainSteps: Number(s && s.trainSteps) || 0
-    });
+    function trainerStatsForBench(s) {
+      const r = s || {};
+      const out = {
+        gamesCompleted: Number(r.gamesCompleted) || 0,
+        generation: Number(r.generation) || 0,
+        bufferSize: Number(r.bufferSize) || 0,
+        trainSteps: Number(r.trainSteps) || 0
+      };
+      if (typeof r.benchAvgPolicyMsPerSimTick === 'number') {
+        out.benchAvgPolicyMsPerSimTick = r.benchAvgPolicyMsPerSimTick;
+      }
+      if (typeof r.benchAvgPhysicsMsPerSimTick === 'number') {
+        out.benchAvgPhysicsMsPerSimTick = r.benchAvgPhysicsMsPerSimTick;
+      }
+      if (typeof r.benchTrainMs === 'number') out.benchTrainMs = r.benchTrainMs;
+      if (typeof r.benchTrainCalls === 'number') out.benchTrainCalls = r.benchTrainCalls;
+      if (r.benchInstrument) out.benchInstrument = true;
+      if (typeof r.gpuReadbackBytes === 'number') out.gpuReadbackBytes = r.gpuReadbackBytes;
+      if (typeof r.gpuReadbackCalls === 'number') out.gpuReadbackCalls = r.gpuReadbackCalls;
+      return out;
+    }
 
     const getTrainSteps = () => {
       try {
@@ -180,7 +209,7 @@ async function runThroughputSample(page, opts) {
       return 0;
     };
 
-    const stats0 = toStats(ui.trainer.getStats());
+    const stats0 = trainerStatsForBench(ui.trainer.getStats());
     stats0.trainSteps = getTrainSteps() || stats0.trainSteps;
 
     const frame0 = Number(ui._frameCount) || 0;
@@ -208,7 +237,7 @@ async function runThroughputSample(page, opts) {
 
     running = false;
 
-    const stats1 = toStats(ui.trainer.getStats());
+    const stats1 = trainerStatsForBench(ui.trainer.getStats());
     stats1.trainSteps = getTrainSteps() || stats1.trainSteps;
     const frame1 = Number(ui._frameCount) || 0;
 
@@ -309,14 +338,34 @@ async function runQualitySample(page, opts) {
     const ui = window.__alphaPlague;
     if (!ui || !ui.trainer) throw new Error('UI trainer not ready');
 
-    const toStats = (s) => ({
-      gamesCompleted: Number(s && s.gamesCompleted) || 0,
-      generation: Number(s && s.generation) || 0,
-      bufferSize: Number(s && s.bufferSize) || 0,
-      trainSteps: Number(s && s.trainSteps) || 0,
-      elo: Number(s && s.elo) || 0,
-      checkpointWinRate: Number(s && s.checkpointWinRate) || 0
-    });
+    function trainerStatsForBench(s) {
+      const r = s || {};
+      const out = {
+        gamesCompleted: Number(r.gamesCompleted) || 0,
+        generation: Number(r.generation) || 0,
+        bufferSize: Number(r.bufferSize) || 0,
+        trainSteps: Number(r.trainSteps) || 0
+      };
+      if (typeof r.benchAvgPolicyMsPerSimTick === 'number') {
+        out.benchAvgPolicyMsPerSimTick = r.benchAvgPolicyMsPerSimTick;
+      }
+      if (typeof r.benchAvgPhysicsMsPerSimTick === 'number') {
+        out.benchAvgPhysicsMsPerSimTick = r.benchAvgPhysicsMsPerSimTick;
+      }
+      if (typeof r.benchTrainMs === 'number') out.benchTrainMs = r.benchTrainMs;
+      if (typeof r.benchTrainCalls === 'number') out.benchTrainCalls = r.benchTrainCalls;
+      if (r.benchInstrument) out.benchInstrument = true;
+      if (typeof r.gpuReadbackBytes === 'number') out.gpuReadbackBytes = r.gpuReadbackBytes;
+      if (typeof r.gpuReadbackCalls === 'number') out.gpuReadbackCalls = r.gpuReadbackCalls;
+      return out;
+    }
+
+    const toStats = (s) => {
+      const o = trainerStatsForBench(s);
+      o.elo = Number(s && s.elo) || 0;
+      o.checkpointWinRate = Number(s && s.checkpointWinRate) || 0;
+      return o;
+    };
 
     const getTrainSteps = () => {
       try {
@@ -372,6 +421,8 @@ async function runQualitySample(page, opts) {
 
 function summarizeRunSet(runSet) {
   const pick = (key) => runSet.map((r) => r[key]).filter((v) => Number.isFinite(v));
+  const pickEnd = (key) =>
+    runSet.map((r) => r.endStats && r.endStats[key]).filter((v) => Number.isFinite(v));
   return {
     gamesPerSec: summarize(pick('gamesPerSec')),
     generationsPerMin: summarize(pick('generationsPerMin')),
@@ -380,11 +431,14 @@ function summarizeRunSet(runSet) {
     estimatedTicksPerSec: summarize(pick('estimatedTicksPerSec')),
     rafMedianMs: summarize(pick('rafMedianMs')),
     rafP95Ms: summarize(pick('rafP95Ms')),
-    queueDepth: summarize(pick('queueDepth'))
+    queueDepth: summarize(pick('queueDepth')),
+    benchAvgPolicyMsPerSimTick: summarize(pickEnd('benchAvgPolicyMsPerSimTick')),
+    benchAvgPhysicsMsPerSimTick: summarize(pickEnd('benchAvgPhysicsMsPerSimTick'))
   };
 }
 
-function systemBenchLog(msg) {
+function systemBenchLog(quiet, msg) {
+  if (quiet) return;
   const t = new Date().toISOString().replace('T', ' ').replace('Z', '');
   console.log('[bench:system ' + t + '] ' + msg);
 }
@@ -397,7 +451,7 @@ async function main() {
   const puppeteer = await loadPuppeteer();
 
   const { fileUrl: baseUrl } = resolveBuiltAppFileUrl(process.cwd());
-  const url = applyPageQueryToFileUrl(baseUrl, cfg.pageQuery);
+  const url = resolveSystemBenchPageUrl(baseUrl, cfg.pageQuery, cfg.instrument);
 
   const browser = await puppeteer.launch(
     getPuppeteerLaunchOptions({
@@ -435,7 +489,7 @@ async function main() {
     for (const algo of algoList) {
       out.algorithms[algo] = { pipelines: {} };
       for (const pipeline of cfg.pipelines) {
-        systemBenchLog('start pipeline=' + pipeline + ' algo=' + algo + ' (restart + warmup ' + cfg.warmupSec + 's)');
+        systemBenchLog(output.quiet, 'start pipeline=' + pipeline + ' algo=' + algo + ' (restart + warmup ' + cfg.warmupSec + 's)');
         await configureAndRestart(page, cfg, pipeline, algo);
 
         // Warmup run (discarded)
@@ -447,7 +501,7 @@ async function main() {
         }
 
         const runs = [];
-        systemBenchLog('throughput ' + cfg.runs + ' x ' + cfg.durationSec + 's …');
+        systemBenchLog(output.quiet, 'throughput ' + cfg.runs + ' x ' + cfg.durationSec + 's …');
         for (let i = 0; i < cfg.runs; i++) {
           const sample = await runThroughputSample(page, {
             durationMs: Math.round(cfg.durationSec * 1000),
@@ -456,20 +510,20 @@ async function main() {
           runs.push(sample);
         }
 
-        systemBenchLog('inference busy ' + cfg.inferenceRuns + ' RPCs (may take minutes on gpu_worker) …');
+        systemBenchLog(output.quiet, 'inference busy ' + cfg.inferenceRuns + ' RPCs (may take minutes on gpu_worker) …');
         const infBusyRaw = await runInferenceSample(page, {
           runs: cfg.inferenceRuns,
           inferenceTimeoutMs: cfg.inferenceTimeoutMs
         });
 
         // Restart to get a clean queue state for idle inference latency.
-        systemBenchLog('restart + inference idle ' + cfg.inferenceRuns + ' RPCs …');
+        systemBenchLog(output.quiet, 'restart + inference idle ' + cfg.inferenceRuns + ' RPCs …');
         await configureAndRestart(page, cfg, pipeline, algo);
         const infIdleRaw = await runInferenceSample(page, {
           runs: cfg.inferenceRuns,
           inferenceTimeoutMs: cfg.inferenceTimeoutMs
         });
-        systemBenchLog('done pipeline=' + pipeline + ' algo=' + algo);
+        systemBenchLog(output.quiet, 'done pipeline=' + pipeline + ' algo=' + algo);
 
         const inference = {
           busyLatencyMs: summarize(infBusyRaw.latencies || []),
@@ -530,6 +584,8 @@ async function main() {
         generationsPerMin: s.generationsPerMin.median,
         framesPerSec: s.framesPerSec.median,
         rafP95Ms: s.rafP95Ms.median,
+        benchAvgPolicyMsPerSimTick: s.benchAvgPolicyMsPerSimTick.median,
+        benchAvgPhysicsMsPerSimTick: s.benchAvgPhysicsMsPerSimTick.median,
         inferBusyP95Ms: inf.busyLatencyMs.p95,
         inferIdleP95Ms: inf.idleLatencyMs.p95,
         inferBusyTimeouts: inf.busyTimeoutCount,
@@ -546,6 +602,7 @@ async function main() {
     'System interface benchmark complete',
     'config duration=' + cfg.durationSec + 's runs=' + cfg.runs
       + ' ticks=' + cfg.ticksPerFrame
+      + ' instrument=' + cfg.instrument
       + ' model=' + cfg.model
       + ' algo=' + cfg.algo
       + ' algos=' + (cfg.algos.length > 0 ? cfg.algos.join(',') : '(single)')
@@ -597,6 +654,15 @@ async function main() {
       if (Number.isFinite(row.qualityEloDelta)) {
         line += ' quality_elo_delta=' + formatNumber(row.qualityEloDelta, 3)
           + ' quality_per_gpu_sec=' + formatNumber(row.qualityPerGpuSecond, 6);
+      }
+      if (Number.isFinite(row.benchAvgPolicyMsPerSimTick) && Number.isFinite(row.benchAvgPhysicsMsPerSimTick)) {
+        const pol = row.benchAvgPolicyMsPerSimTick;
+        const phy = row.benchAvgPhysicsMsPerSimTick;
+        const tot = pol + phy;
+        const pct = tot > 0 ? (100 * pol) / tot : NaN;
+        line += ' policy_ms/tick=' + formatNumber(pol, 3)
+          + ' physics_ms/tick=' + formatNumber(phy, 3)
+          + ' policy_share=' + formatNumber(pct, 1) + '%';
       }
       summaryLines.push(line);
     }

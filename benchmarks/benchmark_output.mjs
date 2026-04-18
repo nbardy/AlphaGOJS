@@ -82,9 +82,9 @@ export function emitBenchmarkReport(output, payload, summaryLines) {
     process.stdout.write(summaryText);
     console.log('saved json=' + relativeOutputPath(output.jsonPath));
     console.log('saved summary=' + relativeOutputPath(output.summaryPath));
-    if (output.printJson) {
-      console.log(JSON.stringify(payload, null, 2));
-    }
+  }
+  if (output.printJson) {
+    console.log(JSON.stringify(payload, null, 2));
   }
   return { summaryText };
 }

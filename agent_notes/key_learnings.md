@@ -1,6 +1,6 @@
 # Key learnings — AlphaPlague RL (dense)
 
-Durable takeaways for **correct learning**, **stable PPO**, and **what actually moved the needle** vs throughput-only work. For Q&A and file map see [THREAD_RECAP.md](./THREAD_RECAP.md).
+Durable takeaways for **correct learning**, **stable PPO**, and **what actually moved the needle** vs throughput-only work. For Q&A and file map see [THREAD_RECAP.md](./THREAD_RECAP.md). For **which bench answers which question**, see [docs/BENCHMARKS.md](../docs/BENCHMARKS.md) and **§8** below.
 
 ---
 
@@ -51,6 +51,7 @@ At the revision when this file was added, **training was observed to converge** 
 - **PPO `oldLogProb` vs train:** Buffer log π must match **`tf.logSoftmax(maskedLogits)`** at the taken action. CPU rollouts use **`logProbMaskedLogits` / `logProbOfAction`** (`src/action.js`, `ppo.js` `selectActions`); GPU rollouts use the same masked normalization via **TF `logSoftmax` + one-hot gather** (`gpu_owner_runtime.js`). Mismatch breaks importance ratios.
 - **`plague_walls` GPU–CPU parity:** **`plague_walls_layout`** shares wall RNG/placement; **`gpu_game_engine`** spread/neighbors/terminals track CPU rules; policy tensors use **wall = 0.5** like **`getBoardForNN`** (`gpu_orchestrator.js`, `gpu_owner_runtime.js`).
 - **`gpu_orchestrator`:** Happy path **GPU `gatherSlotsTensor`** → obs/mask; **`extractStatesMasksCPU`** only on **fallback** after batched TF select failures (plus compact CPU snapshots for trajectory replay per file comments).
+- **TF.js WebGPU CPU→GPU upload (`mappedAtCreation`):** Stock **TF.js 4.22** `uploadToGPU` used **`createBuffer({ mappedAtCreation: true })`** for host uploads. **WebKit/Safari** (and similar) enforce a **small max size** for that path (~tens–low hundreds of KiB). **Larger tensors** (typical **PPO batches**) throw (`size … too large … mappedAtCreation == true`), the **GPU worker errors**, and the UI can **lose canvases / WebGPU instances** (cascade). **Fix:** `patch-package` patch on **`@tensorflow/tfjs-backend-webgpu`** replaces that path with **`queue.writeBuffer`** into a non-mapped buffer — see **`patches/@tensorflow+tfjs-backend-webgpu+4.22.0.patch`** and **§7** below.
 
 ---
 
@@ -65,6 +66,7 @@ At the revision when this file was added, **training was observed to converge** 
 | GPU sim + gather / batched policy path | `src/engine/gpu_game_engine.js`, `src/nextgen/runtime/gpu_owner_runtime.js`, `src/orchestration/gpu_orchestrator.js` (main-thread GPU pipeline: same gather → tensor select + fallbacks) |
 | Checkpoint opponent sampling | `src/checkpoint_pool.js` |
 | Pipeline presets, queue cap | `src/runtime/runtime_registry.js`, `src/nextgen/gpu_worker_trainer_proxy.js` |
+| Benchmarks, JSON/summary artifacts | `benchmarks/*.mjs`, `benchmarks/benchmark_output.mjs`, `benchmarks/run_all_benchmarks.mjs` |
 
 ---
 
@@ -75,3 +77,39 @@ At the revision when this file was added, **training was observed to converge** 
 3. Check **entropy** (collapse vs blow-up); adaptive coeff may need retuning if board size or valid-move rate changes.  
 4. If using **league**, confirm **nonzero** `checkpointFraction` and that saves occur (`saveInterval`).  
 5. If the worker **feels stuck**, inspect **`queueDepth`** / soft cap before blaming the optimizer.
+6. If **throughput regressed**, run **`bench:loop`** + **`bench:system:headless`** and compare **policy_ms/tick** vs **physics_ms/tick** (§8) before assuming the optimizer or PPO schedule.
+
+---
+
+## 7. TF.js WebGPU worker: upload crash, console noise, and memory sleuthing
+
+### Confirmed failure mode (2026-04)
+
+- **Symptom:** Console shows **`Failed to execute 'createBuffer' on 'GPUDevice' … mappedAtCreation == true`** (sizes like **128000** or **~900KiB**), then **`GPU worker error`** / **`GPUOwnerRuntime train error`**, canvases flash or die, **`A valid external Instance reference no longer exists`**.
+- **Cause:** Not a generic “OOM” message — it is an **implementation limit on mappable buffers at creation**. Training allocates **larger** CPU-backed tensors → upload hits the limit → **throw** in the worker.
+- **Mitigation in-repo:** Patched **`dist/backend_webgpu.js`** `uploadToGPU` to use **`queue.writeBuffer`**, and **`dist/buffer_manager.js`** to **never** pass **`mappedAtCreation`** into **`createBuffer`** (WebKit rejects **STORAGE + mappable-at-create**; error text can mention tiny sizes like **320**). Reapplied via **`npm` `postinstall` → `patch-package`**.
+
+### Related console lines (usually not the crash)
+
+- **`readSync` / Softplus / backend_webgpu “synchronously reading data from GPU to CPU is poor”:** TF.js **warning** about **sync GPU→CPU** readbacks (performance). Distinct from the **`createBuffer`** throw unless you are doing pathological sync in a tight loop.
+- **`lockdown-install.js` / SES:** Almost always a **browser extension** or injected script, not this app.
+- **`favicon.ico` 404:** Harmless dev-server noise.
+
+### If you suspect a leak after the patch
+
+- Browsers **do not expose** fine-grained **GPU VRAM usage** like desktop tools. **`adapter.limits` / `device.limits`** are caps, not meters.
+- **Actionable in JS:** Periodic **`tf.memory()`** in the **worker** (tensor **count** / **numBytes**) — rising without bound suggests **missing `tf.tidy` / disposal** on train or rollout paths. **`performance.memory`** (Chrome-only, when defined) helps **heap** trends.
+- **Symptoms of real GPU pressure:** slowdowns, **different** errors (OOM wording), or **context loss** — triangulate with Activity Monitor / Chrome’s task manager, not only in-app logs.
+
+---
+
+## 8. Benchmarks: what the numbers mean (avoid comparing apples to orbitals)
+
+- **Canonical index:** [docs/BENCHMARKS.md](../docs/BENCHMARKS.md) lists npm scripts, entry files, and **fair-comparison** warnings (e.g. **`bench:loop` games/s** vs **`bench:webgpu:spread`**).
+- **`ticksPerFrame`:** UI batching — sim ticks per **animation frame**, not “one WGSL dispatch” in the spread microbench.
+- **`benchInstrument=1` (URL) / `--instrument` (CLI):** Enables **`GPUOwnerRuntime._tickOne`** timers in `src/nextgen/runtime/gpu_owner_runtime.js`. Exported as **`benchAvgPolicyMsPerSimTick`** and **`benchAvgPhysicsMsPerSimTick`** on stats — these are **means over sim ticks since the last stats flush** (each **`TICK_RESULT`** / **`getStats`** read resets the batch). **Not** a per-tick time series; for histograms or traces you would add new buffers and payload fields.
+- **Policy vs “physics” split (worker instrument):** “Policy” ≈ selection / forward path for the tick; “physics” ≈ applies, spread, terminals/resets — coarse wall-clock split, not TF op profiling. **`ensureBoardCacheForPolicy`** is outside the first policy timer block.
+- **`bench:loop`:** Modes **`sim_random` / `sim_forward` / full** via URL; CLI **`--instrument` defaults true** (same as loop script). Good for **where time goes inside a sim tick** vs headline games/s.
+- **`bench:system:headless`:** **Two phases:** (1) **RL running** with throughput + rAF + **`estimatedTicksPerSec`**; (2) **paused** **`selectActionAsync`** latency (busy vs idle) — that phase is **not** sim-tick throughput. CLI **`--instrument` defaults true** so **`runs[].endStats`** and **`summary`** include worker ms/tick when the pipeline is the GPU worker; CPU-only paths may omit those fields.
+- **Artifacts:** `prepareBenchmarkOutput` / `emitBenchmarkReport` write **`.json` + `.summary.md`**; **`--quiet`** silences progress-style logs in system bench too when paired with the shared quiet flag. **`--printJson`** prints the full payload even if **`--quiet`** (human summary still suppressed).
+- **Gaps (intentional today):** Parity and patch3 smokes are mostly **stdout-only**; no built-in **per-tick arrays** in benchmark JSON.
