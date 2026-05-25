@@ -1,0 +1,824 @@
+function x(o){const t=9*o,f=0+9*o*o+9*o*t+2*o*o+o+o+1,h=0+4*o+262144*o;return{D:o,K:24,P:8,PATCH_CH:t,denseWeightCount:f,embedWeightCount:h}}const y=[{name:"compact",D:4,color:"#44ff44"},{name:"standard",D:8,color:"#4488ff"},{name:"wide",D:16,color:"#ff4444"}];function W(o,e,n,t){const a=1/(1+Math.pow(10,(e-o)/400));return{a:o+t*(n-a),b:e+t*(1-n-(1-a))}}const E=256;class A{archs;evalHistory=[];trainers=new Map;currentArchIdx=0;totalRollouts=0;evalInterval=10;evalGamesPerPair=20;eloK=32;constructor(e=y){this.archs=e.map(n=>({config:n,elo:1e3,generation:0,totalGames:0,latestLoss:0,latestGamesPerSec:0}))}async runStep(){const e=this.archs[this.currentArchIdx],n=this.trainers.get(e.config.name);if(!n)throw new Error(`No trainer registered for architecture "${e.config.name}"`);return await n.runStep(),e.generation++,n.rollout>0&&(e.totalGames+=E),this.totalRollouts++,this.currentArchIdx=(this.currentArchIdx+1)%this.archs.length,this.totalRollouts%this.evalInterval===0&&await this.runEvalRound(),this.getStats()}async runEvalRound(){if(this.archs.length<2)return;const e=Math.floor(Math.random()*this.archs.length);let n=Math.floor(Math.random()*(this.archs.length-1));n>=e&&n++;const t=this.archs[e],a=this.archs[n],s=this.trainers.get(t.config.name),r=this.trainers.get(a.config.name);if(!s||!r)return;const[l,_]=await Promise.all([s.readWeights(),r.readWeights()]),{evalArchitectures:f}=await import("./eval_harness-Ddak4Ekd.js"),c=f(t.config,l,a.config,_,this.evalGamesPerPair,this.totalRollouts*1e3),d=(c.winsA+c.draws*.5)/c.games,h=W(t.elo,a.elo,d,this.eloK);t.elo=h.a,a.elo=h.b,this.evalHistory.push({archA:t.config.name,archB:a.config.name,winsA:c.winsA,winsB:c.winsB,draws:c.draws,rollout:this.totalRollouts})}getStats(){return{archs:this.archs,evalHistory:this.evalHistory,currentTraining:this.archs[this.currentArchIdx].config.name,totalRollouts:this.totalRollouts}}}var C=`// alphagojs_v2/src/fused_ppo.wgsl
+// --------------------------------------------------------------------------
+// PRO-GRADE FUSED PPO KERNEL
+// Architecture: Patch-based ConvNet with Skip Connections and Pixel Shuffle.
+// Optimizations: L1 Caching, Cooperative Chunking, Hogwild Internal-Loop.
+// --------------------------------------------------------------------------
+enable f16;
+
+const K: u32 = 24u;
+const D: u32 = 8u;
+const WG: u32 = 64u;
+const MAX_STEPS: u32 = 600u;
+
+const N: u32 = K * K;
+const P: u32 = K / 3u; // 8
+const PATCH_CH: u32 = 9u * D; // 72
+const WPB: u32 = (N + 15u) / 16u; // 36
+const MASK_FILL: f32 = -3.4e38;
+const EPS: f32 = 1.0e-12;
+
+// Dense Weights
+const W_CONV1: u32 = 0u;
+const W_CONV2: u32 = W_CONV1 + 9u * D * D;
+const W_FUSE: u32 = W_CONV2 + 9u * D * PATCH_CH;
+const W_POLICY: u32 = W_FUSE + 2u * D * D;
+const W_VALUE: u32 = W_POLICY + D;
+const W_TOTAL: u32 = W_VALUE + D + 1u;
+const W_OPP: u32 = W_TOTAL * 3u;
+
+// Embed Weights
+const E_CELL: u32 = 0u;
+const E_PATCH: u32 = E_CELL + 4u * D;
+const E_TOTAL: u32 = E_PATCH + 262144u * D; // 2097184
+const E_OPP: u32 = E_TOTAL * 3u;
+
+const DW2_SIZE: u32 = 9u * D * 9u * D;
+const DW2_PER_THREAD: u32 = (DW2_SIZE + WG - 1u) / WG;
+
+struct Params {
+  batch_size: u32,
+  step: u32,
+  seed: u32,
+  max_steps: u32,
+  
+  adam_step: u32,
+  use_opponent: u32,
+  _p1: u32, _p2: u32,
+  
+  lr: f32,
+  beta1: f32,
+  beta2: f32,
+  eps_adam: f32,
+  
+  epsilon_clip: f32,
+  c1_value: f32,
+  c2_entropy: f32,
+  gamma: f32,
+  
+  gae_lambda: f32,
+  grad_clip: f32,
+  weight_decay: f32,
+  elo_scale: f32,
+  
+  territory_bonus: f32,
+  wall_density: f32,
+  _pad1: f32,
+  _pad2: f32,
+}
+
+struct Transition {
+  action: u32,
+  log_prob: f16,
+  value: f16,
+  reward: f16,
+  advantage: f16,
+  value_target: f16,
+  _pad: f16,
+  board: array<u32, WPB>,
+}
+
+struct BoardState {
+  packed: array<u32, WPB>,
+  game_over: u32,
+  player: u32,
+  step_count: u32,
+  _pad: u32,
+  transitions: array<Transition, MAX_STEPS>,
+}
+
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read_write> boards: array<BoardState>;
+@group(0) @binding(2) var<storage, read_write> embed_w: array<f16>;
+@group(0) @binding(3) var<storage, read_write> dense_w: array<f32>;
+
+var<workgroup> sh_board: array<u32, 36u>;
+var<workgroup> sh_patch_state: array<u32, 64u>;
+var<workgroup> sh_a: array<f32, P * P * D>;
+var<workgroup> sh_b: array<f32, 576u>;
+var<workgroup> sh_pool: array<f32, 64u>;
+var<workgroup> sh_reduce_m: array<f32, 64u>;
+var<workgroup> sh_reduce_s: array<f32, 64u>;
+var<workgroup> sh_patch_delta2: array<f32, PATCH_CH>;
+var<workgroup> sh_value: f32;
+var<workgroup> sh_action: u32;
+var<workgroup> sh_log_prob: f32;
+var<workgroup> sh_delta_v: f32;
+var<workgroup> sh_total_steps: u32;
+var<workgroup> sh_bar_a1: array<f32, P * P * D>;
+
+var<private> p_invert: bool = false;
+var<private> w_offset: u32 = 0u;
+var<private> e_offset: u32 = 0u;
+
+fn pcg(s: u32) -> u32 {
+  var st = s * 747796405u + 2891336453u;
+  let w = ((st >> ((st >> 28u) + 4u)) ^ st) * 277803737u;
+  return (w >> 22u) ^ w;
+}
+
+fn rng_float(seed: u32, a: u32, b: u32) -> f32 {
+  return f32(pcg(seed ^ pcg(a ^ pcg(b))) & 0x00FFFFFFu) / 16777216.0;
+}
+
+fn get_sh_cell_state(y: u32, x: u32) -> u32 {
+  let n = y * K + x;
+  let s = (sh_board[n >> 4u] >> ((n & 15u) << 1u)) & 3u;
+  if (p_invert) {
+    if (s == 1u) { return 2u; }
+    if (s == 2u) { return 1u; }
+  }
+  return s;
+}
+
+fn set_cell(b: u32, cell: u32, state: u32) {
+  let wi = cell >> 4u;
+  let bo = (cell & 15u) << 1u;
+  boards[b].packed[wi] = (boards[b].packed[wi] & ~(3u << bo)) | ((state & 3u) << bo);
+}
+
+// Weights
+fn cell_e(state: u32, d: u32) -> f32 { return f32(embed_w[e_offset + E_CELL + state * D + d]); }
+fn patch_e(row: u32, d: u32) -> f32 { return f32(embed_w[e_offset + E_PATCH + row * D + d]); }
+fn c1w(ky: u32, kx: u32, c: u32, o: u32) -> f32 { return dense_w[w_offset + W_CONV1 + ((ky*3u+kx)*D+c)*D+o]; }
+fn c2w(ky: u32, kx: u32, c: u32, o: u32) -> f32 { return dense_w[w_offset + W_CONV2 + ((ky*3u+kx)*D+c)*PATCH_CH+o]; }
+fn fw(c: u32, o: u32) -> f32 { return dense_w[w_offset + W_FUSE + c * D + o]; }
+fn pw(d: u32) -> f32 { return dense_w[w_offset + W_POLICY + d]; }
+fn vw(d: u32) -> f32 { return dense_w[w_offset + W_VALUE + d]; }
+fn vbias() -> f32 { return dense_w[w_offset + W_VALUE + D]; }
+
+struct MS { m: f32, s: f32 }
+fn combine(am: f32, as2: f32, bm: f32, bs: f32) -> MS {
+  if (as2 == 0.0) { return MS(bm, bs); }
+  if (bs == 0.0) { return MS(am, as2); }
+  let m = max(am, bm);
+  return MS(m, as2 * exp(am - m) + bs * exp(bm - m));
+}
+
+fn apply_adam_f32(offset: u32, grad: f32) {
+  let adam_t = f32(params.adam_step + 1u);
+  let inv_bias1 = 1.0 / (1.0 - pow(params.beta1, adam_t));
+  let inv_bias2 = 1.0 / (1.0 - pow(params.beta2, adam_t));
+  let m_idx = W_TOTAL + offset;
+  let v_idx = W_TOTAL * 2u + offset;
+  
+  var w = dense_w[offset];
+  w *= (1.0 - params.lr * params.weight_decay);
+  
+  let c_grad = clamp(grad, -params.grad_clip, params.grad_clip);
+  let m = params.beta1 * dense_w[m_idx] + (1.0 - params.beta1) * c_grad;
+  let v = params.beta2 * dense_w[v_idx] + (1.0 - params.beta2) * c_grad * c_grad;
+  
+  dense_w[m_idx] = m;
+  dense_w[v_idx] = v;
+  
+  w -= params.lr * (m * inv_bias1) / (sqrt(max(v * inv_bias2, 0.0)) + params.eps_adam);
+  dense_w[offset] = w;
+}
+
+fn apply_adam_f16(offset: u32, grad: f32) {
+  let adam_t = f32(params.adam_step + 1u);
+  let inv_bias1 = 1.0 / (1.0 - pow(params.beta1, adam_t));
+  let inv_bias2 = 1.0 / (1.0 - pow(params.beta2, adam_t));
+  let m_idx = E_TOTAL + offset;
+  let v_idx = E_TOTAL * 2u + offset;
+  
+  var w = f32(embed_w[offset]);
+  w *= (1.0 - params.lr * params.weight_decay);
+  
+  let c_grad = clamp(grad, -params.grad_clip, params.grad_clip);
+  let m = params.beta1 * f32(embed_w[m_idx]) + (1.0 - params.beta1) * c_grad;
+  let v = params.beta2 * f32(embed_w[v_idx]) + (1.0 - params.beta2) * c_grad * c_grad;
+  
+  embed_w[m_idx] = f16(m);
+  embed_w[v_idx] = f16(max(v, 1e-4));
+  
+  w -= params.lr * (m * inv_bias1) / (sqrt(max(v * inv_bias2, 0.0)) + params.eps_adam);
+  embed_w[offset] = f16(w);
+}
+
+fn sh_a_at(py: i32, px: i32, d: u32) -> f32 {
+  if (py < 0 || px < 0 || py >= i32(P) || px >= i32(P)) { return 0.0; }
+  return sh_a[u32(py) * P * D + u32(px) * D + d];
+}
+
+fn conv2_at_patch(py: i32, px: i32, o: u32) -> f32 {
+  var acc: f32 = 0.0;
+  for (var c: u32 = 0u; c < D; c++) {
+    for (var ky: u32 = 0u; ky < 3u; ky++) {
+      for (var kx: u32 = 0u; kx < 3u; kx++) {
+        let y = py + 2*(i32(ky)-1);
+        let x = px + 2*(i32(kx)-1);
+        if (y >= 0 && y < i32(P) && x >= 0 && x < i32(P)) {
+          acc += c2w(ky, kx, c, o) * sh_a[u32(y)*P*D + u32(x)*D + c];
+        }
+      }
+    }
+  }
+  return max(acc, 0.0);
+}
+
+fn forward_pass(b: u32, lid: u32, is_live: bool) {
+  let step = boards[b].step_count;
+
+  // Load Board to L1 Cache
+  if (!is_live && lid < WPB) {
+    sh_board[lid] = boards[b].transitions[step].board[lid];
+  } else if (is_live && lid < WPB) {
+    sh_board[lid] = boards[b].packed[lid];
+  }
+  workgroupBarrier();
+
+  // Patch Embedding
+  if (lid < P * P) {
+    let py = lid / P; let px = lid % P;
+    var pi: u32 = 0u;
+    for (var dy: u32 = 0u; dy < 3u; dy++) {
+      for (var dx: u32 = 0u; dx < 3u; dx++) {
+        pi |= (get_sh_cell_state(py*3u+dy, px*3u+dx) << (2u * (dy*3u+dx)));
+      }
+    }
+    if (!is_live) { sh_patch_state[lid] = pi; }
+    for (var d: u32 = 0u; d < D; d++) { sh_a[lid * D + d] = patch_e(pi, d); }
+  }
+  workgroupBarrier();
+
+  // Conv1
+  var conv1_reg: array<f32, D>;
+  if (lid < P * P) {
+    let py = i32(lid / P); let px = i32(lid % P);
+    for (var o: u32 = 0u; o < D; o++) {
+      var acc: f32 = 0.0;
+      for (var c: u32 = 0u; c < D; c++) {
+        for (var ky: u32 = 0u; ky < 3u; ky++) {
+          for (var kx: u32 = 0u; kx < 3u; kx++) {
+            let y = py + i32(ky) - 1; let x = px + i32(kx) - 1;
+            if (y >= 0 && y < i32(P) && x >= 0 && x < i32(P)) {
+              acc += c1w(ky, kx, c, o) * sh_a[u32(y)*P*D + u32(x)*D + c];
+            }
+          }
+        }
+      }
+      conv1_reg[o] = max(acc, 0.0);
+    }
+  }
+  workgroupBarrier();
+  if (lid < P * P) {
+    for (var o: u32 = 0u; o < D; o++) { sh_a[lid * D + o] = conv1_reg[o]; }
+  }
+  workgroupBarrier();
+
+  // Conv2 + Pixel Shuffle + Fuse + Heads
+  var lm: f32 = MASK_FILL; var ls: f32 = 0.0;
+  var pool: array<f32, D>;
+  for (var d: u32 = 0u; d < D; d++) { pool[d] = 0.0; }
+
+  for (var cell: u32 = lid; cell < N; cell += WG) {
+    let y = cell / K; let x = cell % K;
+    let py = y / 3u; let px = x / 3u;
+    let sub = (y % 3u) * 3u + (x % 3u);
+    let state = get_sh_cell_state(y, x);
+
+    var decoded: array<f32, D>;
+    for (var d: u32 = 0u; d < D; d++) { decoded[d] = conv2_at_patch(i32(py), i32(px), sub * D + d); }
+
+    var fused: array<f32, D>;
+    for (var o: u32 = 0u; o < D; o++) {
+      var acc: f32 = 0.0;
+      for (var c: u32 = 0u; c < D; c++) {
+        acc += fw(c, o) * decoded[c] + fw(D + c, o) * cell_e(state, c);
+      }
+      fused[o] = max(acc, 0.0);
+      pool[o] += fused[o];
+    }
+
+    var logit: f32 = 0.0;
+    for (var d: u32 = 0u; d < D; d++) { logit += pw(d) * fused[d]; }
+    let valid = (state == 0u);
+    let masked = select(MASK_FILL, logit, valid);
+    sh_b[cell] = masked;
+    if (valid) {
+      let ms = combine(lm, ls, masked, 1.0);
+      lm = ms.m; ls = ms.s;
+    }
+  }
+  workgroupBarrier();
+
+  // Reductions
+  for (var d: u32 = 0u; d < D; d++) {
+    sh_pool[lid] = pool[d];
+    workgroupBarrier();
+    for (var stride: u32 = WG >> 1u; stride > 0u; stride >>= 1u) {
+      if (lid < stride) { sh_pool[lid] += sh_pool[lid + stride]; }
+      workgroupBarrier();
+    }
+    if (lid == 0u) { pool[d] = sh_pool[0] / f32(N); }
+    workgroupBarrier();
+  }
+
+  if (lid == 0u) {
+    var v: f32 = vbias();
+    for (var d: u32 = 0u; d < D; d++) { v += vw(d) * pool[d]; }
+    sh_value = tanh(v);
+  }
+
+  sh_reduce_m[lid] = lm; sh_reduce_s[lid] = ls;
+  workgroupBarrier();
+  for (var stride: u32 = WG >> 1u; stride > 0u; stride >>= 1u) {
+    if (lid < stride) {
+      let ms = combine(sh_reduce_m[lid], sh_reduce_s[lid], sh_reduce_m[lid+stride], sh_reduce_s[lid+stride]);
+      sh_reduce_m[lid] = ms.m; sh_reduce_s[lid] = ms.s;
+    }
+    workgroupBarrier();
+  }
+  let gm = sh_reduce_m[0]; let gs = max(sh_reduce_s[0], EPS);
+
+  for (var cell: u32 = lid; cell < N; cell += WG) {
+    let state = get_sh_cell_state(cell / K, cell % K);
+    sh_b[cell] = select(0.0, exp(sh_b[cell] - gm) / gs, state == 0u);
+  }
+  workgroupBarrier();
+}
+
+
+// --------------------------------------------------------------------------
+// Entry: ROLLOUT (Self-Play Generation)
+// --------------------------------------------------------------------------
+@compute @workgroup_size(WG)
+fn rollout_step(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) loc: vec3<u32>) {
+  let b = wg.x;
+  if (b >= params.batch_size) { return; }
+  let lid = loc.x;
+  let is_live = boards[b].game_over == 0u;
+
+  if (params.use_opponent == 1u && boards[b].player == 2u) {
+    w_offset = W_OPP; e_offset = E_OPP;
+  } else {
+    w_offset = 0u; e_offset = 0u;
+  }
+
+  let step = boards[b].step_count;
+  if (is_live) {
+    for (var w: u32 = lid; w < WPB; w += WG) { boards[b].transitions[step].board[w] = boards[b].packed[w]; }
+  }
+  workgroupBarrier();
+
+  forward_pass(b, lid, true);
+
+  if (lid == 0u && is_live) {
+    let rand = rng_float(params.seed, params.step, b);
+    var cumsum: f32 = 0.0; var chosen: u32 = 0u; var chosen_p: f32 = 0.0;
+    for (var i: u32 = 0u; i < N; i++) {
+      let p = sh_b[i];
+      if (p <= 0.0) { continue; }
+      cumsum += p;
+      if (rand < cumsum) { chosen = i; chosen_p = p; break; }
+    }
+    if (chosen_p == 0.0) {
+      for (var i: u32 = 0u; i < N; i++) { if (sh_b[i] > 0.0) { chosen = i; chosen_p = sh_b[i]; break; } }
+    }
+    sh_action = chosen;
+    sh_log_prob = log(max(chosen_p, EPS));
+
+    boards[b].transitions[step].action = chosen;
+    boards[b].transitions[step].log_prob = f16(sh_log_prob);
+    boards[b].transitions[step].value = f16(sh_value);
+    boards[b].transitions[step].reward = f16(0.0);
+  }
+  workgroupBarrier();
+
+  // 1. Initialize sh_b with the old state
+  for (var cell: u32 = lid; cell < N; cell += WG) {
+    sh_b[cell] = f32(get_sh_cell_state(cell / K, cell % K));
+  }
+  workgroupBarrier();
+
+  // 2. Network places its piece
+  if (lid == 0u && is_live) {
+    sh_b[sh_action] = f32(boards[b].player);
+    boards[b].player = select(1u, 2u, boards[b].player == 1u);
+  }
+  workgroupBarrier();
+
+  p_invert = false;
+  // 3. Spread Plague (only on cells that are empty and NOT the new action)
+  for (var cell: u32 = lid; cell < N; cell += WG) {
+    let r = cell / K; let c = cell % K;
+    let state = get_sh_cell_state(r, c);
+    
+    if (!is_live || state != 0u || cell == sh_action) { continue; }
+    
+    var sum: f32 = 0.0;
+    let rb = params.seed ^ params.step ^ cell;
+
+    if (r > 0u) { let n = get_sh_cell_state(r-1u, c); if (n == 1u) { sum += rng_float(rb,0u,b); } else if (n == 2u) { sum -= rng_float(rb,0u,b); } }
+    if (r + 1u < K) { let n = get_sh_cell_state(r+1u, c); if (n == 1u) { sum += rng_float(rb,1u,b); } else if (n == 2u) { sum -= rng_float(rb,1u,b); } }
+    if (c > 0u) { let n = get_sh_cell_state(r, c-1u); if (n == 1u) { sum += rng_float(rb,2u,b); } else if (n == 2u) { sum -= rng_float(rb,2u,b); } }
+    if (c + 1u < K) { let n = get_sh_cell_state(r, c+1u); if (n == 1u) { sum += rng_float(rb,3u,b); } else if (n == 2u) { sum -= rng_float(rb,3u,b); } }
+
+    let v = clamp(trunc(sum * 2.0), -1.0, 1.0);
+    sh_b[cell] = f32(select(0u, 1u, v > 0.0) | select(0u, 2u, v < 0.0));
+  }
+  workgroupBarrier();
+
+  // 4. Safe, race-free parallel repacking to VRAM
+  if (is_live && lid < WPB) {
+    var word: u32 = 0u;
+    for (var i = 0u; i < 16u; i++) {
+      let cell = lid * 16u + i;
+      if (cell < N) {
+        let state = u32(sh_b[cell]);
+        word |= (state << (i * 2u));
+      }
+    }
+    boards[b].packed[lid] = word;
+  }
+  workgroupBarrier();
+
+  if (lid == 0u && is_live) {
+    var has_empty: bool = false;
+    let full_words = N >> 4u; let leftover = N & 15u;
+    for (var w: u32 = 0u; w < full_words; w++) {
+      let word = boards[b].packed[w];
+      if (((word | (word >> 1u)) & 0x55555555u) != 0x55555555u) { has_empty = true; break; }
+    }
+    if (!has_empty && leftover > 0u) {
+      let word = boards[b].packed[full_words];
+      let mask = (1u << (leftover * 2u)) - 1u;
+      let check_mask = 0x55555555u & mask;
+      if ((((word & mask) | ((word & mask) >> 1u)) & check_mask) != check_mask) { has_empty = true; }
+    }
+    let ns = step + 1u;
+    boards[b].step_count = ns;
+    
+    if (!has_empty || ns >= params.max_steps) {
+      boards[b].game_over = 1u;
+      var p1: u32 = 0u; var p2: u32 = 0u;
+      for (var i: u32 = 0u; i < N; i++) {
+        let s = get_sh_cell_state(i/K, i%K);
+        if (s == 1u) { p1++; } else if (s == 2u) { p2++; }
+      }
+      
+      let base_reward = select(select(-1.0, 1.0, p1 > p2), 0.0, p1 == p2);
+      let total_cells = f32(p1 + p2);
+      let p1_pct = select(0.5, f32(p1) / total_cells, total_cells > 0.0);
+      let territory_diff = (p1_pct - 0.5) * 2.0;
+      
+      let scaled_reward = (base_reward * params.elo_scale) + (territory_diff * params.territory_bonus);
+      boards[b].transitions[ns - 1u].reward = f16(scaled_reward);
+    }
+  }
+}
+
+// --------------------------------------------------------------------------
+// Entry: GAE SCAN
+// --------------------------------------------------------------------------
+@compute @workgroup_size(WG)
+fn gae_scan(@builtin(global_invocation_id) id: vec3<u32>) {
+  let b = id.x;
+  if (b >= params.batch_size) { return; }
+  let T = boards[b].step_count;
+  if (T == 0u) { return; }
+
+  var gae: f32 = 0.0;
+  for (var t1: u32 = T; t1 > 0u; t1--) {
+    let t = t1 - 1u;
+    let reward = f32(boards[b].transitions[t].reward);
+    let value = f32(boards[b].transitions[t].value);
+    let nv = select(f32(boards[b].transitions[t+1u].value), 0.0, t+1u >= T);
+    let delta = reward + params.gamma * nv - value;
+    gae = delta + params.gamma * params.gae_lambda * gae;
+    boards[b].transitions[t].advantage = f16(gae);
+    boards[b].transitions[t].value_target = f16(gae + value);
+  }
+}
+
+// --------------------------------------------------------------------------
+// Entry: FUSED PPO + ADAMW
+// --------------------------------------------------------------------------
+@compute @workgroup_size(WG)
+fn ppo_step(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) loc: vec3<u32>) {
+  let b = wg.x;
+  if (b >= params.batch_size) { return; }
+  let lid = loc.x;
+
+  if (lid == 0u) { sh_total_steps = min(boards[b].step_count, params.max_steps); }
+  workgroupBarrier();
+  let total_steps = workgroupUniformLoad(&sh_total_steps);
+
+  for (var step = 0u; step < total_steps; step++) {
+    p_invert = ((step % 2u) != 0u);
+    if (params.use_opponent == 1u && p_invert) {
+      w_offset = W_OPP; e_offset = E_OPP;
+    } else {
+      w_offset = 0u; e_offset = 0u;
+    }
+    forward_pass(b, lid, false);
+
+    if (lid == 0u) {
+      let action = boards[b].transitions[step].action;
+      let old_lp = f32(boards[b].transitions[step].log_prob);
+      let adv = f32(boards[b].transitions[step].advantage);
+      let v_tar = f32(boards[b].transitions[step].value_target);
+
+      let ratio = exp(log(max(sh_b[action], EPS)) - old_lp);
+      let surr1 = ratio * adv;
+      let surr2 = clamp(ratio, 1.0 - params.epsilon_clip, 1.0 + params.epsilon_clip) * adv;
+      let clip_loss = -min(surr1, surr2);
+      let v_loss = params.c1_value * (sh_value - v_tar) * (sh_value - v_tar);
+
+      var entropy: f32 = 0.0;
+      for (var i: u32 = 0u; i < N; i++) {
+        let p = sh_b[i];
+        if (p > EPS) { entropy -= p * log(p); }
+      }
+
+      boards[b].transitions[0u].reward = f16(clip_loss + v_loss - params.c2_entropy * entropy);
+
+      let is_p2_turn = (step % 2u) != 0u;
+      let is_opponent_turn = params.use_opponent == 1u && is_p2_turn;
+
+      var g_lp = 0.0;
+      var d_v = 0.0;
+      if (!is_opponent_turn) {
+        let e = params.epsilon_clip;
+        if ((adv >= 0.0 && ratio < 1.0 + e) || (adv < 0.0 && ratio > 1.0 - e)) {
+          g_lp = -(adv * ratio) / f32(params.batch_size);
+        }
+        d_v = (2.0 * params.c1_value / f32(params.batch_size)) * (sh_value - v_tar) * (1.0 - sh_value * sh_value);
+      }
+      
+      sh_delta_v = d_v;
+      sh_pool[0] = entropy;
+      sh_pool[1] = g_lp;
+    }
+    workgroupBarrier();
+
+    let H_b = sh_pool[0];
+    let sh_g_lp = sh_pool[1];
+    let c2_B = params.c2_entropy / f32(params.batch_size);
+    let action = boards[b].transitions[step].action;
+
+    for (var i: u32 = lid; i < N; i += WG) {
+      let p_i = sh_b[i];
+      var delta_pi = 0.0;
+      if (p_i > 0.0) {
+        let indicator = select(0.0, 1.0, i == action);
+        delta_pi = sh_g_lp * (indicator - p_i) + c2_B * p_i * (log(max(p_i, EPS)) + H_b);
+      }
+      sh_b[i] = delta_pi;
+    }
+    workgroupBarrier();
+
+    var l_dWpi: array<f32, D>;
+    var l_dWv: array<f32, D>;
+    var l_dbv: f32 = 0.0;
+    var l_dWf: array<f32, 128>;
+    var l_dE_cell: array<f32, 32>;
+
+    if (lid == 0u) { l_dbv = sh_delta_v; }
+
+    var local_dW2: array<f32, DW2_PER_THREAD>;
+    for (var i = 0u; i < DW2_PER_THREAD; i++) { local_dW2[i] = 0.0; }
+
+    for (var i = 0u; i < 512u; i += WG) { sh_bar_a1[lid + i] = 0.0; }
+    workgroupBarrier();
+
+    for (var patch_idx = 0u; patch_idx < 64u; patch_idx++) {
+      if (lid < 9u) {
+        let sub = lid;
+        let py = patch_idx / 8u; let px = patch_idx % 8u;
+        let y = py * 3u + sub / 3u; let x = px * 3u + sub % 3u;
+        let state = get_sh_cell_state(y, x);
+
+        var decoded: array<f32, D>;
+        for (var c = 0u; c < 8u; c++) { decoded[c] = conv2_at_patch(i32(py), i32(px), sub * 8u + c); }
+
+        var af: array<f32, D>;
+        for (var o = 0u; o < 8u; o++) {
+          var acc = 0.0;
+          for (var c = 0u; c < 8u; c++) { acc += fw(c, o) * decoded[c] + fw(8u + c, o) * cell_e(state, c); }
+          af[o] = max(acc, 0.0);
+        }
+
+        let delta_pi_i = sh_b[y * K + x];
+        let delta_v_N = sh_delta_v / f32(N);
+        var delta_f: array<f32, D>;
+
+        for (var o = 0u; o < 8u; o++) {
+          l_dWpi[o] += delta_pi_i * af[o];
+          l_dWv[o] += delta_v_N * af[o];
+          
+          let bar_af = delta_pi_i * pw(o) + delta_v_N * vw(o);
+          delta_f[o] = select(0.0, bar_af, af[o] > 0.0);
+          
+          for (var c = 0u; c < 8u; c++) {
+            l_dWf[c * 8u + o] += delta_f[o] * decoded[c];
+            l_dWf[(8u + c) * 8u + o] += delta_f[o] * cell_e(state, c);
+            l_dE_cell[state * 8u + c] += delta_f[o] * fw(8u + c, o);
+          }
+        }
+
+        for (var d = 0u; d < 8u; d++) {
+          var bar_decoded_d = 0.0;
+          for (var o = 0u; o < 8u; o++) { bar_decoded_d += delta_f[o] * fw(d, o); }
+          sh_patch_delta2[sub * 8u + d] = select(0.0, bar_decoded_d, decoded[d] > 0.0);
+        }
+      }
+      workgroupBarrier();
+
+      for (var i = 0u; i < DW2_PER_THREAD; i++) {
+        let w_idx = lid + i * 64u;
+        if (w_idx < DW2_SIZE) {
+          let k = w_idx % 72u; let c = (w_idx / 72u) % 8u;
+          let kx = (w_idx / 576u) % 3u; let ky = (w_idx / 1728u) % 3u;
+          let py = patch_idx / 8u; let px = patch_idx % 8u;
+          local_dW2[i] += sh_patch_delta2[k] * sh_a_at(i32(py) + 2*(i32(ky)-1), i32(px) + 2*(i32(kx)-1), c);
+        }
+      }
+
+      for (var item = lid; item < 72u; item += WG) {
+        let c = item % 8u; let v = (item / 8u) % 3u; let u = (item / 24u) % 3u;
+        let py = i32(patch_idx / 8u) + 2 * (i32(u) - 1);
+        let px = i32(patch_idx % 8u) + 2 * (i32(v) - 1);
+        if (py >= 0 && py < 8 && px >= 0 && px < 8) {
+          var sum = 0.0;
+          for (var k = 0u; k < 72u; k++) { sum += sh_patch_delta2[k] * c2w(u, v, c, k); }
+          sh_bar_a1[u32(py) * 64u + u32(px) * 8u + c] += sum;
+        }
+      }
+      workgroupBarrier();
+    }
+
+    for (var chunk = 0u; chunk < 177u; chunk += 2u) {
+      let count = min(2u, 177u - chunk);
+      let c0 = chunk; let c1 = chunk + 1u;
+      
+      var val0 = 0.0;
+      if (c0 < 8u) { val0 = l_dWpi[c0]; }
+      else if (c0 < 16u) { val0 = l_dWv[c0 - 8u]; }
+      else if (c0 == 16u) { val0 = l_dbv; }
+      else if (c0 < 145u) { val0 = l_dWf[c0 - 17u]; }
+      else { val0 = l_dE_cell[c0 - 145u]; }
+      
+      var val1 = 0.0;
+      if (c1 < 8u) { val1 = l_dWpi[c1]; }
+      else if (c1 < 16u) { val1 = l_dWv[c1 - 8u]; }
+      else if (c1 == 16u) { val1 = l_dbv; }
+      else if (c1 < 145u) { val1 = l_dWf[c1 - 17u]; }
+      else { val1 = l_dE_cell[c1 - 145u]; }
+      
+      if (count > 0u) { sh_pool[lid] = val0; }
+      if (count > 1u) { sh_reduce_m[lid] = val1; }
+      workgroupBarrier();
+      
+      if (lid < count) {
+        var sum = 0.0;
+        if (lid == 0u) { for(var t=0u; t<64u; t++) { sum += sh_pool[t]; } }
+        if (lid == 1u) { for(var t=0u; t<64u; t++) { sum += sh_reduce_m[t]; } }
+        
+        let w_idx = chunk + lid;
+        if (w_idx < 8u) { apply_adam_f32(W_POLICY + w_idx, sum); }
+        else if (w_idx < 16u) { apply_adam_f32(W_VALUE + (w_idx - 8u), sum); }
+        else if (w_idx == 16u) { apply_adam_f32(W_VALUE + D, sum); }
+        else if (w_idx < 145u) { apply_adam_f32(W_FUSE + (w_idx - 17u), sum); }
+        else { apply_adam_f16(E_CELL + (w_idx - 145u), sum); }
+      }
+      workgroupBarrier();
+    }
+
+    for (var i = 0u; i < DW2_PER_THREAD; i++) {
+      let w_idx = lid + i * 64u;
+      if (w_idx < DW2_SIZE) { apply_adam_f32(W_CONV2 + w_idx, local_dW2[i]); }
+    }
+    workgroupBarrier();
+
+    for (var w_idx = lid; w_idx < 576u; w_idx += WG) {
+      let o = w_idx % 8u; let c = (w_idx / 8u) % 8u;
+      let v = (w_idx / 64u) % 3u; let u = (w_idx / 192u) % 3u;
+      var grad = 0.0;
+      for (var p = 0; p < 8; p++) {
+        for (var q = 0; q < 8; q++) {
+          if (sh_a[(p * 8 + q) * 8 + i32(o)] > 0.0) {
+            let py = p + i32(u) - 1; let px = q + i32(v) - 1;
+            if (py >= 0 && py < 8 && px >= 0 && px < 8) {
+              grad += sh_bar_a1[(p * 8 + q) * 8 + i32(o)] * patch_e(sh_patch_state[u32(py) * 8u + u32(px)], c);
+            }
+          }
+        }
+      }
+      apply_adam_f32(W_CONV1 + w_idx, grad);
+    }
+    workgroupBarrier();
+
+    var pi = select(0u, sh_patch_state[lid], lid < 64u);
+    var l_bar_patch0: array<f32, D>;
+    let patch_p = i32(lid / 8u); let patch_q = i32(lid % 8u);
+    for (var c = 0u; c < 8u; c++) {
+      var grad = 0.0;
+      for (var u = 0u; u < 3u; u++) {
+        for (var v = 0u; v < 3u; v++) {
+          let p_out = patch_p - (i32(u) - 1); let q_out = patch_q - (i32(v) - 1);
+          if (p_out >= 0 && p_out < 8 && q_out >= 0 && q_out < 8) {
+            for (var o = 0u; o < 8u; o++) {
+              if (sh_a[(p_out * 8 + q_out) * 8 + i32(o)] > 0.0) {
+                grad += sh_bar_a1[(p_out * 8 + q_out) * 8 + i32(o)] * c1w(u, v, c, o);
+              }
+            }
+          }
+        }
+      }
+      l_bar_patch0[c] = grad;
+    }
+
+    sh_pool[lid] = bitcast<f32>(pi);
+    for(var c = 0u; c < 8u; c++) { sh_b[lid * 8u + c] = l_bar_patch0[c]; }
+    workgroupBarrier();
+
+    var is_first = true;
+    for (var t = 0u; t < lid; t++) { if (bitcast<u32>(sh_pool[t]) == pi) { is_first = false; break; } }
+    if (is_first) {
+      var sum_grad: array<f32, D>;
+      for(var c = 0u; c < 8u; c++) { sum_grad[c] = 0.0; }
+      for (var t = lid; t < 64u; t++) {
+        if (bitcast<u32>(sh_pool[t]) == pi) {
+          for(var c = 0u; c < 8u; c++) { sum_grad[c] += sh_b[t * 8u + c]; }
+        }
+      }
+      for (var c = 0u; c < 8u; c++) { apply_adam_f16(E_PATCH + pi * D + c, sum_grad[c]); }
+    }
+    workgroupBarrier();
+  }
+}
+
+// --------------------------------------------------------------------------
+// Entry: INIT BOARDS (Wall Generation)
+// --------------------------------------------------------------------------
+@compute @workgroup_size(WG)
+fn init_boards(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) loc: vec3<u32>) {
+  let b = wg.x;
+  if (b >= params.batch_size) { return; }
+  let lid = loc.x;
+
+  if (lid < WPB) { boards[b].packed[lid] = 0u; }
+  workgroupBarrier();
+
+  if (lid == 0u) {
+    boards[b].game_over = 0u;
+    boards[b].player = 1u;
+    boards[b].step_count = 0u;
+
+    // Generate random walls
+    let area = f32(N);
+    let base_chains = 5.0 + trunc(rng_float(params.seed, 100u, b) * 8.0);
+    let num_chains = u32(round((base_chains * area) / 100.0 * params.wall_density));
+    
+    let DR = array<i32, 4>(0, 1, 0, -1);
+    let DC = array<i32, 4>(1, 0, -1, 0);
+
+    var rng_state = params.seed ^ b;
+    
+    for (var chain = 0u; chain < num_chains; chain++) {
+      rng_state = pcg(rng_state);
+      var r = i32(rng_float(rng_state, chain, 0u) * f32(K));
+      var c = i32(rng_float(rng_state, chain, 1u) * f32(K));
+      let length = 1u + u32(rng_float(rng_state, chain, 2u) * 4.0);
+      var dir = u32(rng_float(rng_state, chain, 3u) * 4.0);
+
+      for (var seg = 0u; seg < length; seg++) {
+        if (r < 0 || r >= i32(K) || c < 0 || c >= i32(K)) { break; }
+        
+        // Wall state is 3
+        let cell = u32(r) * K + u32(c);
+        let wi = cell >> 4u;
+        let bo = (cell & 15u) << 1u;
+        boards[b].packed[wi] = (boards[b].packed[wi] & ~(3u << bo)) | (3u << bo);
+        
+        r += DR[dir];
+        c += DC[dir];
+        
+        if (rng_float(rng_state, chain, 4u + seg) < 0.3) {
+          let turn = select(3u, 1u, rng_float(rng_state, chain, 5u + seg) < 0.5);
+          dir = (dir + turn) % 4u;
+        }
+      }
+    }
+    
+    // Clear center 3x3 for fair start
+    let mid = i32(K / 2u);
+    for (var dr = -1; dr <= 1; dr++) {
+      for (var dc = -1; dc <= 1; dc++) {
+        let rr = mid + dr;
+        let cc = mid + dc;
+        if (rr >= 0 && rr < i32(K) && cc >= 0 && cc < i32(K)) {
+          let cell = u32(rr) * K + u32(cc);
+          let wi = cell >> 4u;
+          let bo = (cell & 15u) << 1u;
+          boards[b].packed[wi] = boards[b].packed[wi] & ~(3u << bo);
+        }
+      }
+    }
+  }
+}
+`;function D(o){return C.replace(/const D: u32 = \d+u;/,`const D: u32 = ${o}u;`)}const S="AlphaGoJS_v2_DB",b="checkpoints",G=1;class L{db=null;async init(){return new Promise((e,n)=>{const t=indexedDB.open(S,G);t.onupgradeneeded=a=>{const s=a.target.result;s.objectStoreNames.contains(b)||s.createObjectStore(b,{keyPath:"id"})},t.onsuccess=a=>{this.db=a.target.result,e()},t.onerror=a=>{n(a.target.error)}})}async saveCheckpoint(e){if(this.db)return new Promise((n,t)=>{const r=this.db.transaction([b],"readwrite").objectStore(b).put({id:e.id,embed:e.embed,dense:e.dense,elo:e.elo,generation:e.generation});r.onsuccess=()=>n(),r.onerror=l=>t(l.target.error)})}async deleteCheckpoint(e){if(this.db)return new Promise((n,t)=>{const r=this.db.transaction([b],"readwrite").objectStore(b).delete(e);r.onsuccess=()=>n(),r.onerror=l=>t(l.target.error)})}async loadAllCheckpoints(){return this.db?new Promise((e,n)=>{const s=this.db.transaction([b],"readonly").objectStore(b).getAll();s.onsuccess=r=>{const l=r.target.result;l.sort((_,f)=>_.id-f.id),e(l)},s.onerror=r=>{n(r.target.error)}}):[]}}class T{checkpoints=[];currentElo=1e3;eloK=32;nextId=1;storage=new L;async init(){await this.storage.init();const e=await this.storage.loadAllCheckpoints();if(e&&e.length>0){this.checkpoints=e;const n=e[e.length-1];n&&(this.currentElo=n.elo,this.nextId=n.id+1,console.log(`Loaded ${e.length} checkpoints from IDB. Current Elo: ${this.currentElo}`))}}async saveCheckpoint(e,n,t){const a={id:this.nextId++,embed:new Float16Array(e),dense:new Float32Array(n),elo:this.currentElo,generation:t};if(this.checkpoints.push(a),await this.storage.saveCheckpoint(a),this.checkpoints.length>20){const s=this.checkpoints.shift();s&&await this.storage.deleteCheckpoint(s.id)}}sampleOpponent(){if(this.checkpoints.length===0)return null;const e=Math.random(),n=Math.floor(Math.pow(e,.5)*this.checkpoints.length),t=Math.min(n,this.checkpoints.length-1);return this.checkpoints[t]}updateElo(e,n,t){const a=1/(1+Math.pow(10,(e-this.currentElo)/400)),s=t?.5:n?1:0;return this.currentElo+=this.eloK*(s-a),this.currentElo}}const i={numBoards:256,maxSteps:600,ppoEpochs:3,lr:3e-4,beta1:.9,beta2:.999,epsAdam:1e-8,epsilonClip:.2,c1Value:.5,c2Entropy:.01,gamma:.99,gaeLambda:.95,gradClip:1,weightDecay:.01,seed:42,wallDensity:.15,territoryBonus:.5,checkpointInterval:20,evalFraction:.5},k=24,M=k*k,g=Math.ceil(M/16),v=160+600*160,P=96;class R{device;pool=new T;archConfig;layout;paramsBuf;boardsBuf;embedBuf;denseBuf;readbackBuf;initPipeline;rolloutPipeline;gaePipeline;ppoPipeline;bindGroup;gaeBindGroup;ppoBindGroup;initBindGroup;adamStep=0;rollout=0;onStats;onBoard;constructor(e){this.archConfig=e,this.layout=x(e.D)}async init(){const e=await navigator.gpu.requestAdapter();if(!e)throw new Error("No GPU adapter");if(!e.features.has("shader-f16"))throw new Error("Your browser does not support the 'shader-f16' WebGPU feature. Please enable it in your browser flags (e.g. chrome://flags/#enable-webgpu-developer-features).");this.device=await e.requestDevice({requiredFeatures:["shader-f16"]}),await this.pool.init();const t=D(this.archConfig.D),a=this.device.createShaderModule({code:t,label:`plague_ppo_D${this.archConfig.D}`});console.log("Worker: Compiling initPipeline..."),this.initPipeline=await this.device.createComputePipelineAsync({layout:"auto",compute:{module:a,entryPoint:"init_boards"}}),console.log("Worker: Compiling rolloutPipeline..."),this.rolloutPipeline=await this.device.createComputePipelineAsync({layout:"auto",compute:{module:a,entryPoint:"rollout_step"}}),console.log("Worker: Compiling gaePipeline..."),this.gaePipeline=await this.device.createComputePipelineAsync({layout:"auto",compute:{module:a,entryPoint:"gae_scan"}}),console.log("Worker: Compiling ppoPipeline (this might take a few seconds)..."),this.ppoPipeline=await this.device.createComputePipelineAsync({layout:"auto",compute:{module:a,entryPoint:"ppo_step"}}),console.log("Worker: All pipelines compiled successfully!");const s=GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC|GPUBufferUsage.COPY_DST,r=GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST,l=GPUBufferUsage.MAP_READ|GPUBufferUsage.COPY_DST,_=i.numBoards;this.paramsBuf=this.device.createBuffer({size:P,usage:r}),this.boardsBuf=this.device.createBuffer({size:_*v,usage:s}),this.embedBuf=this.device.createBuffer({size:this.layout.embedWeightCount*6*2,usage:s}),this.denseBuf=this.device.createBuffer({size:this.layout.denseWeightCount*6*4,usage:s}),this.readbackBuf=this.device.createBuffer({size:_*Math.max(v,4),usage:l});const f=new Float32Array(this.layout.denseWeightCount*4);let c=typeof Float16Array<"u"?new Float16Array(this.layout.embedWeightCount*4):null;if(this.pool.checkpoints.length>0){const d=this.pool.checkpoints[this.pool.checkpoints.length-1];console.log(`Worker: Resuming from IDB checkpoint ${d.id} at rollout ${d.generation}`),this.rollout=d.generation,f.set(d.dense,0),c&&d.embed&&c.set(d.embed,0)}else{let d=12345;const h=()=>(d=d*747796405+2891336453>>>0,d/4294967296);for(let u=0;u<this.layout.denseWeightCount;u++){const p=h(),m=h();f[u]=Math.sqrt(-2*Math.log(p+1e-12))*Math.cos(2*Math.PI*m)*.1}if(c)for(let u=0;u<this.layout.embedWeightCount;u++)c[u]=(h()-.5)*.02}this.device.queue.writeBuffer(this.denseBuf,0,f),c&&this.device.queue.writeBuffer(this.embedBuf,0,c),this.initBindGroup=this.device.createBindGroup({layout:this.initPipeline.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:this.paramsBuf}},{binding:1,resource:{buffer:this.boardsBuf}}]}),this.bindGroup=this.device.createBindGroup({layout:this.rolloutPipeline.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:this.paramsBuf}},{binding:1,resource:{buffer:this.boardsBuf}},{binding:2,resource:{buffer:this.embedBuf}},{binding:3,resource:{buffer:this.denseBuf}}]}),this.gaeBindGroup=this.device.createBindGroup({layout:this.gaePipeline.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:this.paramsBuf}},{binding:1,resource:{buffer:this.boardsBuf}}]}),this.ppoBindGroup=this.device.createBindGroup({layout:this.ppoPipeline.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:this.paramsBuf}},{binding:1,resource:{buffer:this.boardsBuf}},{binding:2,resource:{buffer:this.embedBuf}},{binding:3,resource:{buffer:this.denseBuf}}]})}writeParams(e,n,t){const a=new ArrayBuffer(P),s=new Uint32Array(a),r=new Float32Array(a);s[0]=i.numBoards,s[1]=e,s[2]=i.seed+this.rollout,s[3]=i.maxSteps,s[4]=this.adamStep,s[5]=n?1:0,r[8]=i.lr,r[9]=i.beta1,r[10]=i.beta2,r[11]=i.epsAdam,r[12]=i.epsilonClip,r[13]=i.c1Value,r[14]=i.c2Entropy,r[15]=i.gamma,r[16]=i.gaeLambda,r[17]=i.gradClip,r[18]=i.weightDecay,r[19]=t,r[20]=i.territoryBonus,r[21]=i.wallDensity,this.device.queue.writeBuffer(this.paramsBuf,0,a)}initBoards(){const e=this.device.createCommandEncoder(),n=e.beginComputePass();n.setPipeline(this.initPipeline),n.setBindGroup(0,this.initBindGroup),n.dispatchWorkgroups(i.numBoards),n.end(),this.device.queue.submit([e.finish()])}async runStep(){const e=performance.now();let n=!1,t=null,a=-1;this.rollout>0&&this.rollout%i.checkpointInterval===0&&await this.saveCheckpoint(),Math.random()<i.evalFraction&&(t=this.pool.sampleOpponent(),t&&(n=!0,this.device.queue.writeBuffer(this.denseBuf,this.layout.denseWeightCount*3*4,t.dense.buffer),this.device.queue.writeBuffer(this.embedBuf,this.layout.embedWeightCount*3*2,t.embed.buffer)));let s=1;n&&t&&(s=1/(1/(1+Math.pow(10,(t.elo-this.pool.currentElo)/400))+.1)),this.writeParams(0,n,s),this.initBoards();for(let u=0;u<i.maxSteps;u++){this.writeParams(u,n,s);const p=this.device.createCommandEncoder(),m=p.beginComputePass();if(m.setPipeline(this.rolloutPipeline),m.setBindGroup(0,this.bindGroup),m.dispatchWorkgroups(i.numBoards),m.end(),this.device.queue.submit([p.finish()]),u%20===0&&await this.allGamesDone())break}if(n&&t){const u=await this.getWinRate();a=u;const p=u===.5,m=u>.5;this.pool.updateElo(t.elo,m,p)}await this.captureBoard(),this.writeParams(0,n,s);{const u=this.device.createCommandEncoder(),p=u.beginComputePass();p.setPipeline(this.gaePipeline),p.setBindGroup(0,this.gaeBindGroup),p.dispatchWorkgroups(Math.ceil(i.numBoards/64)),p.end(),this.device.queue.submit([u.finish()])}for(let u=0;u<i.ppoEpochs;u++){this.writeParams(0,n,s);const p=this.device.createCommandEncoder(),m=p.beginComputePass();m.setPipeline(this.ppoPipeline),m.setBindGroup(0,this.ppoBindGroup),m.dispatchWorkgroups(i.numBoards),m.end(),this.device.queue.submit([p.finish()])}await this.device.queue.onSubmittedWorkDone();const l=(await this.readStepCounts()).reduce((u,p)=>u+p,0);this.adamStep+=Math.round(l/i.numBoards);const _=l/i.numBoards,f=await this.readLoss(),c=performance.now()-e,d=i.numBoards/c*1e3,h=c>0?l/c*1e3:0;this.rollout++,this.onStats&&this.onStats({rollout:this.rollout,games:this.rollout*i.numBoards,loss:f,elo:this.pool.currentElo,timeMs:c,trainedGamesPerSec:d,trainedStepsPerSec:h,avgStepsPerGame:_,winRate:a,entropy:0})}async allGamesDone(){const e=this.device.createCommandEncoder();for(let a=0;a<i.numBoards;a++)e.copyBufferToBuffer(this.boardsBuf,a*v+144,this.readbackBuf,a*4,4);this.device.queue.submit([e.finish()]),await this.readbackBuf.mapAsync(GPUMapMode.READ);const t=new Uint32Array(this.readbackBuf.getMappedRange().slice(0,i.numBoards*4)).every(a=>a!==0);return this.readbackBuf.unmap(),t}async getWinRate(){const e=this.device.createCommandEncoder();for(let r=0;r<i.numBoards;r++)e.copyBufferToBuffer(this.boardsBuf,r*v,this.readbackBuf,r*g*4,g*4);this.device.queue.submit([e.finish()]),await this.readbackBuf.mapAsync(GPUMapMode.READ);const n=new Uint32Array(this.readbackBuf.getMappedRange().slice(0,i.numBoards*g*4));let t=0,a=0;for(let r=0;r<i.numBoards;r++){let l=0,_=0;for(let f=0;f<g;f++){let c=n[r*g+f];for(let d=0;d<16;d++){const h=c>>d*2&3;h===1?l++:h===2&&_++}}l>_?t++:_>l&&a++}this.readbackBuf.unmap();const s=t+a;return s>0?t/s:.5}async captureBoard(){if(!this.onBoard)return;const e=this.device.createCommandEncoder();e.copyBufferToBuffer(this.boardsBuf,0,this.readbackBuf,0,g*4),this.device.queue.submit([e.finish()]),await this.readbackBuf.mapAsync(GPUMapMode.READ);const n=new Uint32Array(this.readbackBuf.getMappedRange().slice(0,g*4)),t=new Uint32Array(n);this.readbackBuf.unmap(),this.rollout%10===0&&console.log("captureBoard packed:",t[0],t[1]),this.onBoard(t)}async readLoss(){const e=this.device.createCommandEncoder();for(let t=0;t<i.numBoards;t++)e.copyBufferToBuffer(this.boardsBuf,t*v+160+8,this.readbackBuf,t*4,4);this.device.queue.submit([e.finish()]),await this.readbackBuf.mapAsync(GPUMapMode.READ);let n=0;if(typeof Float16Array<"u"){const t=new Float16Array(this.readbackBuf.getMappedRange().slice(0,i.numBoards*4));for(let a=0;a<i.numBoards;a++)n+=t[a*2]}return this.readbackBuf.unmap(),n/i.numBoards}async readStepCounts(){const e=this.device.createCommandEncoder();for(let a=0;a<i.numBoards;a++)e.copyBufferToBuffer(this.boardsBuf,a*v+152,this.readbackBuf,a*4,4);this.device.queue.submit([e.finish()]),await this.readbackBuf.mapAsync(GPUMapMode.READ);const n=new Uint32Array(this.readbackBuf.getMappedRange().slice(0,i.numBoards*4)),t=new Uint32Array(n);return this.readbackBuf.unmap(),t}async readWeights(){const e=this.layout.denseWeightCount*4,n=this.layout.embedWeightCount*2,t=e+n,a=this.device.createCommandEncoder();a.copyBufferToBuffer(this.denseBuf,0,this.readbackBuf,0,e),a.copyBufferToBuffer(this.embedBuf,0,this.readbackBuf,e,n),this.device.queue.submit([a.finish()]),await this.readbackBuf.mapAsync(GPUMapMode.READ);const s=this.readbackBuf.getMappedRange(0,t),r=new Float32Array(new Float32Array(s,0,this.layout.denseWeightCount)),l=new Float16Array(new Float16Array(s,e,this.layout.embedWeightCount));return this.readbackBuf.unmap(),{dense:r,embed:l}}async saveCheckpoint(){const e=this.layout.denseWeightCount*4,n=this.layout.embedWeightCount*2,t=e+n,a=this.device.createCommandEncoder();a.copyBufferToBuffer(this.denseBuf,0,this.readbackBuf,0,e),a.copyBufferToBuffer(this.embedBuf,0,this.readbackBuf,e,n),this.device.queue.submit([a.finish()]),await this.readbackBuf.mapAsync(GPUMapMode.READ);const s=this.readbackBuf.getMappedRange(0,t),r=new Float32Array(new Float32Array(s,0,this.layout.denseWeightCount));let l=new Float16Array(this.layout.embedWeightCount);typeof Float16Array<"u"&&(l=new Float16Array(new Float16Array(s,e,this.layout.embedWeightCount))),this.readbackBuf.unmap(),await this.pool.saveCheckpoint(l,r,this.rollout)}}let w,B=!1;self.onmessage=async o=>{const{type:e}=o.data;e==="START_LEAGUE"?await O():e==="PAUSE"?(B=!0,self.postMessage({type:"LOG",msg:"League paused"})):e==="RESUME"&&(B=!1,self.postMessage({type:"LOG",msg:"League resumed"}))};async function O(){try{w=new A(y);for(const o of y){self.postMessage({type:"LOG",msg:`Initializing ${o.name} (D=${o.D})...`});const e=new R(o);e.onStats=n=>{const t=w.archs.find(a=>a.config.name===o.name);t&&(t.latestLoss=n.loss,t.latestGamesPerSec=n.trainedGamesPerSec)},e.onBoard=n=>{self.postMessage({type:"BOARD",board:n,arch:o.name})},await e.init(),w.trainers.set(o.name,e),self.postMessage({type:"LOG",msg:`${o.name} ready`})}for(self.postMessage({type:"LOG",msg:"League initialized — starting training"});;){if(B){await new Promise(e=>setTimeout(e,100));continue}const o=await w.runStep();self.postMessage({type:"LEAGUE_STATS",stats:o})}}catch(o){const e=o instanceof Error?o.message:String(o);self.postMessage({type:"ERROR",message:e})}}export{x as c};
+//# sourceMappingURL=league_worker-B6vDmW4T.js.map
