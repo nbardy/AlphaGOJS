@@ -49,13 +49,16 @@ export class CheckpointPool {
 
   sampleOpponent(): Checkpoint | null {
     if (this.checkpoints.length === 0) return null;
-    // heavily bias towards recent checkpoints
-    const idx = Math.floor(Math.random() * this.checkpoints.length);
+    // Exponential recency bias: u^0.5 maps uniform [0,1] toward higher indices (recent checkpoints)
+    const u = Math.random();
+    const biased = Math.floor(Math.pow(u, 0.5) * this.checkpoints.length);
+    const idx = Math.min(biased, this.checkpoints.length - 1);
     return this.checkpoints[idx];
   }
 
   updateElo(opponentElo: number, currentWon: boolean, draw: boolean) {
-    const expected = 1 / (1 + Math.pow(10, (this.currentElo - opponentElo) / 400));
+    // Standard Elo: expected_A = 1 / (1 + 10^((R_B - R_A) / 400))
+    const expected = 1 / (1 + Math.pow(10, (opponentElo - this.currentElo) / 400));
     const actual = draw ? 0.5 : (currentWon ? 1 : 0);
     this.currentElo += this.eloK * (actual - expected);
     return this.currentElo;

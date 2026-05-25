@@ -50,6 +50,7 @@ export class GPUTrainer {
   bindGroup!: GPUBindGroup;
   gaeBindGroup!: GPUBindGroup;
   ppoBindGroup!: GPUBindGroup;
+  initBindGroup!: GPUBindGroup;
   
   adamStep = 0;
   rollout = 0;
@@ -69,6 +70,9 @@ export class GPUTrainer {
     this.device = await adapter.requestDevice({
       requiredFeatures: ["shader-f16"],
     });
+
+    // Initialize checkpoint pool from IDB before checking for saved checkpoints
+    await this.pool.init();
 
     const shaderModule = this.device.createShaderModule({ code: wgsl, label: "plague_ppo" });
 
@@ -300,12 +304,13 @@ export class GPUTrainer {
       pass.end();
       this.device.queue.submit([encoder.finish()]);
       
-      this.adamStep += 23; // approx avg steps
     }
-    
+
     await this.device.queue.onSubmittedWorkDone();
     const stepCounts = await this.readStepCounts();
     const totalSteps = stepCounts.reduce((sum, count) => sum + count, 0);
+    // Use actual step counts from GPU instead of hardcoded approximation
+    this.adamStep += Math.round(totalSteps / CONFIG.numBoards);
     const avgSteps = totalSteps / CONFIG.numBoards;
     const finalLoss = await this.readLoss();
     const time = performance.now() - start;
