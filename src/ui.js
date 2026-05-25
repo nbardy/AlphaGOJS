@@ -34,6 +34,7 @@ export class UI {
     this.lastGeneration = -1;
     this._chartsDirty = true;
     this.charts = {};
+    this._chartWaitKey = '';
 
     this._buildDOM();
     this._startLoop();
@@ -56,6 +57,9 @@ export class UI {
     }
     this.pipelineType = pipelineType || 'cpu_actors_gpu_learner';
     this.gameType = gameType || 'plague_walls';
+    var benchExtras = Object.assign({}, this.config.benchRuntimeExtras || {}, {
+      tfBackendPreference: this.config.tfBackendPreference || 'auto'
+    });
     var pipeline = this.config.createPipeline(
       modelType, algoType,
       this.config.rows || this.rows,
@@ -63,8 +67,7 @@ export class UI {
       this.config.numGames || this.trainer.numGames,
       this.pipelineType,
       this.gameType,
-      this.config.benchRuntimeExtras || {},
-      this.config.leagueRuntimeOverrides
+      benchExtras
     );
     this.pipelineType = pipeline.pipelineType || this.pipelineType;
     this.trainer = pipeline.trainer;
@@ -142,7 +145,9 @@ export class UI {
       '.sr { color:#ff3366; }',
       '.controls-row { margin-top:12px; }',
       '.controls-row button { margin:0 5px; }',
-      '#charts-section { margin-top:20px; }',
+      '#error-banner { display:none; margin:12px auto 0; max-width:820px; padding:10px 14px; border-radius:6px; border:1px solid #664422; background:#2a1810; color:#ffbb88; font-size:12px; line-height:1.45; text-align:left; }',
+      '#error-banner a { color:#88ccff; }',
+      '#charts-hint { text-align:center; font-size:11px; color:#667; margin:8px auto 0; max-width:820px; line-height:1.4; }',
       '#charts-section h2 { font-size:15px; color:#4488ff; margin-bottom:10px; text-align:center; }',
       '#charts-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; max-width:820px; margin:0 auto; }',
       '@media (max-width:600px) { #charts-grid { grid-template-columns:1fr; } }',
@@ -285,11 +290,16 @@ export class UI {
     var header = document.createElement('header');
     var leagueMode = !!this.config.leagueMode;
     var homeHref = this.config.homeHref || 'index.html';
+    var gridDesc = this.rows + '\u00d7' + this.cols + ', ' + this.trainer.numGames + ' games';
     var subLine = leagueMode
-      ? 'League training (all architectures, unified Elo) &mdash; <a href="' + homeHref + '" style="color:#88aaff;">Single-model training</a>'
-      : 'Self-play RL &mdash; plague territory with random walls &mdash; 80 games live &mdash; <a href="league.html" style="color:#88aaff;">League mode</a>';
+      ? 'League training (all architectures, unified Elo) &mdash; ' + gridDesc
+        + ' &mdash; <a href="' + homeHref + '" style="color:#88aaff;">Single-model training</a>'
+      : 'Self-play RL &mdash; plague territory &mdash; ' + gridDesc
+        + ' &mdash; <a href="league.html" style="color:#88aaff;">League mode</a>'
+        + ' &mdash; <a href="?preset=fast" style="color:#88aaff;">Fast preset</a>';
     header.innerHTML = '<h1>AlphaPlague</h1>'
       + '<div class="subtitle">' + subLine + '</div>'
+      + '<div id="error-banner"></div>'
       + '<div id="stats">'
       + '<div class="stat"><div class="label">Games</div><div class="value" id="sg">0</div></div>'
       + '<div class="stat"><div class="label">Gen</div><div class="value" id="sgen">0</div></div>'
@@ -484,7 +494,8 @@ export class UI {
     // Charts section
     var chartsSection = document.createElement('div');
     chartsSection.id = 'charts-section';
-    chartsSection.innerHTML = '<h2>Training Metrics</h2>';
+    chartsSection.innerHTML = '<h2>Training Metrics</h2>'
+      + '<div id="charts-hint">Charts populate after generation 1 (first PPO train, ~30 finished games on default grid).</div>';
     var chartsGrid = document.createElement('div');
     chartsGrid.id = 'charts-grid';
 
@@ -732,8 +743,45 @@ export class UI {
     }
   }
 
+  _updateWorkerErrorBanner(s) {
+    var el = document.getElementById('error-banner');
+    if (!el) return;
+    var err = s && s.lastWorkerError;
+    if (err) {
+      el.style.display = 'block';
+      var tfHint = this.config.tfBackendPreference === 'webgpu' || this.config.tfBackendPreference === 'auto'
+        ? ' Try <a href="?tfBackend=webgl">?tfBackend=webgl</a> or <a href="?tfBackend=cpu">?tfBackend=cpu</a>.'
+        : '';
+      el.innerHTML = '<strong>GPU worker error:</strong> ' + err + tfHint;
+      return;
+    }
+    if (s && s.workerReady === false && this._isGpuWorkerPipeline()) {
+      el.style.display = 'block';
+      el.innerHTML = 'GPU worker starting\u2026';
+      return;
+    }
+    el.style.display = 'none';
+    el.textContent = '';
+  }
+
+  _chartWaitingMessage(s) {
+    var games = s && typeof s.gamesCompleted === 'number' ? s.gamesCompleted : 0;
+    var gen = s && typeof s.generation === 'number' ? s.generation : 0;
+    if (s && s.lastWorkerError) {
+      return 'Worker error — fix above\nCharts need generation 1';
+    }
+    if (gen <= 0 && games <= 0) {
+      return 'Waiting for generation 1\n(~30 finished games)';
+    }
+    if (gen <= 0) {
+      return 'Waiting for generation 1\n' + games + ' games done';
+    }
+    return 'Waiting for data...';
+  }
+
   _updateStats() {
     var s = this.trainer.getStats();
+    this._updateWorkerErrorBanner(s);
     document.getElementById('sg').textContent = s.gamesCompleted;
     document.getElementById('sgen').textContent = s.generation;
     document.getElementById('sloss').textContent = s.loss ? s.loss.toFixed(4) : '\u2014';
@@ -791,8 +839,16 @@ export class UI {
       document.getElementById('sckpt').textContent = ckptWr > 0 ? (ckptWr * 100).toFixed(0) + '%' : '\u2014';
     }
     var last = this.metrics.last();
-    if (last) {
+    if (typeof s.entropy === 'number' && Number.isFinite(s.entropy)) {
+      document.getElementById('sentr').textContent = s.entropy.toFixed(3);
+    } else if (last) {
       document.getElementById('sentr').textContent = last.entropy.toFixed(3);
+    }
+
+    var waitKey = (s.lastWorkerError || '') + ':' + s.gamesCompleted + ':' + s.generation;
+    if (this._chartWaitKey !== waitKey) {
+      this._chartWaitKey = waitKey;
+      this._chartsDirty = true;
     }
   }
 
@@ -841,6 +897,9 @@ export class UI {
     var data = this.metrics.length > 0;
     var last = data ? this.metrics.last() : null;
     var leagueMulti = !!(last && last.multiModel && this.config.listModelTypes);
+    var stats = this.trainer.getStats ? this.trainer.getStats() : {};
+    var waitingMessage = this._chartWaitingMessage(stats);
+    var emptyChartOpts = data ? {} : { waitingMessage: waitingMessage };
 
     if (leagueMulti) {
       var modelTypes = this.config.listModelTypes();
@@ -885,43 +944,43 @@ export class UI {
       }
       var minY = Math.min.apply(null, allY) - 40;
       var maxY = Math.max.apply(null, allY) + 40;
-      drawLineChart(this.charts.elo, [], {
+      drawLineChart(this.charts.elo, [], Object.assign({
         title: 'League Elo (per architecture)',
         refLine: 1000,
         refColor: '#444466',
         series: series,
         minY: minY,
         maxY: maxY
-      });
+      }, emptyChartOpts));
     } else {
-      drawLineChart(this.charts.elo, data ? this.metrics.getSeries('elo') : [], {
+      drawLineChart(this.charts.elo, data ? this.metrics.getSeries('elo') : [], Object.assign({
         title: 'Elo Rating',
         color: '#ffaa00',
         refLine: 1000,
         refColor: '#444466'
-      });
+      }, emptyChartOpts));
     }
-    drawLineChart(this.charts.ckptWin, data ? this.metrics.getSeries('checkpointWinRate').map(function (v) { return v * 100; }) : [], {
+    drawLineChart(this.charts.ckptWin, data ? this.metrics.getSeries('checkpointWinRate').map(function (v) { return v * 100; }) : [], Object.assign({
       title: 'Win% vs Checkpoints',
       color: '#00ff88',
       minY: 0,
       maxY: 100,
       refLine: 50,
       refColor: '#444466'
-    });
-    drawLineChart(this.charts.loss, data ? this.metrics.getSeries('loss') : [], {
+    }, emptyChartOpts));
+    drawLineChart(this.charts.loss, data ? this.metrics.getSeries('loss') : [], Object.assign({
       title: 'Training Loss',
       color: '#ffcc00'
-    });
-    drawLineChart(this.charts.entropy, data ? this.metrics.getSeries('entropy') : [], {
+    }, emptyChartOpts));
+    drawLineChart(this.charts.entropy, data ? this.metrics.getSeries('entropy') : [], Object.assign({
       title: 'Policy Entropy',
       color: '#ff66aa'
-    });
-    drawLineChart(this.charts.avgLen, data ? this.metrics.getSeries('avgGameLength') : [], {
+    }, emptyChartOpts));
+    drawLineChart(this.charts.avgLen, data ? this.metrics.getSeries('avgGameLength') : [], Object.assign({
       title: 'Avg Game Length',
       color: '#66ccff'
-    });
-    drawLineChart(this.charts.selfPlay, [], {
+    }, emptyChartOpts));
+    drawLineChart(this.charts.selfPlay, [], Object.assign({
       title: 'P1 / P2 / Draw %',
       minY: 0,
       maxY: 100,
@@ -932,7 +991,7 @@ export class UI {
         { data: this.metrics.getSeries('selfPlayP2Rate').map(function (v) { return v * 100; }), color: '#ff3366', label: 'P2' },
         { data: this.metrics.getSeries('selfPlayDrawRate').map(function (v) { return v * 100; }), color: '#888888', label: 'Draw' }
       ] : []
-    });
+    }, emptyChartOpts));
   }
 
   _startLoop() {

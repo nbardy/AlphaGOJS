@@ -9,7 +9,7 @@
   if (proto.writeBuffer.__alphaPlagueChunkShim) return;
 
   /** Multiple of 256 for dest alignment; keep small for strict per-call caps (WebKit). */
-  var CHUNK = 2048;
+  var CHUNK = 256;
   var orig = proto.writeBuffer;
 
   proto.writeBuffer = function (destination, destinationOffset, data, dataOffset, size) {

@@ -1,8 +1,8 @@
 // Perspective NN cell codes for discrete-input models (matches float getBoardForNN semantics).
 // 0 empty, 1 own, 2 opponent, 3 wall (wall is not flipped by player).
 
-import { PLAGUE_WALL_CELL } from './engine/plague_walls_layout';
-import { CELL_EMPTY, CELL_P1, CELL_P2, CELL_WALL } from './engine/webgpu_plague_spread_engine';
+import { PLAGUE_WALL_CELL } from './engine/plague_walls_layout.js';
+import { CELL_EMPTY, CELL_P1, CELL_P2, CELL_WALL } from './engine/webgpu_plague_spread_engine.js';
 
 /**
  * @param {number} u - packed WGSL cell (CELL_*)

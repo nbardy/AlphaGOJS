@@ -10,7 +10,7 @@ import { chooseRuntimeTier } from './nextgen/runtime_planner';
 import { CheckpointPool } from './checkpoint_pool';
 import { resolveRuntimeSpec, listRuntimeTypes } from './runtime/runtime_registry';
 import { UI } from './ui';
-import { ensureBestTfBackendOnce } from './tf_backend_bootstrap';
+import { ensureBestTfBackendOnce, parseTfBackendQueryParam, setTfBackendPreference } from './tf_backend_bootstrap';
 
 // --- Configuration ---
 var ROWS = 20;
@@ -53,6 +53,7 @@ function parseRuntimeQueryOverrides() {
     return {
       pipelineType: null,
       benchRuntimeExtras: emptyBench,
+      tfBackendPreference: 'auto',
       rows: ROWS,
       cols: COLS,
       numGames: NUM_GAMES
@@ -82,6 +83,7 @@ function parseRuntimeQueryOverrides() {
   return {
     pipelineType: pl || null,
     benchRuntimeExtras: bench,
+    tfBackendPreference: parseTfBackendQueryParam(p),
     rows: parseClampedPositiveIntParam(p, 'rows', rowsDefault, 4, 32),
     cols: parseClampedPositiveIntParam(p, 'cols', colsDefault, 4, 32),
     numGames: parseClampedPositiveIntParam(p, 'numGames', numGamesDefault, 4, 128)
@@ -146,7 +148,8 @@ export function createPipeline(modelType, algoType, rows, cols, numGames, pipeli
 
   if (runtimeSpec.pipelineKind === 'gpu_worker') {
     var workerOptions = Object.assign({}, runtimeOptions, benchX, {
-      pipelineTypeOverride: requestedRuntimeId
+      pipelineTypeOverride: requestedRuntimeId,
+      tfBackendPreference: benchX.tfBackendPreference || 'auto'
     });
     return createGPUWorkerPipeline(
       modelType,
@@ -207,20 +210,27 @@ async function start() {
   }
 
   var q = parseRuntimeQueryOverrides();
+  setTfBackendPreference(q.tfBackendPreference);
   if (q.pipelineType) {
     pipelineType = q.pipelineType;
   }
 
   var runtimeSpec = resolveRuntimeSpec(pipelineType);
-  var tfBackendMain = 'gpu worker';
-  if (runtimeSpec.pipelineKind !== 'gpu_worker') {
-    tfBackendMain = await ensureBestTfBackendOnce();
-  }
-
-  var benchExtras = q.benchRuntimeExtras || {};
   var rows = q.rows;
   var cols = q.cols;
   var numGames = q.numGames;
+  var tfBackendMain = 'gpu worker';
+  if (runtimeSpec.pipelineKind !== 'gpu_worker') {
+    tfBackendMain = await ensureBestTfBackendOnce(q.tfBackendPreference, {
+      rows: rows,
+      cols: cols,
+      trainBatchSize: runtimeSpec.options.trainBatchSize || 512
+    });
+  }
+
+  var benchExtras = Object.assign({}, q.benchRuntimeExtras || {}, {
+    tfBackendPreference: q.tfBackendPreference
+  });
 
   var pipeline;
   try {
@@ -241,6 +251,7 @@ async function start() {
     listAlgorithmTypes: listAlgorithmTypes,
     listRuntimeTypes: listRuntimeTypes,
     benchRuntimeExtras: benchExtras,
+    tfBackendPreference: q.tfBackendPreference,
     tfBackendMain: tfBackendMain
   });
   window.__alphaPlague = ui;

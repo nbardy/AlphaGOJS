@@ -50,6 +50,7 @@ export class GPUWorkerTrainerProxy {
     this._trainInFlightQueueCap = Math.max(0, config.trainInFlightQueueCap || 0);
     this._nextRequestId = 1;
     this._pending = {};
+    this._lastWorkerError = null;
 
     this._onMessage = this._onMessage.bind(this);
     this.worker.addEventListener('message', this._onMessage);
@@ -66,6 +67,7 @@ export class GPUWorkerTrainerProxy {
 
     if (data.type === MSG.READY) {
       this._ready = true;
+      this._lastWorkerError = null;
       this._flushTicks();
       return;
     }
@@ -112,7 +114,9 @@ export class GPUWorkerTrainerProxy {
     }
 
     if (data.type === MSG.ERROR) {
-      console.warn('GPU worker error:', data.message);
+      this._lastWorkerError = data.message || 'Unknown GPU worker error';
+      console.warn('GPU worker error:', this._lastWorkerError);
+      return;
     }
   }
 
@@ -162,7 +166,9 @@ export class GPUWorkerTrainerProxy {
       queueDepth: this._queuedSteps,
       queueSoftCap: softCap,
       queueSoftCapFraction: this._queueSoftCapFraction,
-      tickInFlight: this._tickInFlight
+      tickInFlight: this._tickInFlight,
+      lastWorkerError: this._lastWorkerError,
+      workerReady: this._ready
     });
   }
 

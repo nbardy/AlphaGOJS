@@ -2,6 +2,8 @@ const path = require('path');
 const HtmlWebpackPlugin = require('html-webpack-plugin');
 const CopyPlugin = require('copy-webpack-plugin');
 
+const faviconPath = path.resolve(__dirname, 'assets/favicon.svg');
+
 module.exports = {
   entry: {
     app: './src/app.js',
@@ -24,12 +26,14 @@ module.exports = {
     new HtmlWebpackPlugin({
       title: 'AlphaPlague - Self-Play RL',
       filename: 'index.html',
-      chunks: ['app']
+      chunks: ['app'],
+      favicon: faviconPath
     }),
     new HtmlWebpackPlugin({
       title: 'AlphaPlague — League',
       filename: 'league.html',
-      chunks: ['league']
+      chunks: ['league'],
+      favicon: faviconPath
     }),
     new CopyPlugin({
       patterns: [

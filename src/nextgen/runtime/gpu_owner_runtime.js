@@ -1,5 +1,5 @@
 import * as tf from '@tensorflow/tfjs';
-import { ensureBestTfBackendOnce, getTfWebGpuDeviceIfAvailable } from '../../tf_backend_bootstrap';
+import { ensureBestTfBackendOnce, getTfWebGpuDeviceIfAvailable, resetTfBackendChoice } from '../../tf_backend_bootstrap';
 import { statesRowsToModelInputTensor } from '../../action';
 import { nnPerspectiveFloatBoardToCodes } from '../../nn_cell_codes';
 import { createModel } from '../../model_registry';
@@ -82,7 +82,11 @@ export class GPUOwnerRuntime {
   async init(config) {
     config = config || {};
     await this.dispose();
-    await ensureBestTfBackendOnce();
+    await ensureBestTfBackendOnce(config.tfBackendPreference || 'auto', {
+      rows: config.rows,
+      cols: config.cols,
+      trainBatchSize: config.trainBatchSize
+    });
 
     this._disposed = false;
     this._ready = false;
@@ -179,6 +183,8 @@ export class GPUOwnerRuntime {
         }
       }
     }
+
+    await this._fallbackToCpuIfWebGpuForwardFails(config, useMulti, modelTypes, algoType, poolCfg);
 
     var useWebGpuEnv = !!config.useWebGPUGameEngine && this.gameType === 'plague_walls';
     if (useWebGpuEnv) {
@@ -291,6 +297,72 @@ export class GPUOwnerRuntime {
 
   async restart(config) {
     return this.init(config);
+  }
+
+  async _fallbackToCpuIfWebGpuForwardFails(config, useMulti, modelTypes, algoType, poolCfg) {
+    if (tf.getBackend() !== 'webgpu') return;
+    if (config.tfBackendPreference === 'webgpu') return;
+
+    var probeModel = useMulti ? this.models[0] : this.model;
+    if (!probeModel) return;
+
+    try {
+      var batch = 2;
+      var states = [];
+      for (var i = 0; i < batch; i++) {
+        states.push(new Float32Array(this.boardSize));
+      }
+      var input = statesRowsToModelInputTensor(probeModel, states, batch);
+      var fwd = probeModel.forward(input);
+      await fwd.policy.data();
+      tf.dispose([input, fwd.policy, fwd.value]);
+      return;
+    } catch (e) {
+      var msg = e && e.message ? e.message : String(e);
+      if (typeof console !== 'undefined' && console.warn) {
+        console.warn('[gpu_owner] WebGPU model forward probe failed, switching to CPU backend:', msg);
+      }
+    }
+
+    resetTfBackendChoice();
+    await ensureBestTfBackendOnce('cpu');
+
+    if (useMulti) {
+      var rowsR = this.rows;
+      var colsR = this.cols;
+      this.models = [];
+      this.algos = [];
+      this.pools = [];
+      for (var mi = 0; mi < this._numModels; mi++) {
+        (function (tid) {
+          var m = createModel(tid, rowsR, colsR);
+          this.models.push(m);
+          this.algos.push(createAlgorithm(algoType, m));
+          this.pools.push(
+            new CheckpointPool(function () {
+              return createModel(tid, rowsR, colsR);
+            }, poolCfg)
+          );
+        }).call(this, modelTypes[mi]);
+      }
+      for (var ax = 0; ax < this.algos.length; ax++) {
+        var ag = this.algos[ax];
+        if (ag && typeof ag.maxBufferSize === 'number' && ag.maxBufferSize > 10000) {
+          ag.maxBufferSize = 10000;
+        }
+      }
+      this.model = this.models[0];
+      this.algo = this.algos[0];
+      this.pool = this.pools[0];
+      return;
+    }
+
+    var modelType = config.modelType || 'spatial_lite';
+    this.model = createModel(modelType, this.rows, this.cols);
+    this.algo = createAlgorithm(algoType, this.model);
+    this.pool = new CheckpointPool(function () {
+      return createModel(modelType, config.rows || 20, config.cols || 20);
+    }, poolCfg);
   }
 
   _fallbackAction(mask) {

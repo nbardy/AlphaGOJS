@@ -68,7 +68,8 @@ export function createLeaguePipeline(
     pipelineTypeOverride: requestedRuntimeId,
     multiModel: true,
     modelTypes: modelTypes,
-    trainInterval: trainInt
+    trainInterval: trainInt,
+    tfBackendPreference: benchX.tfBackendPreference || 'auto'
   });
   if (typeof l.trainBatchSize === 'number' && l.trainBatchSize >= 32) {
     workerOptions.trainBatchSize = l.trainBatchSize;

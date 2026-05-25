@@ -37,7 +37,9 @@
     "bench:all": "node benchmarks/run_all_benchmarks.mjs",
     "bench:all:smoke": "node benchmarks/run_all_benchmarks.mjs --smoke",
     "bench:matrix:smoke": "node benchmarks/runtime_matrix_smoke.mjs",
-    "bench:matrix:smoke:skip-build": "node benchmarks/runtime_matrix_smoke.mjs --skip-build"
+    "bench:matrix:smoke:skip-build": "node benchmarks/runtime_matrix_smoke.mjs --skip-build",
+    "launch:verify": "node benchmarks/launch_page_verify.mjs",
+    "launch:verify:dev": "node benchmarks/launch_page_verify.mjs --url=http://localhost:8080/?preset=fast --skip-build-check"
   },
   "keywords": [],
   "author": "",

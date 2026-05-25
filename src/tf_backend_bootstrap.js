@@ -5,6 +5,8 @@
  * The default @tensorflow/tfjs bundle registers WebGL but does not load the WebGPU backend;
  * importing @tensorflow/tfjs-backend-webgpu here registers it so setBackend('webgpu') can succeed.
  *
+ * URL override: ?tfBackend=webgpu|webgl|cpu|auto (aliases: wgpu, gl, wasm).
+ *
  * In a dedicated Worker, skips WebGL (no canvas). Uses one export so webpack worker chunks
  * cannot drop a separate "worker-only" symbol during split-chunk / HMR.
  */
@@ -13,6 +15,38 @@ import * as tf from '@tensorflow/tfjs';
 import '@tensorflow/tfjs-backend-webgpu';
 
 var backendChosen = false;
+var globalPreference = 'auto';
+
+/**
+ * @param {URLSearchParams|string|null|undefined} params
+ * @returns {'auto'|'webgpu'|'webgl'|'cpu'}
+ */
+export function parseTfBackendQueryParam(params) {
+  if (!params) return 'auto';
+  var p = params;
+  if (typeof params === 'string') {
+    p = new URLSearchParams(params.replace(/^\?/, ''));
+  }
+  var raw = p.get('tfBackend');
+  if (!raw) raw = p.get('tfbackend');
+  if (!raw) return 'auto';
+  var v = String(raw).trim().toLowerCase();
+  if (v === 'webgpu' || v === 'wgpu' || v === 'gpu') return 'webgpu';
+  if (v === 'webgl' || v === 'gl') return 'webgl';
+  if (v === 'cpu' || v === 'wasm') return 'cpu';
+  if (v === 'auto') return 'auto';
+  return 'auto';
+}
+
+export function setTfBackendPreference(pref) {
+  globalPreference = pref || 'auto';
+  backendChosen = false;
+}
+
+/** Force re-probing backends (e.g. worker WebGPU → CPU fallback). */
+export function resetTfBackendChoice() {
+  backendChosen = false;
+}
 
 function tfBootstrapInDedicatedWorker() {
   try {
@@ -26,64 +60,138 @@ function tfBootstrapInDedicatedWorker() {
   }
 }
 
+function normalizePreference(pref) {
+  var p = pref || globalPreference || 'auto';
+  if (p === 'webgpu' || p === 'webgl' || p === 'cpu' || p === 'auto') return p;
+  return 'auto';
+}
+
+function logBackendInfo(name, inWorker) {
+  if (typeof console !== 'undefined' && console.info) {
+    console.info('[tf] backend: ' + name + (inWorker ? ' (worker)' : ''));
+  }
+}
+
+function logBackendWarn(label, err) {
+  if (typeof console !== 'undefined' && console.warn) {
+    console.warn(
+      '[tf] ' + label + ':',
+      err && err.message ? err.message : err
+    );
+  }
+}
+
+/**
+ * Run a tensor op sized like a PPO batch upload (batch × board matmul).
+ * @param {{ rows?: number, cols?: number, trainBatchSize?: number }} [probeOptions]
+ * @returns {Promise<boolean>}
+ */
+async function webGpuUploadProbePasses(probeOptions) {
+  probeOptions = probeOptions || {};
+  var rows = probeOptions.rows || 20;
+  var cols = probeOptions.cols || 20;
+  var batchSize = probeOptions.trainBatchSize || 512;
+  var boardSize = rows * cols;
+  try {
+    await tf.ready();
+    var result = tf.tidy(function () {
+      var x = tf.randomUniform([batchSize, boardSize]);
+      var w = tf.randomUniform([boardSize, Math.min(64, boardSize)]);
+      return x.matMul(w);
+    });
+    await result.data();
+    result.dispose();
+    return true;
+  } catch (e) {
+    logBackendWarn('WebGPU upload probe failed', e);
+    return false;
+  }
+}
+
+async function trySetWebGpuBackend(inWorker, probeOptions) {
+  var nav = typeof navigator !== 'undefined' ? navigator : {};
+  if (!nav.gpu) return false;
+  try {
+    var adapter = await nav.gpu.requestAdapter({ powerPreference: 'high-performance' });
+    if (!adapter) return false;
+    var okWg = await tf.setBackend('webgpu');
+    if (!okWg) return false;
+    await tf.ready();
+    if (!(await webGpuUploadProbePasses(probeOptions))) {
+      return false;
+    }
+    logBackendInfo('webgpu', inWorker);
+    return true;
+  } catch (e) {
+    logBackendWarn('WebGPU backend failed', e);
+    return false;
+  }
+}
+
+async function trySetWebGlBackend() {
+  try {
+    var okGl = await tf.setBackend('webgl');
+    if (!okGl) return false;
+    await tf.ready();
+    logBackendInfo('webgl', false);
+    return true;
+  } catch (e) {
+    logBackendWarn('WebGL backend failed', e);
+    return false;
+  }
+}
+
+async function trySetCpuBackend(inWorker) {
+  await tf.setBackend('cpu');
+  await tf.ready();
+  logBackendInfo('cpu', inWorker);
+  return true;
+}
+
 /**
  * WebGPU → (WebGL on main thread only) → CPU.
- * Probes requestAdapter() before setBackend('webgpu'): TF's factory uses adapter.features
- * and throws if adapter is null.
+ * `preference`: force order start; `auto` probes WebGPU with an upload smoke test first.
+ * @param {'auto'|'webgpu'|'webgl'|'cpu'} [preference]
+ * @param {{ rows?: number, cols?: number, trainBatchSize?: number }} [probeOptions]
+ * @returns {Promise<string>}
  */
-export async function ensureBestTfBackendOnce() {
+export async function ensureBestTfBackendOnce(preference, probeOptions) {
   if (backendChosen) {
     return tf.getBackend();
   }
   backendChosen = true;
 
+  var pref = normalizePreference(preference);
   var inWorker = tfBootstrapInDedicatedWorker();
-  var nav = typeof navigator !== 'undefined' ? navigator : {};
-  try {
-    if (nav.gpu) {
-      var adapter = await nav.gpu.requestAdapter({ powerPreference: 'high-performance' });
-      if (adapter) {
-        var okWg = await tf.setBackend('webgpu');
-        if (okWg) {
-          await tf.ready();
-          if (typeof console !== 'undefined' && console.info) {
-            console.info('[tf] backend: webgpu' + (inWorker ? ' (worker)' : ''));
-          }
-          return 'webgpu';
-        }
-      }
+  var order = [];
+
+  if (pref === 'webgpu') {
+    order = ['webgpu', 'cpu'];
+  } else if (pref === 'webgl') {
+    order = inWorker ? ['cpu'] : ['webgl', 'cpu'];
+  } else if (pref === 'cpu') {
+    order = ['cpu'];
+  } else {
+    order = inWorker ? ['webgpu', 'cpu'] : ['webgpu', 'webgl', 'cpu'];
+  }
+
+  for (var i = 0; i < order.length; i++) {
+    var kind = order[i];
+    if (kind === 'webgpu') {
+      if (await trySetWebGpuBackend(inWorker, probeOptions)) return 'webgpu';
+      continue;
     }
-  } catch (e) {
-    if (typeof console !== 'undefined' && console.warn) {
-      console.warn('[tf] WebGPU backend failed:', e && e.message ? e.message : e);
+    if (kind === 'webgl' && !inWorker) {
+      if (await trySetWebGlBackend()) return 'webgl';
+      continue;
+    }
+    if (kind === 'cpu') {
+      await trySetCpuBackend(inWorker);
+      return 'cpu';
     }
   }
 
-  if (!inWorker) {
-    try {
-      var okGl = await tf.setBackend('webgl');
-      if (okGl) {
-        await tf.ready();
-        if (typeof console !== 'undefined' && console.info) {
-          console.info('[tf] backend: webgl');
-        }
-        return 'webgl';
-      }
-    } catch (e2) {
-      if (typeof console !== 'undefined' && console.warn) {
-        console.warn('[tf] WebGL backend failed:', e2 && e2.message ? e2.message : e2);
-      }
-    }
-  }
-
-  await tf.setBackend('cpu');
-  await tf.ready();
-  if (typeof console !== 'undefined' && console.info) {
-    console.info(
-      '[tf] backend: cpu' +
-        (inWorker ? ' (worker — WebGL unavailable in workers)' : '')
-    );
-  }
+  await trySetCpuBackend(inWorker);
   return 'cpu';
 }
 

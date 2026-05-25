@@ -5,6 +5,7 @@ import { createLeaguePipeline } from './league_pipeline';
 import { probeCapabilities } from './nextgen/capability_probe';
 import { chooseRuntimeTier } from './nextgen/runtime_planner';
 import { UI } from './ui';
+import { parseTfBackendQueryParam, setTfBackendPreference } from './tf_backend_bootstrap';
 
 var DEFAULT_ALGO = 'ppo';
 var ROWS = 20;
@@ -76,7 +77,8 @@ function parseLeagueQuery() {
       rows: ROWS,
       cols: COLS,
       numGames: NUM_GAMES,
-      leagueRuntimeOverrides: {}
+      leagueRuntimeOverrides: {},
+      tfBackendPreference: 'auto'
     };
   }
   var p = new URLSearchParams(location.search);
@@ -110,7 +112,8 @@ function parseLeagueQuery() {
     rows: parseClampedPositiveIntParam(p, 'rows', presetFast && !p.has('rows') ? 10 : ROWS, 4, 32),
     cols: parseClampedPositiveIntParam(p, 'cols', presetFast && !p.has('cols') ? 10 : COLS, 4, 32),
     numGames: parseClampedPositiveIntParam(p, 'numGames', presetFast && !p.has('numGames') ? 40 : NUM_GAMES, 4, 128),
-    leagueRuntimeOverrides: leagueRuntimeOverrides
+    leagueRuntimeOverrides: leagueRuntimeOverrides,
+    tfBackendPreference: parseTfBackendQueryParam(p)
   };
 }
 
@@ -132,6 +135,7 @@ async function startLeague() {
   }
 
   var q = parseLeagueQuery();
+  setTfBackendPreference(q.tfBackendPreference);
   if (q.pipelineType) {
     pipelineType = q.pipelineType;
   }
@@ -139,6 +143,10 @@ async function startLeague() {
   var cols = q.cols;
   var numGames = q.numGames;
   var leagueRuntimeOverrides = q.leagueRuntimeOverrides || {};
+
+  var benchExtras = Object.assign({}, q.benchRuntimeExtras || {}, {
+    tfBackendPreference: q.tfBackendPreference
+  });
 
   var pipeline;
   try {
@@ -149,7 +157,7 @@ async function startLeague() {
       numGames,
       pipelineType,
       undefined,
-      q.benchRuntimeExtras,
+      benchExtras,
       leagueRuntimeOverrides
     );
   } catch (e) {
@@ -184,9 +192,10 @@ async function startLeague() {
     listModelTypes: listLeagueModelTypes,
     listAlgorithmTypes: listAlgorithmTypes,
     listRuntimeTypes: listRuntimeTypes,
-    benchRuntimeExtras: q.benchRuntimeExtras,
+    benchRuntimeExtras: benchExtras,
     leagueMode: true,
     homeHref: 'index.html',
+    tfBackendPreference: q.tfBackendPreference,
     tfBackendMain: tfBackendMain
   });
   window.__alphaPlagueLeague = ui;

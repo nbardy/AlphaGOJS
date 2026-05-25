@@ -2,7 +2,7 @@
 // Pure functions: no model, no optimizer, no state.
 
 import * as tf from '@tensorflow/tfjs';
-import { nnCodesToFloatBoard, nnPerspectiveFloatBoardToCodes } from './nn_cell_codes';
+import { nnCodesToFloatBoard, nnPerspectiveFloatBoardToCodes } from './nn_cell_codes.js';
 
 /**
  * Flatten an array of Float32Array states into a single Float32Array
