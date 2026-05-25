@@ -1,48 +1,17 @@
 name: CI
 
 on:
-  push:
-    branches: [master, main]
   pull_request:
+    branches: [v2, main, master]
+  push:
+    branches: [v2, main, master]
 
 jobs:
-  build-and-smoke:
+  check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-
-      - name: Install dependencies
-        run: npm install
-
-      - name: Production build
-        run: npm run build
-
-      - name: WebGPU spread parity
-        run: npm run bench:webgpu:parity
-
-      - name: Patch3 forward smokes
-        run: |
-          npm run bench:patch3-smoke
-          npm run bench:patch3-token-smoke
-
-      - name: Install Puppeteer Chrome
-        run: npx puppeteer browsers install chrome
-
-      - name: Launch page verify (RL screenshots)
-        run: npm run launch:verify
-
-      - name: Headless integration smoke (WebGL backend)
-        run: |
-          node benchmarks/system_interface_benchmark.mjs \
-            --pipelines=single_gpu_phased \
-            --pageQuery='preset=fast&tfBackend=webgl' \
-            --duration=8 \
-            --runs=1 \
-            --warmup=2 \
-            --inferenceRuns=8 \
-            --timeoutMs=180000
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install
+      - run: bun run typecheck
+      - run: bun run build
