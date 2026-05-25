@@ -225,6 +225,7 @@ export class GPUTrainer {
     const start = performance.now();
     let useOpponent = false;
     let opponent: Checkpoint | null = null;
+    let evalWinRate = -1;
 
     if (this.rollout > 0 && this.rollout % CONFIG.checkpointInterval === 0) {
       // Save checkpoint
@@ -269,6 +270,7 @@ export class GPUTrainer {
     // Update Elo if eval
     if (useOpponent && opponent) {
        const winRate = await this.getWinRate();
+       evalWinRate = winRate;
        const isDraw = winRate === 0.5;
        const isWin = winRate > 0.5;
        this.pool.updateElo(opponent.elo, isWin, isDraw);
@@ -323,7 +325,9 @@ export class GPUTrainer {
          timeMs: time,
          trainedGamesPerSec: gamesPerSecTrained,
          trainedStepsPerSec: stepsPerSecTrained,
-         avgStepsPerGame: avgSteps
+         avgStepsPerGame: avgSteps,
+         winRate: evalWinRate,
+         entropy: 0
       });
     }
   }
