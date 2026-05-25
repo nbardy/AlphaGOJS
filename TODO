@@ -1,4 +1,0 @@
-Possibly use one synced data per round
-Change the gameEnded to be faster by not syncing data.
-
-Make getMoveRandom faster not syncing to check for empty state.

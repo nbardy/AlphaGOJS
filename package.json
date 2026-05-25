@@ -1,47 +1,20 @@
 {
-  "name": "ml-blog",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
-  "dependencies": {
-    "@tensorflow/tfjs": "^4.22.0",
-    "@tensorflow/tfjs-backend-wasm": "^4.22.0",
-    "@tensorflow/tfjs-backend-webgpu": "^4.22.0"
+  "name": "alphagojs_v2",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
   },
   "devDependencies": {
-    "copy-webpack-plugin": "^12.0.0",
-    "html-webpack-plugin": "^5.6.0",
-    "patch-package": "^8.0.1",
-    "puppeteer": "^24.37.5",
-    "webgpu": "^0.3.8",
-    "webpack": "^5.97.0",
-    "webpack-cli": "^6.0.0",
-    "webpack-dev-server": "^5.2.0"
+    "@types/bun": "latest",
+    "@webgpu/types": "^0.1.69",
+    "puppeteer": "^24.40.0",
+    "vite": "^8.0.3"
   },
-  "scripts": {
-    "postinstall": "patch-package",
-    "dev": "webpack serve",
-    "build": "webpack --config webpack.prod.js",
-    "build:dev": "webpack --config webpack.config.js",
-    "bench:webgpu:node": "node benchmarks/node_webgpu_benchmark.mjs",
-    "bench:webgpu:browser": "echo \"Open benchmarks/browser_webgpu_benchmark.html in a WebGPU-capable browser\"",
-    "bench:webgpu:headless": "node benchmarks/headless_browser_webgpu_benchmark.mjs",
-    "bench:system:headless": "node benchmarks/system_interface_benchmark.mjs",
-    "bench:system:algos": "node benchmarks/system_interface_benchmark.mjs --algos=ppo,reinforce",
-    "bench:loop": "node benchmarks/loop_decomposition_benchmark.mjs",
-    "bench:patch3-smoke": "node benchmarks/patch3_discrete_forward_smoke.mjs",
-    "bench:patch3-token-smoke": "node benchmarks/patch3_token_forward_smoke.mjs",
-    "bench:webgpu:parity": "node benchmarks/webgpu_plague_spread_parity.mjs",
-    "bench:webgpu:parity:packed": "node benchmarks/webgpu_plague_spread_parity_packed.mjs",
-    "bench:webgpu:spread": "node benchmarks/webgpu_plague_spread_throughput.mjs",
-    "bench:all": "node benchmarks/run_all_benchmarks.mjs",
-    "bench:all:smoke": "node benchmarks/run_all_benchmarks.mjs --smoke",
-    "bench:matrix:smoke": "node benchmarks/runtime_matrix_smoke.mjs",
-    "bench:matrix:smoke:skip-build": "node benchmarks/runtime_matrix_smoke.mjs --skip-build",
-    "launch:verify": "node benchmarks/launch_page_verify.mjs",
-    "launch:verify:dev": "node benchmarks/launch_page_verify.mjs --url=http://localhost:8080/?preset=fast --skip-build-check"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC"
+  "peerDependencies": {
+    "typescript": "^6.0.2"
+  }
 }

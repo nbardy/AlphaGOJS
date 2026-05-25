@@ -1,6 +1,32 @@
-<html>
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AlphaGOJS v2 (WebGPU Fused)</title>
+    <style>
+      body { background: #121212; color: #eee; font-family: monospace; display: flex; flex-direction: column; align-items: center; padding: 2rem; }
+      canvas { background: #000; border: 1px solid #333; margin-bottom: 2rem; }
+      .stats { display: flex; gap: 2rem; font-size: 1.2rem; }
+      .stat { display: flex; flex-direction: column; align-items: center; }
+      .label { color: #888; font-size: 0.9rem; }
+      .value { font-weight: bold; margin-top: 0.5rem; }
+    </style>
+  </head>
   <body>
-    <script src="app.bundle.js"></script>
-    <style> canvas { width: 500px;}</style>
+    <h1>AlphaGOJS v2 (Fused PPO+AdamW)</h1>
+    <div id="error-overlay" style="color: red; font-weight: bold; margin-bottom: 1rem;"></div>
+    <canvas id="board" width="480" height="480" style="margin-bottom: 1rem;"></canvas>
+    <canvas id="elo-chart" width="480" height="120"></canvas>
+    <div class="stats">
+      <div class="stat"><div class="label">Rollout</div><div class="value" id="stat-rollout">0</div></div>
+      <div class="stat"><div class="label">Games</div><div class="value" id="stat-games">0</div></div>
+      <div class="stat"><div class="label">Games/s</div><div class="value" id="stat-games-per-sec">0.0</div></div>
+      <div class="stat"><div class="label">Avg Steps</div><div class="value" id="stat-avg-steps">0.0</div></div>
+      <div class="stat"><div class="label">Loss</div><div class="value" id="stat-loss">0.0000</div></div>
+      <div class="stat"><div class="label">Elo</div><div class="value" id="stat-elo">1000</div></div>
+      <div class="stat"><div class="label">Train ms</div><div class="value" id="stat-time">0ms</div></div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
   </body>
 </html>
