@@ -1,4 +1,5 @@
 import { GPUTrainer } from './gpu_harness';
+import { LEAGUE_ARCHS, type ArchConfig } from './arch_config';
 
 let trainer: GPUTrainer;
 let paused = false;
@@ -7,7 +8,9 @@ self.onmessage = async (e) => {
   if (e.data.type === 'START') {
     self.postMessage({ type: 'LOG', msg: "Worker received START" });
     try {
-      trainer = new GPUTrainer();
+      // Accept arch config from message, default to 'standard' (D=8)
+      const archConfig: ArchConfig = e.data.archConfig ?? LEAGUE_ARCHS[1];
+      trainer = new GPUTrainer(archConfig);
       trainer.onStats = (stats) => self.postMessage({ type: 'STATS', stats });
       trainer.onBoard = (board) => self.postMessage({ type: 'BOARD', board });
 

@@ -1,4 +1,5 @@
-import wgsl from './fused_ppo.wgsl?raw';
+import { generateKernel } from './kernel_template';
+import { computeWeightLayout, type ArchConfig, type WeightLayout } from './arch_config';
 import { CheckpointPool, type Checkpoint } from './checkpoint_pool';
 
 export const CONFIG = {
@@ -29,34 +30,39 @@ const WPB = Math.ceil(N / 16);
 const BOARD_STATE_STRIDE = 160 + 600 * 160;
 const PARAMS_SIZE = 24 * 4;
 
-const DENSE_WEIGHT_COUNT = 5905;
-const EMBED_WEIGHT_COUNT = 2097184;
-
 export class GPUTrainer {
   device!: GPUDevice;
   pool = new CheckpointPool();
-  
+
+  archConfig: ArchConfig;
+  layout: WeightLayout;
+
   paramsBuf!: GPUBuffer;
   boardsBuf!: GPUBuffer;
   embedBuf!: GPUBuffer;
   denseBuf!: GPUBuffer;
   readbackBuf!: GPUBuffer;
-  
+
   initPipeline!: GPUComputePipeline;
   rolloutPipeline!: GPUComputePipeline;
   gaePipeline!: GPUComputePipeline;
   ppoPipeline!: GPUComputePipeline;
-  
+
   bindGroup!: GPUBindGroup;
   gaeBindGroup!: GPUBindGroup;
   ppoBindGroup!: GPUBindGroup;
   initBindGroup!: GPUBindGroup;
-  
+
   adamStep = 0;
   rollout = 0;
 
   onStats?: (stats: any) => void;
   onBoard?: (board: Uint32Array) => void;
+
+  constructor(config: ArchConfig) {
+    this.archConfig = config;
+    this.layout = computeWeightLayout(config.D);
+  }
 
   async init() {
     const adapter = await navigator.gpu.requestAdapter();
@@ -74,7 +80,8 @@ export class GPUTrainer {
     // Initialize checkpoint pool from IDB before checking for saved checkpoints
     await this.pool.init();
 
-    const shaderModule = this.device.createShaderModule({ code: wgsl, label: "plague_ppo" });
+    const wgsl = generateKernel(this.archConfig.D);
+    const shaderModule = this.device.createShaderModule({ code: wgsl, label: `plague_ppo_D${this.archConfig.D}` });
 
     console.log("Worker: Compiling initPipeline...");
     this.initPipeline = await this.device.createComputePipelineAsync({
@@ -110,21 +117,21 @@ export class GPUTrainer {
     this.boardsBuf = this.device.createBuffer({ size: B * BOARD_STATE_STRIDE, usage: STORAGE });
     
     // 6 slots: w, m, v for player, and w, m, v for opponent
-    this.embedBuf = this.device.createBuffer({ size: EMBED_WEIGHT_COUNT * 6 * 2, usage: STORAGE });
-    this.denseBuf = this.device.createBuffer({ size: DENSE_WEIGHT_COUNT * 6 * 4, usage: STORAGE });
+    this.embedBuf = this.device.createBuffer({ size: this.layout.embedWeightCount * 6 * 2, usage: STORAGE });
+    this.denseBuf = this.device.createBuffer({ size: this.layout.denseWeightCount * 6 * 4, usage: STORAGE });
     
     this.readbackBuf = this.device.createBuffer({ size: B * Math.max(BOARD_STATE_STRIDE, 4), usage: READ });
 
     // Initialize weights
-    const denseWeights = new Float32Array(DENSE_WEIGHT_COUNT * 4);
-    let embedWeights = typeof Float16Array !== "undefined" ? new Float16Array(EMBED_WEIGHT_COUNT * 4) : null;
+    const denseWeights = new Float32Array(this.layout.denseWeightCount * 4);
+    let embedWeights = typeof Float16Array !== "undefined" ? new Float16Array(this.layout.embedWeightCount * 4) : null;
 
     if (this.pool.checkpoints.length > 0) {
       const latest = this.pool.checkpoints[this.pool.checkpoints.length - 1];
       console.log(`Worker: Resuming from IDB checkpoint ${latest.id} at rollout ${latest.generation}`);
       this.rollout = latest.generation;
       
-      // The saved dense weights are only length DENSE_WEIGHT_COUNT (just the w component)
+      // The saved dense weights are only length this.layout.denseWeightCount (just the w component)
       // but the buffer needs space for m, v, and opp. We just copy the weights into the front.
       denseWeights.set(latest.dense, 0);
       if (embedWeights && latest.embed) {
@@ -133,13 +140,13 @@ export class GPUTrainer {
     } else {
       let rng = 12345;
       const nextRng = () => { rng = (rng * 747796405 + 2891336453) >>> 0; return rng / 4294967296; };
-      for (let i = 0; i < DENSE_WEIGHT_COUNT; i++) {
+      for (let i = 0; i < this.layout.denseWeightCount; i++) {
         const u = nextRng(), v = nextRng();
         denseWeights[i] = Math.sqrt(-2 * Math.log(u + 1e-12)) * Math.cos(2 * Math.PI * v) * 0.1;
       }
       
       if (embedWeights) {
-        for (let i = 0; i < EMBED_WEIGHT_COUNT; i++) {
+        for (let i = 0; i < this.layout.embedWeightCount; i++) {
           embedWeights[i] = (nextRng() - 0.5) * 0.02;
         }
       }
@@ -240,8 +247,8 @@ export class GPUTrainer {
       opponent = this.pool.sampleOpponent();
       if (opponent) {
         useOpponent = true;
-        this.device.queue.writeBuffer(this.denseBuf, DENSE_WEIGHT_COUNT * 3 * 4, opponent.dense.buffer);
-        this.device.queue.writeBuffer(this.embedBuf, EMBED_WEIGHT_COUNT * 3 * 2, opponent.embed.buffer);
+        this.device.queue.writeBuffer(this.denseBuf, this.layout.denseWeightCount * 3 * 4, opponent.dense.buffer);
+        this.device.queue.writeBuffer(this.embedBuf, this.layout.embedWeightCount * 3 * 2, opponent.embed.buffer);
       }
     }
 
@@ -425,9 +432,26 @@ export class GPUTrainer {
     return copy;
   }
 
+  /** Read back current weights from GPU — needed for cross-architecture eval. */
+  async readWeights(): Promise<{ dense: Float32Array; embed: Float16Array }> {
+    const denseBytes = this.layout.denseWeightCount * 4;
+    const embedBytes = this.layout.embedWeightCount * 2;
+    const totalBytes = denseBytes + embedBytes;
+    const encoder = this.device.createCommandEncoder();
+    encoder.copyBufferToBuffer(this.denseBuf, 0, this.readbackBuf, 0, denseBytes);
+    encoder.copyBufferToBuffer(this.embedBuf, 0, this.readbackBuf, denseBytes, embedBytes);
+    this.device.queue.submit([encoder.finish()]);
+    await this.readbackBuf.mapAsync(GPUMapMode.READ);
+    const mapped = this.readbackBuf.getMappedRange(0, totalBytes);
+    const dense = new Float32Array(new Float32Array(mapped, 0, this.layout.denseWeightCount));
+    const embed = new Float16Array(new Float16Array(mapped, denseBytes, this.layout.embedWeightCount));
+    this.readbackBuf.unmap();
+    return { dense, embed };
+  }
+
   async saveCheckpoint() {
-    const denseBytes = DENSE_WEIGHT_COUNT * 4;
-    const embedBytes = EMBED_WEIGHT_COUNT * 2;
+    const denseBytes = this.layout.denseWeightCount * 4;
+    const embedBytes = this.layout.embedWeightCount * 2;
     const checkpointBytes = denseBytes + embedBytes;
     const encoder = this.device.createCommandEncoder();
     encoder.copyBufferToBuffer(this.denseBuf, 0, this.readbackBuf, 0, denseBytes);
@@ -436,10 +460,10 @@ export class GPUTrainer {
     
     await this.readbackBuf.mapAsync(GPUMapMode.READ);
     const mapped = this.readbackBuf.getMappedRange(0, checkpointBytes);
-    const denseCopy = new Float32Array(new Float32Array(mapped, 0, DENSE_WEIGHT_COUNT));
-    let embedCopy = new Float16Array(EMBED_WEIGHT_COUNT);
+    const denseCopy = new Float32Array(new Float32Array(mapped, 0, this.layout.denseWeightCount));
+    let embedCopy = new Float16Array(this.layout.embedWeightCount);
     if (typeof Float16Array !== "undefined") {
-      embedCopy = new Float16Array(new Float16Array(mapped, denseBytes, EMBED_WEIGHT_COUNT));
+      embedCopy = new Float16Array(new Float16Array(mapped, denseBytes, this.layout.embedWeightCount));
     }
     
     this.readbackBuf.unmap();
