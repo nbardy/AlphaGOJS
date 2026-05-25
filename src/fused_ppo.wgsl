@@ -94,18 +94,18 @@ struct BoardState {
 
 var<workgroup> sh_board: array<u32, 36u>;
 var<workgroup> sh_patch_state: array<u32, 64u>;
-var<workgroup> sh_a: array<f32, 512u>;
+var<workgroup> sh_a: array<f32, P * P * D>;
 var<workgroup> sh_b: array<f32, 576u>;
 var<workgroup> sh_pool: array<f32, 64u>;
 var<workgroup> sh_reduce_m: array<f32, 64u>;
 var<workgroup> sh_reduce_s: array<f32, 64u>;
-var<workgroup> sh_patch_delta2: array<f32, 72u>;
+var<workgroup> sh_patch_delta2: array<f32, PATCH_CH>;
 var<workgroup> sh_value: f32;
 var<workgroup> sh_action: u32;
 var<workgroup> sh_log_prob: f32;
 var<workgroup> sh_delta_v: f32;
 var<workgroup> sh_total_steps: u32;
-var<workgroup> sh_bar_a1: array<f32, 512u>;
+var<workgroup> sh_bar_a1: array<f32, P * P * D>;
 
 var<private> p_invert: bool = false;
 var<private> w_offset: u32 = 0u;
@@ -244,7 +244,7 @@ fn forward_pass(b: u32, lid: u32, is_live: bool) {
   workgroupBarrier();
 
   // Conv1
-  var conv1_reg: array<f32, 8>;
+  var conv1_reg: array<f32, D>;
   if (lid < P * P) {
     let py = i32(lid / P); let px = i32(lid % P);
     for (var o: u32 = 0u; o < D; o++) {
@@ -270,7 +270,7 @@ fn forward_pass(b: u32, lid: u32, is_live: bool) {
 
   // Conv2 + Pixel Shuffle + Fuse + Heads
   var lm: f32 = MASK_FILL; var ls: f32 = 0.0;
-  var pool: array<f32, 8>;
+  var pool: array<f32, D>;
   for (var d: u32 = 0u; d < D; d++) { pool[d] = 0.0; }
 
   for (var cell: u32 = lid; cell < N; cell += WG) {
@@ -279,10 +279,10 @@ fn forward_pass(b: u32, lid: u32, is_live: bool) {
     let sub = (y % 3u) * 3u + (x % 3u);
     let state = get_sh_cell_state(y, x);
 
-    var decoded: array<f32, 8>;
+    var decoded: array<f32, D>;
     for (var d: u32 = 0u; d < D; d++) { decoded[d] = conv2_at_patch(i32(py), i32(px), sub * D + d); }
 
-    var fused: array<f32, 8>;
+    var fused: array<f32, D>;
     for (var o: u32 = 0u; o < D; o++) {
       var acc: f32 = 0.0;
       for (var c: u32 = 0u; c < D; c++) {
@@ -570,8 +570,8 @@ fn ppo_step(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) 
     }
     workgroupBarrier();
 
-    var l_dWpi: array<f32, 8>;
-    var l_dWv: array<f32, 8>;
+    var l_dWpi: array<f32, D>;
+    var l_dWv: array<f32, D>;
     var l_dbv: f32 = 0.0;
     var l_dWf: array<f32, 128>;
     var l_dE_cell: array<f32, 32>;
@@ -591,10 +591,10 @@ fn ppo_step(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) 
         let y = py * 3u + sub / 3u; let x = px * 3u + sub % 3u;
         let state = get_sh_cell_state(y, x);
 
-        var decoded: array<f32, 8>;
+        var decoded: array<f32, D>;
         for (var c = 0u; c < 8u; c++) { decoded[c] = conv2_at_patch(i32(py), i32(px), sub * 8u + c); }
 
-        var af: array<f32, 8>;
+        var af: array<f32, D>;
         for (var o = 0u; o < 8u; o++) {
           var acc = 0.0;
           for (var c = 0u; c < 8u; c++) { acc += fw(c, o) * decoded[c] + fw(8u + c, o) * cell_e(state, c); }
@@ -603,7 +603,7 @@ fn ppo_step(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) 
 
         let delta_pi_i = sh_b[y * K + x];
         let delta_v_N = sh_delta_v / f32(N);
-        var delta_f: array<f32, 8>;
+        var delta_f: array<f32, D>;
 
         for (var o = 0u; o < 8u; o++) {
           l_dWpi[o] += delta_pi_i * af[o];
@@ -712,7 +712,7 @@ fn ppo_step(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) 
     workgroupBarrier();
 
     var pi = select(0u, sh_patch_state[lid], lid < 64u);
-    var l_bar_patch0: array<f32, 8>;
+    var l_bar_patch0: array<f32, D>;
     let patch_p = i32(lid / 8u); let patch_q = i32(lid % 8u);
     for (var c = 0u; c < 8u; c++) {
       var grad = 0.0;
@@ -738,7 +738,7 @@ fn ppo_step(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) 
     var is_first = true;
     for (var t = 0u; t < lid; t++) { if (bitcast<u32>(sh_pool[t]) == pi) { is_first = false; break; } }
     if (is_first) {
-      var sum_grad: array<f32, 8>;
+      var sum_grad: array<f32, D>;
       for(var c = 0u; c < 8u; c++) { sum_grad[c] = 0.0; }
       for (var t = lid; t < 64u; t++) {
         if (bitcast<u32>(sh_pool[t]) == pi) {
