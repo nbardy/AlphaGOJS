@@ -5,28 +5,128 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>AlphaGOJS v2 (WebGPU Fused)</title>
     <style>
-      body { background: #121212; color: #eee; font-family: monospace; display: flex; flex-direction: column; align-items: center; padding: 2rem; }
-      canvas { background: #000; border: 1px solid #333; margin-bottom: 2rem; }
-      .stats { display: flex; gap: 2rem; font-size: 1.2rem; }
-      .stat { display: flex; flex-direction: column; align-items: center; }
-      .label { color: #888; font-size: 0.9rem; }
-      .value { font-weight: bold; margin-top: 0.5rem; }
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      body {
+        background: #121212;
+        color: #eee;
+        font-family: "Courier New", monospace;
+        padding: 1.5rem;
+      }
+      h1 {
+        text-align: center;
+        margin-bottom: 1rem;
+        font-size: 1.3rem;
+        color: #8888cc;
+      }
+      #error-overlay {
+        color: #ff4444;
+        font-weight: bold;
+        text-align: center;
+        margin-bottom: 0.5rem;
+        min-height: 1.2rem;
+      }
+
+      /* --- Two-column dashboard --- */
+      .dashboard {
+        display: flex;
+        gap: 1.5rem;
+        max-width: 1100px;
+        margin: 0 auto;
+      }
+
+      /* Left column: board + controls */
+      .col-board {
+        flex: 0 0 480px;
+        display: flex;
+        flex-direction: column;
+        gap: 0.75rem;
+      }
+      #board {
+        background: #000;
+        border: 1px solid #333;
+        border-radius: 4px;
+      }
+
+      /* Controls row */
+      .controls {
+        display: flex;
+        align-items: center;
+        gap: 1rem;
+      }
+      #btn-pause {
+        background: #1a1a3a;
+        color: #8888cc;
+        border: 1px solid #333;
+        border-radius: 4px;
+        padding: 0.4rem 1.2rem;
+        font-family: "Courier New", monospace;
+        font-size: 0.9rem;
+        cursor: pointer;
+      }
+      #btn-pause:hover { background: #2a2a4a; }
+      #status-indicator {
+        color: #00ff88;
+        font-size: 0.9rem;
+      }
+
+      /* Stats bar */
+      .stats {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 1.2rem;
+        margin-top: 0.5rem;
+      }
+      .stat {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+      }
+      .stat .label { color: #888; font-size: 0.75rem; }
+      .stat .value { font-weight: bold; font-size: 1rem; margin-top: 0.25rem; }
+
+      /* Right column: 2x3 chart grid */
+      .col-charts {
+        flex: 1 1 auto;
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        grid-template-rows: repeat(3, auto);
+        gap: 0.75rem;
+      }
+      .col-charts canvas {
+        width: 100%;
+        height: auto;
+      }
     </style>
   </head>
   <body>
     <h1>AlphaGOJS v2 (Fused PPO+AdamW)</h1>
-    <div id="error-overlay" style="color: red; font-weight: bold; margin-bottom: 1rem;"></div>
-    <canvas id="board" width="480" height="480" style="margin-bottom: 1rem;"></canvas>
-    <canvas id="elo-chart" width="480" height="120"></canvas>
-    <div class="stats">
-      <div class="stat"><div class="label">Rollout</div><div class="value" id="stat-rollout">0</div></div>
-      <div class="stat"><div class="label">Games</div><div class="value" id="stat-games">0</div></div>
-      <div class="stat"><div class="label">Games/s</div><div class="value" id="stat-games-per-sec">0.0</div></div>
-      <div class="stat"><div class="label">Avg Steps</div><div class="value" id="stat-avg-steps">0.0</div></div>
-      <div class="stat"><div class="label">Loss</div><div class="value" id="stat-loss">0.0000</div></div>
-      <div class="stat"><div class="label">Elo</div><div class="value" id="stat-elo">1000</div></div>
-      <div class="stat"><div class="label">Train ms</div><div class="value" id="stat-time">0ms</div></div>
+    <div id="error-overlay"></div>
+
+    <div class="dashboard">
+      <!-- Left column: board + controls + stats -->
+      <div class="col-board">
+        <canvas id="board" width="480" height="480"></canvas>
+        <div class="controls">
+          <button id="btn-pause">Pause</button>
+          <span id="status-indicator">Training</span>
+        </div>
+        <div class="stats">
+          <div class="stat"><div class="label">Rollout</div><div class="value" id="stat-rollout">0</div></div>
+          <div class="stat"><div class="label">Games</div><div class="value" id="stat-games">0</div></div>
+          <div class="stat"><div class="label">Games/s</div><div class="value" id="stat-games-per-sec">0.0</div></div>
+          <div class="stat"><div class="label">Avg Steps</div><div class="value" id="stat-avg-steps">0.0</div></div>
+          <div class="stat"><div class="label">Loss</div><div class="value" id="stat-loss">0.0000</div></div>
+          <div class="stat"><div class="label">Elo</div><div class="value" id="stat-elo">1000</div></div>
+          <div class="stat"><div class="label">Train ms</div><div class="value" id="stat-time">0ms</div></div>
+        </div>
+      </div>
+
+      <!-- Right column: 2x3 chart grid -->
+      <div class="col-charts" id="chart-grid">
+        <!-- Charts are created and inserted by main.ts -->
+      </div>
     </div>
+
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>
