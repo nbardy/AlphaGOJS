@@ -240,8 +240,8 @@ export class GPUTrainer {
       opponent = this.pool.sampleOpponent();
       if (opponent) {
         useOpponent = true;
-        this.device.queue.writeBuffer(this.denseBuf, DENSE_WEIGHT_COUNT * 3 * 4, opponent.dense);
-        this.device.queue.writeBuffer(this.embedBuf, EMBED_WEIGHT_COUNT * 3 * 2, opponent.embed);
+        this.device.queue.writeBuffer(this.denseBuf, DENSE_WEIGHT_COUNT * 3 * 4, opponent.dense.buffer);
+        this.device.queue.writeBuffer(this.embedBuf, EMBED_WEIGHT_COUNT * 3 * 2, opponent.embed.buffer);
       }
     }
 
