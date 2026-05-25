@@ -1,5 +1,6 @@
 import { createChartCanvas, drawLineChart } from './charts';
-import type { ChartOptions } from './charts';
+import type { ChartOptions, ChartSeries } from './charts';
+import { LEAGUE_ARCHS } from './arch_config';
 
 // --- System diagnostics ---
 console.log("--- SYSTEM DIAGNOSTICS ---");
@@ -22,6 +23,16 @@ const errorOverlay   = document.getElementById('error-overlay')!;
 const btnPause       = document.getElementById('btn-pause') as HTMLButtonElement;
 const statusIndicator = document.getElementById('status-indicator')!;
 const chartGrid      = document.getElementById('chart-grid')!;
+
+// --- League mode DOM refs ---
+const btnSingle      = document.getElementById('btn-single') as HTMLButtonElement;
+const btnLeague      = document.getElementById('btn-league') as HTMLButtonElement;
+const leaguePanel    = document.getElementById('league-panel')!;
+const leagueTbody    = document.getElementById('league-tbody')!;
+const leagueTrainingStatus = document.getElementById('league-training-status')!;
+const evalLog        = document.getElementById('eval-log')!;
+const boardLabel     = document.getElementById('board-label')!;
+const statsBar       = document.querySelector('.stats') as HTMLElement;
 
 // --- Board rendering ---
 const K = 24;
@@ -107,23 +118,200 @@ function redrawCharts(): void {
 // Draw initial empty state
 redrawCharts();
 
-// --- Pause / Resume ---
+// --- Pause state (declared early so league toggle can reference it) ---
 let paused = false;
+
+// --- League mode state ---
+let mode: 'single' | 'league' = 'single';
+let leagueWorker: Worker | null = null;
+
+// Per-architecture metric history for league mode charts
+const leagueHistory: Record<string, { elo: number[], loss: number[], gamesPerSec: number[] }> = {};
+
+/** Update the league standings table from LEAGUE_STATS data. */
+function updateLeagueTable(archs: Array<{
+  config: { name: string, D: number, color: string },
+  elo: number,
+  generation: number,
+  totalGames: number,
+  latestLoss: number,
+  latestGamesPerSec: number,
+}>): void {
+  // Sort by Elo descending for ranking
+  const sorted = [...archs].sort((a, b) => b.elo - a.elo);
+  leagueTbody.innerHTML = sorted.map((arch, i) => `
+    <tr>
+      <td>${i + 1}</td>
+      <td class="arch-name-cell" style="border-left-color:${arch.config.color};color:${arch.config.color}">${arch.config.name}</td>
+      <td>${arch.config.D}</td>
+      <td style="font-weight:bold">${arch.elo.toFixed(0)}</td>
+      <td>${arch.generation}</td>
+      <td>${arch.totalGames}</td>
+      <td>${arch.latestLoss.toFixed(4)}</td>
+      <td>${arch.latestGamesPerSec.toFixed(1)}</td>
+    </tr>
+  `).join('');
+}
+
+/** Redraw the Elo chart in multi-series league mode. */
+function redrawLeagueEloChart(): void {
+  const eloChart = chartCanvases[0]; // Elo is the first chart
+  const eloSeries: ChartSeries[] = LEAGUE_ARCHS.map(a => ({
+    data: leagueHistory[a.name]?.elo ?? [],
+    color: a.color,
+    label: a.name,
+  }));
+  // Multi-series: pass empty data array, use options.series
+  drawLineChart(eloChart.canvas, [], { title: 'League Elo', series: eloSeries, refLine: 1000, refColor: '#ffcc00' });
+}
+
+/** Append an eval result entry to the log (newest at top). */
+function appendEvalEntry(entry: {
+  archA: string, archB: string,
+  winsA: number, winsB: number, draws: number,
+  rollout: number,
+}): void {
+  const winner = entry.winsA > entry.winsB ? entry.archA
+    : entry.winsB > entry.winsA ? entry.archB
+    : 'draw';
+  const outcome = winner === 'draw'
+    ? `${entry.winsA}-${entry.winsB} (draw)`
+    : `${entry.winsA}-${entry.winsB} (${winner} wins)`;
+  const div = document.createElement('div');
+  div.className = 'eval-entry';
+  div.textContent = `Rollout ${entry.rollout}: ${entry.archA} vs ${entry.archB} — ${outcome}`;
+  // Insert at top so newest entries appear first
+  evalLog.insertBefore(div, evalLog.firstChild);
+}
+
+/** Handle messages from the league worker. */
+function handleLeagueMessage(e: MessageEvent): void {
+  const msg = e.data;
+
+  if (msg.type === 'LOG') {
+    console.log("[LEAGUE LOG]", msg.msg);
+    return;
+  }
+  if (msg.type === 'ERROR') {
+    errorOverlay.innerText = "League Error: " + msg.message;
+    return;
+  }
+  if (msg.type === 'BOARD') {
+    drawBoard(msg.board);
+    // Show which architecture's board we're viewing
+    const archName = msg.arch ?? 'unknown';
+    const archConfig = LEAGUE_ARCHS.find(a => a.name === archName);
+    boardLabel.textContent = archConfig
+      ? `Board: ${archName} (D=${archConfig.D})`
+      : `Board: ${archName}`;
+    boardLabel.style.color = archConfig?.color ?? '#888';
+    return;
+  }
+  if (msg.type === 'LEAGUE_STATS') {
+    const { archs, evalHistory, currentTraining } = msg.stats;
+
+    // Update standings table
+    updateLeagueTable(archs);
+
+    // Push to per-arch history arrays
+    for (const arch of archs) {
+      const name = arch.config.name;
+      if (!leagueHistory[name]) {
+        leagueHistory[name] = { elo: [], loss: [], gamesPerSec: [] };
+      }
+      leagueHistory[name].elo.push(arch.elo);
+      leagueHistory[name].loss.push(arch.latestLoss);
+      leagueHistory[name].gamesPerSec.push(arch.latestGamesPerSec);
+    }
+
+    // Redraw the Elo chart with multi-series lines
+    redrawLeagueEloChart();
+
+    // Show training status
+    leagueTrainingStatus.textContent = `Currently training: ${currentTraining}`;
+
+    // Append new eval results
+    for (const entry of evalHistory) {
+      appendEvalEntry(entry);
+    }
+    return;
+  }
+}
+
+/** Start the league worker and wire up message handling. */
+function startLeagueWorker(): void {
+  if (leagueWorker) return;
+  leagueWorker = new Worker(new URL('./league_worker.ts', import.meta.url), { type: 'module' });
+  leagueWorker.onmessage = handleLeagueMessage;
+  leagueWorker.onerror = (err: ErrorEvent) => {
+    console.error("League worker failed:", err.message);
+    errorOverlay.innerText = "League Worker Error: " + err.message;
+  };
+  leagueWorker.postMessage({ type: 'START_LEAGUE' });
+}
+
+/** Stop the league worker. */
+function stopLeagueWorker(): void {
+  if (!leagueWorker) return;
+  leagueWorker.terminate();
+  leagueWorker = null;
+}
+
+// --- Single-mode Worker ---
+const worker = new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' });
+
+// --- Mode toggle ---
+function setMode(newMode: 'single' | 'league'): void {
+  if (newMode === mode) return;
+  mode = newMode;
+
+  // Toggle active button
+  btnSingle.classList.toggle('active', mode === 'single');
+  btnLeague.classList.toggle('active', mode === 'league');
+
+  // Show/hide league panel and single-mode stats
+  leaguePanel.style.display = mode === 'league' ? 'block' : 'none';
+  statsBar.style.display = mode === 'single' ? 'flex' : 'none';
+  boardLabel.style.display = mode === 'league' ? 'block' : 'none';
+
+  if (mode === 'league') {
+    // Pause single worker, start league worker
+    if (!paused) {
+      worker.postMessage({ type: 'PAUSE' });
+    }
+    startLeagueWorker();
+    // Show multi-series Elo chart immediately (may be empty)
+    redrawLeagueEloChart();
+  } else {
+    // Stop league worker, resume single worker
+    stopLeagueWorker();
+    if (!paused) {
+      worker.postMessage({ type: 'RESUME' });
+    }
+    // Clear league board label
+    boardLabel.textContent = '';
+    // Redraw single-mode charts
+    redrawCharts();
+  }
+}
+
+// --- Mode toggle event listeners ---
+btnSingle.addEventListener('click', () => setMode('single'));
+btnLeague.addEventListener('click', () => setMode('league'));
+
+// --- Pause / Resume ---
 
 btnPause.addEventListener('click', () => {
   paused = !paused;
   btnPause.textContent = paused ? 'Resume' : 'Pause';
   statusIndicator.textContent = paused ? 'Paused' : 'Training';
   statusIndicator.style.color = paused ? '#ffcc00' : '#00ff88';
-  // Notify worker. The worker-side PAUSE/RESUME handler is wired up by
-  // another agent -- for now we send the message and the worker ignores it
-  // until that protocol lands.
-  worker.postMessage({ type: paused ? 'PAUSE' : 'RESUME' });
+  // Notify the active worker based on current mode
+  const activeWorker = mode === 'league' ? leagueWorker : worker;
+  activeWorker?.postMessage({ type: paused ? 'PAUSE' : 'RESUME' });
 });
 
-// --- Worker ---
-
-const worker = new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' });
+// --- Single-mode Worker message handler ---
 
 worker.onmessage = (e: MessageEvent) => {
   const msg = e.data;

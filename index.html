@@ -96,15 +96,158 @@
         width: 100%;
         height: auto;
       }
+
+      /* --- Mode toggle --- */
+      .mode-toggle {
+        display: flex;
+        justify-content: center;
+        gap: 0;
+        margin-bottom: 1rem;
+      }
+      .mode-btn {
+        background: #1a1a3a;
+        color: #6666aa;
+        border: 1px solid #333;
+        padding: 0.4rem 1.6rem;
+        font-family: "Courier New", monospace;
+        font-size: 0.9rem;
+        cursor: pointer;
+        transition: background 0.15s, color 0.15s;
+      }
+      .mode-btn:first-child {
+        border-radius: 4px 0 0 4px;
+      }
+      .mode-btn:last-child {
+        border-radius: 0 4px 4px 0;
+        border-left: none;
+      }
+      .mode-btn:hover { background: #2a2a4a; }
+      .mode-btn.active {
+        background: #2a2a5a;
+        color: #ccccff;
+        border-color: #4444aa;
+      }
+
+      /* --- League panel --- */
+      #league-panel {
+        max-width: 1100px;
+        margin: 0 auto 1rem auto;
+      }
+      #league-panel h2 {
+        color: #8888cc;
+        font-size: 1.1rem;
+        margin-bottom: 0.75rem;
+      }
+      #league-table {
+        width: 100%;
+        border-collapse: collapse;
+        font-family: "Courier New", monospace;
+        font-size: 0.85rem;
+      }
+      #league-table thead th {
+        color: #6666aa;
+        font-weight: normal;
+        text-align: left;
+        padding: 0.4rem 0.75rem;
+        border-bottom: 1px solid #333;
+        font-size: 0.75rem;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+      }
+      #league-table tbody tr {
+        border-bottom: 1px solid #1a1a2a;
+      }
+      #league-table tbody tr:nth-child(odd) {
+        background: #151528;
+      }
+      #league-table tbody tr:nth-child(even) {
+        background: #121220;
+      }
+      #league-table tbody td {
+        padding: 0.5rem 0.75rem;
+        vertical-align: middle;
+      }
+      #league-table tbody td:first-child {
+        text-align: center;
+        color: #888;
+      }
+      /* Color indicator applied via inline style: border-left on .arch-name-cell */
+      .arch-name-cell {
+        border-left: 3px solid transparent;
+        padding-left: 0.75rem !important;
+        font-weight: bold;
+      }
+
+      /* Training status */
+      #league-training-status {
+        color: #00ff88;
+        font-size: 0.85rem;
+        margin-top: 0.75rem;
+      }
+
+      /* Eval log */
+      #eval-log {
+        max-height: 150px;
+        overflow-y: auto;
+        font-size: 0.8rem;
+        color: #666;
+        margin-top: 0.75rem;
+        border: 1px solid #1a1a2a;
+        border-radius: 4px;
+        padding: 0.5rem;
+        background: #0d0d1a;
+      }
+      #eval-log .eval-entry {
+        padding: 0.15rem 0;
+        border-bottom: 1px solid #111;
+      }
+      #eval-log .eval-entry:last-child {
+        border-bottom: none;
+      }
+
+      /* Board label for league mode */
+      #board-label {
+        color: #888;
+        font-size: 0.8rem;
+        text-align: center;
+        min-height: 1.1rem;
+      }
     </style>
   </head>
   <body>
     <h1>AlphaGOJS v2 (Fused PPO+AdamW)</h1>
     <div id="error-overlay"></div>
 
+    <div class="mode-toggle">
+      <button id="btn-single" class="mode-btn active">Single</button>
+      <button id="btn-league" class="mode-btn">League</button>
+    </div>
+
+    <div id="league-panel" style="display:none;">
+      <h2>Architecture League</h2>
+      <table id="league-table">
+        <thead>
+          <tr>
+            <th>Rank</th>
+            <th>Architecture</th>
+            <th>D</th>
+            <th>Elo</th>
+            <th>Gen</th>
+            <th>Games</th>
+            <th>Loss</th>
+            <th>Games/s</th>
+          </tr>
+        </thead>
+        <tbody id="league-tbody"></tbody>
+      </table>
+      <div id="league-training-status"></div>
+      <div id="eval-log"></div>
+    </div>
+
     <div class="dashboard">
       <!-- Left column: board + controls + stats -->
       <div class="col-board">
+        <div id="board-label"></div>
         <canvas id="board" width="480" height="480"></canvas>
         <div class="controls">
           <button id="btn-pause">Pause</button>
