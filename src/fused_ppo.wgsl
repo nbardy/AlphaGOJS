@@ -36,6 +36,20 @@ const E_OPP: u32 = E_TOTAL * 3u;
 const DW2_SIZE: u32 = 9u * D * 9u * D;
 const DW2_PER_THREAD: u32 = (DW2_SIZE + WG - 1u) / WG;
 
+// sh_b is reused as a per-cell buffer (size N) in the forward pass AND a [WG][D]
+// gradient scratch in the backward pass; size it for whichever is larger so it does
+// not overflow at large D (at D=8 this is max(576,512)=576, unchanged; D=16 → 1024).
+const SH_B_SIZE: u32 = max(N, WG * D);
+
+// Flat layout of the "small" gradients reduced together at the end of ppo_step:
+//   [ dWpi: D | dWv: D | dbv: 1 | dWf: 2*D*D | dE_cell: 4*D ]
+// These offsets generalize the old hardcoded 8/16/17/145/177 (which were D=8 only).
+const RED_DWV:    u32 = D;                          // start of dWv
+const RED_DBV:    u32 = 2u * D;                     // value-bias slot
+const RED_DWF:    u32 = 2u * D + 1u;                // start of dWf
+const RED_DECELL: u32 = 2u * D + 1u + 2u * D * D;   // start of dE_cell
+const RED_TOTAL:  u32 = RED_DECELL + 4u * D;        // total reduced scalars
+
 struct Params {
   batch_size: u32,
   step: u32,
@@ -95,7 +109,7 @@ struct BoardState {
 var<workgroup> sh_board: array<u32, 36u>;
 var<workgroup> sh_patch_state: array<u32, 64u>;
 var<workgroup> sh_a: array<f32, P * P * D>;
-var<workgroup> sh_b: array<f32, 576u>;
+var<workgroup> sh_b: array<f32, SH_B_SIZE>;
 var<workgroup> sh_pool: array<f32, 64u>;
 var<workgroup> sh_reduce_m: array<f32, 64u>;
 var<workgroup> sh_reduce_s: array<f32, 64u>;
@@ -576,31 +590,31 @@ fn ppo_step(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) 
     var l_dWpi: array<f32, D>;
     var l_dWv: array<f32, D>;
     var l_dbv: f32 = 0.0;
-    var l_dWf: array<f32, 128>;
-    var l_dE_cell: array<f32, 32>;
+    var l_dWf: array<f32, 2u * D * D>;
+    var l_dE_cell: array<f32, 4u * D>;
 
     if (lid == 0u) { l_dbv = sh_delta_v; }
 
     var local_dW2: array<f32, DW2_PER_THREAD>;
     for (var i = 0u; i < DW2_PER_THREAD; i++) { local_dW2[i] = 0.0; }
 
-    for (var i = 0u; i < 512u; i += WG) { sh_bar_a1[lid + i] = 0.0; }
+    for (var i = 0u; i < P * P * D; i += WG) { sh_bar_a1[lid + i] = 0.0; }
     workgroupBarrier();
 
-    for (var patch_idx = 0u; patch_idx < 64u; patch_idx++) {
+    for (var patch_idx = 0u; patch_idx < P * P; patch_idx++) {
       if (lid < 9u) {
         let sub = lid;
-        let py = patch_idx / 8u; let px = patch_idx % 8u;
+        let py = patch_idx / P; let px = patch_idx % P;
         let y = py * 3u + sub / 3u; let x = px * 3u + sub % 3u;
         let state = get_sh_cell_state(y, x);
 
         var decoded: array<f32, D>;
-        for (var c = 0u; c < 8u; c++) { decoded[c] = conv2_at_patch(i32(py), i32(px), sub * 8u + c); }
+        for (var c = 0u; c < D; c++) { decoded[c] = conv2_at_patch(i32(py), i32(px), sub * D + c); }
 
         var af: array<f32, D>;
-        for (var o = 0u; o < 8u; o++) {
+        for (var o = 0u; o < D; o++) {
           var acc = 0.0;
-          for (var c = 0u; c < 8u; c++) { acc += fw(c, o) * decoded[c] + fw(8u + c, o) * cell_e(state, c); }
+          for (var c = 0u; c < D; c++) { acc += fw(c, o) * decoded[c] + fw(D + c, o) * cell_e(state, c); }
           af[o] = max(acc, 0.0);
         }
 
@@ -608,84 +622,84 @@ fn ppo_step(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) 
         let delta_v_N = sh_delta_v / f32(N);
         var delta_f: array<f32, D>;
 
-        for (var o = 0u; o < 8u; o++) {
+        for (var o = 0u; o < D; o++) {
           l_dWpi[o] += delta_pi_i * af[o];
           l_dWv[o] += delta_v_N * af[o];
-          
+
           let bar_af = delta_pi_i * pw(o) + delta_v_N * vw(o);
           delta_f[o] = select(0.0, bar_af, af[o] > 0.0);
-          
-          for (var c = 0u; c < 8u; c++) {
-            l_dWf[c * 8u + o] += delta_f[o] * decoded[c];
-            l_dWf[(8u + c) * 8u + o] += delta_f[o] * cell_e(state, c);
-            l_dE_cell[state * 8u + c] += delta_f[o] * fw(8u + c, o);
+
+          for (var c = 0u; c < D; c++) {
+            l_dWf[c * D + o] += delta_f[o] * decoded[c];
+            l_dWf[(D + c) * D + o] += delta_f[o] * cell_e(state, c);
+            l_dE_cell[state * D + c] += delta_f[o] * fw(D + c, o);
           }
         }
 
-        for (var d = 0u; d < 8u; d++) {
+        for (var d = 0u; d < D; d++) {
           var bar_decoded_d = 0.0;
-          for (var o = 0u; o < 8u; o++) { bar_decoded_d += delta_f[o] * fw(d, o); }
-          sh_patch_delta2[sub * 8u + d] = select(0.0, bar_decoded_d, decoded[d] > 0.0);
+          for (var o = 0u; o < D; o++) { bar_decoded_d += delta_f[o] * fw(d, o); }
+          sh_patch_delta2[sub * D + d] = select(0.0, bar_decoded_d, decoded[d] > 0.0);
         }
       }
       workgroupBarrier();
 
       for (var i = 0u; i < DW2_PER_THREAD; i++) {
-        let w_idx = lid + i * 64u;
+        let w_idx = lid + i * WG;
         if (w_idx < DW2_SIZE) {
-          let k = w_idx % 72u; let c = (w_idx / 72u) % 8u;
-          let kx = (w_idx / 576u) % 3u; let ky = (w_idx / 1728u) % 3u;
-          let py = patch_idx / 8u; let px = patch_idx % 8u;
+          let k = w_idx % PATCH_CH; let c = (w_idx / PATCH_CH) % D;
+          let kx = (w_idx / (PATCH_CH * D)) % 3u; let ky = (w_idx / (PATCH_CH * D * 3u)) % 3u;
+          let py = patch_idx / P; let px = patch_idx % P;
           local_dW2[i] += sh_patch_delta2[k] * sh_a_at(i32(py) + 2*(i32(ky)-1), i32(px) + 2*(i32(kx)-1), c);
         }
       }
 
-      for (var item = lid; item < 72u; item += WG) {
-        let c = item % 8u; let v = (item / 8u) % 3u; let u = (item / 24u) % 3u;
-        let py = i32(patch_idx / 8u) + 2 * (i32(u) - 1);
-        let px = i32(patch_idx % 8u) + 2 * (i32(v) - 1);
-        if (py >= 0 && py < 8 && px >= 0 && px < 8) {
+      for (var item = lid; item < PATCH_CH; item += WG) {
+        let c = item % D; let v = (item / D) % 3u; let u = (item / (3u * D)) % 3u;
+        let py = i32(patch_idx / P) + 2 * (i32(u) - 1);
+        let px = i32(patch_idx % P) + 2 * (i32(v) - 1);
+        if (py >= 0 && py < i32(P) && px >= 0 && px < i32(P)) {
           var sum = 0.0;
-          for (var k = 0u; k < 72u; k++) { sum += sh_patch_delta2[k] * c2w(u, v, c, k); }
-          sh_bar_a1[u32(py) * 64u + u32(px) * 8u + c] += sum;
+          for (var k = 0u; k < PATCH_CH; k++) { sum += sh_patch_delta2[k] * c2w(u, v, c, k); }
+          sh_bar_a1[u32(py) * P * D + u32(px) * D + c] += sum;
         }
       }
       workgroupBarrier();
     }
 
-    for (var chunk = 0u; chunk < 177u; chunk += 2u) {
-      let count = min(2u, 177u - chunk);
+    for (var chunk = 0u; chunk < RED_TOTAL; chunk += 2u) {
+      let count = min(2u, RED_TOTAL - chunk);
       let c0 = chunk; let c1 = chunk + 1u;
-      
+
       var val0 = 0.0;
-      if (c0 < 8u) { val0 = l_dWpi[c0]; }
-      else if (c0 < 16u) { val0 = l_dWv[c0 - 8u]; }
-      else if (c0 == 16u) { val0 = l_dbv; }
-      else if (c0 < 145u) { val0 = l_dWf[c0 - 17u]; }
-      else { val0 = l_dE_cell[c0 - 145u]; }
-      
+      if (c0 < RED_DWV) { val0 = l_dWpi[c0]; }
+      else if (c0 < RED_DBV) { val0 = l_dWv[c0 - RED_DWV]; }
+      else if (c0 == RED_DBV) { val0 = l_dbv; }
+      else if (c0 < RED_DECELL) { val0 = l_dWf[c0 - RED_DWF]; }
+      else { val0 = l_dE_cell[c0 - RED_DECELL]; }
+
       var val1 = 0.0;
-      if (c1 < 8u) { val1 = l_dWpi[c1]; }
-      else if (c1 < 16u) { val1 = l_dWv[c1 - 8u]; }
-      else if (c1 == 16u) { val1 = l_dbv; }
-      else if (c1 < 145u) { val1 = l_dWf[c1 - 17u]; }
-      else { val1 = l_dE_cell[c1 - 145u]; }
-      
+      if (c1 < RED_DWV) { val1 = l_dWpi[c1]; }
+      else if (c1 < RED_DBV) { val1 = l_dWv[c1 - RED_DWV]; }
+      else if (c1 == RED_DBV) { val1 = l_dbv; }
+      else if (c1 < RED_DECELL) { val1 = l_dWf[c1 - RED_DWF]; }
+      else { val1 = l_dE_cell[c1 - RED_DECELL]; }
+
       if (count > 0u) { sh_pool[lid] = val0; }
       if (count > 1u) { sh_reduce_m[lid] = val1; }
       workgroupBarrier();
-      
+
       if (lid < count) {
         var sum = 0.0;
-        if (lid == 0u) { for(var t=0u; t<64u; t++) { sum += sh_pool[t]; } }
-        if (lid == 1u) { for(var t=0u; t<64u; t++) { sum += sh_reduce_m[t]; } }
-        
+        if (lid == 0u) { for(var t=0u; t<WG; t++) { sum += sh_pool[t]; } }
+        if (lid == 1u) { for(var t=0u; t<WG; t++) { sum += sh_reduce_m[t]; } }
+
         let w_idx = chunk + lid;
-        if (w_idx < 8u) { apply_adam_f32(W_POLICY + w_idx, sum); }
-        else if (w_idx < 16u) { apply_adam_f32(W_VALUE + (w_idx - 8u), sum); }
-        else if (w_idx == 16u) { apply_adam_f32(W_VALUE + D, sum); }
-        else if (w_idx < 145u) { apply_adam_f32(W_FUSE + (w_idx - 17u), sum); }
-        else { apply_adam_f16(E_CELL + (w_idx - 145u), sum); }
+        if (w_idx < RED_DWV) { apply_adam_f32(W_POLICY + w_idx, sum); }
+        else if (w_idx < RED_DBV) { apply_adam_f32(W_VALUE + (w_idx - RED_DWV), sum); }
+        else if (w_idx == RED_DBV) { apply_adam_f32(W_VALUE + D, sum); }
+        else if (w_idx < RED_DECELL) { apply_adam_f32(W_FUSE + (w_idx - RED_DWF), sum); }
+        else { apply_adam_f16(E_CELL + (w_idx - RED_DECELL), sum); }
       }
       workgroupBarrier();
     }
@@ -696,16 +710,16 @@ fn ppo_step(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) 
     }
     workgroupBarrier();
 
-    for (var w_idx = lid; w_idx < 576u; w_idx += WG) {
-      let o = w_idx % 8u; let c = (w_idx / 8u) % 8u;
-      let v = (w_idx / 64u) % 3u; let u = (w_idx / 192u) % 3u;
+    for (var w_idx = lid; w_idx < 9u * D * D; w_idx += WG) {
+      let o = w_idx % D; let c = (w_idx / D) % D;
+      let v = (w_idx / (D * D)) % 3u; let u = (w_idx / (D * D * 3u)) % 3u;
       var grad = 0.0;
-      for (var p = 0; p < 8; p++) {
-        for (var q = 0; q < 8; q++) {
-          if (sh_a[(p * 8 + q) * 8 + i32(o)] > 0.0) {
+      for (var p = 0; p < i32(P); p++) {
+        for (var q = 0; q < i32(P); q++) {
+          if (sh_a[(p * i32(P) + q) * i32(D) + i32(o)] > 0.0) {
             let py = p + i32(u) - 1; let px = q + i32(v) - 1;
-            if (py >= 0 && py < 8 && px >= 0 && px < 8) {
-              grad += sh_bar_a1[(p * 8 + q) * 8 + i32(o)] * patch_e(sh_patch_state[u32(py) * 8u + u32(px)], c);
+            if (py >= 0 && py < i32(P) && px >= 0 && px < i32(P)) {
+              grad += sh_bar_a1[(p * i32(P) + q) * i32(D) + i32(o)] * patch_e(sh_patch_state[u32(py) * P + u32(px)], c);
             }
           }
         }
@@ -714,18 +728,18 @@ fn ppo_step(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) 
     }
     workgroupBarrier();
 
-    var pi = select(0u, sh_patch_state[lid], lid < 64u);
+    var pi = select(0u, sh_patch_state[lid], lid < P * P);
     var l_bar_patch0: array<f32, D>;
-    let patch_p = i32(lid / 8u); let patch_q = i32(lid % 8u);
-    for (var c = 0u; c < 8u; c++) {
+    let patch_p = i32(lid / P); let patch_q = i32(lid % P);
+    for (var c = 0u; c < D; c++) {
       var grad = 0.0;
       for (var u = 0u; u < 3u; u++) {
         for (var v = 0u; v < 3u; v++) {
           let p_out = patch_p - (i32(u) - 1); let q_out = patch_q - (i32(v) - 1);
-          if (p_out >= 0 && p_out < 8 && q_out >= 0 && q_out < 8) {
-            for (var o = 0u; o < 8u; o++) {
-              if (sh_a[(p_out * 8 + q_out) * 8 + i32(o)] > 0.0) {
-                grad += sh_bar_a1[(p_out * 8 + q_out) * 8 + i32(o)] * c1w(u, v, c, o);
+          if (p_out >= 0 && p_out < i32(P) && q_out >= 0 && q_out < i32(P)) {
+            for (var o = 0u; o < D; o++) {
+              if (sh_a[(p_out * i32(P) + q_out) * i32(D) + i32(o)] > 0.0) {
+                grad += sh_bar_a1[(p_out * i32(P) + q_out) * i32(D) + i32(o)] * c1w(u, v, c, o);
               }
             }
           }
@@ -735,20 +749,20 @@ fn ppo_step(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) 
     }
 
     sh_pool[lid] = bitcast<f32>(pi);
-    for(var c = 0u; c < 8u; c++) { sh_b[lid * 8u + c] = l_bar_patch0[c]; }
+    for(var c = 0u; c < D; c++) { sh_b[lid * D + c] = l_bar_patch0[c]; }
     workgroupBarrier();
 
     var is_first = true;
     for (var t = 0u; t < lid; t++) { if (bitcast<u32>(sh_pool[t]) == pi) { is_first = false; break; } }
     if (is_first) {
       var sum_grad: array<f32, D>;
-      for(var c = 0u; c < 8u; c++) { sum_grad[c] = 0.0; }
-      for (var t = lid; t < 64u; t++) {
+      for(var c = 0u; c < D; c++) { sum_grad[c] = 0.0; }
+      for (var t = lid; t < P * P; t++) {
         if (bitcast<u32>(sh_pool[t]) == pi) {
-          for(var c = 0u; c < 8u; c++) { sum_grad[c] += sh_b[t * 8u + c]; }
+          for(var c = 0u; c < D; c++) { sum_grad[c] += sh_b[t * D + c]; }
         }
       }
-      for (var c = 0u; c < 8u; c++) { apply_adam_f16(E_PATCH + pi * D + c, sum_grad[c]); }
+      for (var c = 0u; c < D; c++) { apply_adam_f16(E_PATCH + pi * D + c, sum_grad[c]); }
     }
     workgroupBarrier();
   }
