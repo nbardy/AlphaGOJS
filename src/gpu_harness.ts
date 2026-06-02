@@ -322,6 +322,7 @@ export class GPUTrainer {
     this.adamStep += Math.round(totalSteps / CONFIG.numBoards);
     const avgSteps = totalSteps / CONFIG.numBoards;
     const finalLoss = await this.readLoss();
+    const finalEntropy = await this.readEntropy();
     const time = performance.now() - start;
     const gamesPerSecTrained = (CONFIG.numBoards / time) * 1000;
     const stepsPerSecTrained = time > 0 ? (totalSteps / time) * 1000 : 0;
@@ -339,7 +340,7 @@ export class GPUTrainer {
          trainedStepsPerSec: stepsPerSecTrained,
          avgStepsPerGame: avgSteps,
          winRate: evalWinRate,
-         entropy: 0
+         entropy: finalEntropy
       });
     }
   }
@@ -410,6 +411,25 @@ export class GPUTrainer {
     this.device.queue.submit([encoder.finish()]);
     await this.readbackBuf.mapAsync(GPUMapMode.READ);
     
+    let sum = 0;
+    if (typeof Float16Array !== "undefined") {
+      const view = new Float16Array(this.readbackBuf.getMappedRange().slice(0, CONFIG.numBoards * 4));
+      for (let i = 0; i < CONFIG.numBoards; i++) { sum += view[i * 2]; }
+    }
+    this.readbackBuf.unmap();
+    return sum / CONFIG.numBoards;
+  }
+
+  async readEntropy() {
+    // Mirror readLoss exactly: entropy is written to transitions[0]._pad (f16).
+    // Transition header offset = 160; _pad sits at byte 14 within the transition.
+    const encoder = this.device.createCommandEncoder();
+    for (let i = 0; i < CONFIG.numBoards; i++) {
+      encoder.copyBufferToBuffer(this.boardsBuf, i * BOARD_STATE_STRIDE + 160 + 14, this.readbackBuf, i * 4, 4);
+    }
+    this.device.queue.submit([encoder.finish()]);
+    await this.readbackBuf.mapAsync(GPUMapMode.READ);
+
     let sum = 0;
     if (typeof Float16Array !== "undefined") {
       const view = new Float16Array(this.readbackBuf.getMappedRange().slice(0, CONFIG.numBoards * 4));

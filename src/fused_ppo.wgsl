@@ -534,6 +534,9 @@ fn ppo_step(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) 
       }
 
       boards[b].transitions[0u].reward = f16(clip_loss + v_loss - params.c2_entropy * entropy);
+      // Smuggle raw policy entropy H out for CPU readback (mirrors the loss path above).
+      // _pad is an otherwise-unused f16 slot in Transition, so this changes no struct stride.
+      boards[b].transitions[0u]._pad = f16(entropy);
 
       let is_p2_turn = (step % 2u) != 0u;
       let is_opponent_turn = params.use_opponent == 1u && is_p2_turn;
