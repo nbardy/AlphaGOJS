@@ -22,7 +22,7 @@
 import { computeWeightLayout, type WeightLayout } from './arch_config';
 import { type ArchWeights, inferAction } from './js_inference';
 import {
-  K, N,
+  K,
   initBoard, getCellState, setCellState,
   plagueSpread, isTerminal, countTerritory,
   pcg,
