@@ -67,6 +67,22 @@ const history = {
   entropy:     [] as number[],
 };
 
+// Win-rate is only measured on eval steps (~CONFIG.evalFraction of steps); on
+// non-eval steps the worker reports winRate = -1 as a "no eval" sentinel. We must
+// NOT plot that -1, or the [0,1] chart combs down to the floor every other step.
+// Instead we keep only genuine eval points here and carry the smoothed trend
+// forward into history.winRate so the line holds flat between evals.
+const realWinRates: number[] = [];      // only true eval measurements
+const WINRATE_SMOOTH_WINDOW = 10;       // trailing avg window, like Elo's smooth read
+
+/** Trailing moving average of the last N real eval win-rates. */
+function smoothedWinRate(): number {
+  const n = Math.min(WINRATE_SMOOTH_WINDOW, realWinRates.length);
+  let sum = 0;
+  for (let i = realWinRates.length - n; i < realWinRates.length; i++) sum += realWinRates[i];
+  return sum / n;
+}
+
 // --- Chart setup: one canvas per metric, inserted into the 2x3 grid ---
 
 interface ChartDef {
@@ -93,7 +109,7 @@ const chartDefs: ChartDef[] = [
   },
   {
     key: 'winRate',
-    options: { title: 'Win Rate vs Checkpoints', color: '#44dddd', refLine: 0.5, refColor: '#ffcc00', minY: 0, maxY: 1 },
+    options: { title: 'Win Rate vs Checkpoints (10-eval avg)', color: '#44dddd', refLine: 0.5, refColor: '#ffcc00', minY: 0, maxY: 1 },
   },
   {
     key: 'entropy',
@@ -346,9 +362,14 @@ worker.onmessage = (e: MessageEvent) => {
     history.loss.push(s.loss);
     history.gamesPerSec.push(s.trainedGamesPerSec);
     history.avgSteps.push(s.avgStepsPerGame);
-    // winRate and entropy may not be present yet -- the worker-side protocol
-    // addition is handled by a separate agent. Default to 0 until available.
-    history.winRate.push(s.winRate ?? 0);
+    // Win-rate: the worker sends -1 on non-eval steps (no game played this step).
+    // `?? 0` only catches null/undefined, NOT the -1 sentinel, so plotting it
+    // directly made the chart comb to the floor between evals. Only record genuine
+    // eval points (winRate >= 0); on non-eval steps carry the smoothed trend forward
+    // so the line holds flat instead of dropping to 0.
+    const wr = s.winRate ?? -1;
+    if (wr >= 0) realWinRates.push(wr);
+    history.winRate.push(realWinRates.length > 0 ? smoothedWinRate() : 0);
     history.entropy.push(s.entropy ?? 0);
 
     redrawCharts();
