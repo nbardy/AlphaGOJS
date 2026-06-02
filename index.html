@@ -212,6 +212,40 @@
         text-align: center;
         min-height: 1.1rem;
       }
+
+      /* --- Play-vs-model panel --- */
+      #play-panel {
+        display: flex;
+        flex-direction: column;
+        gap: 0.5rem;
+      }
+      #play-status {
+        color: #ccccff;
+        font-size: 0.9rem;
+        min-height: 1.2rem;
+      }
+      #play-source {
+        color: #6666aa;
+        font-size: 0.75rem;
+        min-height: 1rem;
+      }
+      .play-controls {
+        display: flex;
+        gap: 0.75rem;
+      }
+      .play-controls button {
+        background: #1a1a3a;
+        color: #8888cc;
+        border: 1px solid #333;
+        border-radius: 4px;
+        padding: 0.4rem 1.2rem;
+        font-family: "Courier New", monospace;
+        font-size: 0.9rem;
+        cursor: pointer;
+      }
+      .play-controls button:hover { background: #2a2a4a; }
+      /* When in play mode, make the board feel interactive */
+      #board.playable { cursor: pointer; }
     </style>
   </head>
   <body>
@@ -221,6 +255,7 @@
     <div class="mode-toggle">
       <button id="btn-single" class="mode-btn active">Single</button>
       <button id="btn-league" class="mode-btn">League</button>
+      <button id="btn-newgame" class="mode-btn" style="border-left:none;border-radius:0 4px 4px 0;margin-left:0.75rem;border-radius:4px;">New Game</button>
     </div>
 
     <div id="league-panel" style="display:none;">
@@ -252,6 +287,14 @@
         <div class="controls">
           <button id="btn-pause">Pause</button>
           <span id="status-indicator">Training</span>
+        </div>
+        <div id="play-panel" style="display:none;">
+          <div id="play-status"></div>
+          <div id="play-source"></div>
+          <div class="play-controls">
+            <button id="btn-play-again">Play Again</button>
+            <button id="btn-exit-play">Back to Training</button>
+          </div>
         </div>
         <div class="stats">
           <div class="stat"><div class="label">Rollout</div><div class="value" id="stat-rollout">0</div></div>

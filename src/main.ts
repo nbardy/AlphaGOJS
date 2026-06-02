@@ -1,6 +1,7 @@
 import { createChartCanvas, drawLineChart } from './charts';
 import type { ChartOptions, ChartSeries } from './charts';
 import { LEAGUE_ARCHS } from './arch_config';
+import { PlayController, type LiveWeightsGetter } from './play_vs_model';
 
 // --- System diagnostics ---
 console.log("--- SYSTEM DIAGNOSTICS ---");
@@ -33,6 +34,14 @@ const leagueTrainingStatus = document.getElementById('league-training-status')!;
 const evalLog        = document.getElementById('eval-log')!;
 const boardLabel     = document.getElementById('board-label')!;
 const statsBar       = document.querySelector('.stats') as HTMLElement;
+
+// --- Play-vs-model DOM refs ---
+const btnNewGame     = document.getElementById('btn-newgame') as HTMLButtonElement;
+const playPanel      = document.getElementById('play-panel')!;
+const playStatus     = document.getElementById('play-status')!;
+const playSource     = document.getElementById('play-source')!;
+const btnPlayAgain   = document.getElementById('btn-play-again') as HTMLButtonElement;
+const btnExitPlay    = document.getElementById('btn-exit-play') as HTMLButtonElement;
 
 // --- Board rendering ---
 const K = 24;
@@ -299,6 +308,100 @@ function setMode(newMode: 'single' | 'league'): void {
 btnSingle.addEventListener('click', () => setMode('single'));
 btnLeague.addEventListener('click', () => setMode('league'));
 
+// --- Play-vs-model mode ---
+// Human plays the BEST trained model. Weights come from the highest-Elo checkpoint
+// in IndexedDB (read directly on the main thread); if none exists yet we fall back
+// to live GPU weights via a GET_WEIGHTS round-trip to the training worker.
+
+let playController: PlayController | null = null;
+let inPlayMode = false;
+
+// Pending resolver for the live-weights round-trip (set while awaiting WEIGHTS).
+let pendingLiveWeights: ((w: { dense: Float32Array; embed: Float16Array; D: number }) => void) | null = null;
+
+const getLiveWeights: LiveWeightsGetter = () =>
+  new Promise((resolve, reject) => {
+    pendingLiveWeights = resolve;
+    worker.postMessage({ type: 'GET_WEIGHTS' });
+    // Guard against a hung worker so the controller never waits forever.
+    setTimeout(() => {
+      if (pendingLiveWeights) {
+        pendingLiveWeights = null;
+        reject(new Error('Timed out reading live weights from worker.'));
+      }
+    }, 10000);
+  });
+
+function enterPlayMode(): void {
+  if (inPlayMode) return;
+  inPlayMode = true;
+
+  // Pause training (mirror setMode's PAUSE behavior) so the GPU is free.
+  if (!paused) worker.postMessage({ type: 'PAUSE' });
+  // If league mode was active, stop its worker too.
+  stopLeagueWorker();
+
+  // Hide training/league chrome, show the play panel + interactive board.
+  leaguePanel.style.display = 'none';
+  statsBar.style.display = 'none';
+  boardLabel.style.display = 'none';
+  playPanel.style.display = 'flex';
+  canvas.classList.add('playable');
+  btnNewGame.classList.add('active');
+
+  startNewGame();
+}
+
+function exitPlayMode(): void {
+  if (!inPlayMode) return;
+  inPlayMode = false;
+
+  playController?.dispose();
+  playController = null;
+
+  playPanel.style.display = 'none';
+  canvas.classList.remove('playable');
+  btnNewGame.classList.remove('active');
+
+  // Resume the previous mode. setMode short-circuits if mode is unchanged, so
+  // force a clean re-entry: temporarily flip mode then set it back.
+  const target = mode;
+  mode = target === 'single' ? 'league' : 'single';
+  setMode(target);
+}
+
+function startNewGame(): void {
+  playController?.dispose();
+  playController = new PlayController(
+    {
+      onRender: (board) => drawBoard(board),
+      onStatus: (text) => { playStatus.textContent = text; },
+      onGameOver: () => { /* status already set; Play Again button handles restart */ },
+    },
+    getLiveWeights,
+    1, // human plays first (blue)
+  );
+  void playController.start().then(() => {
+    playSource.textContent = `Opponent: ${playController?.modelSource() ?? 'unknown'}`;
+  }).catch((err) => {
+    playStatus.textContent = 'Could not start game: ' + (err?.message ?? String(err));
+  });
+}
+
+// Canvas click → human move (only active in play mode; controller ignores otherwise).
+canvas.addEventListener('click', (ev: MouseEvent) => {
+  if (!inPlayMode || !playController) return;
+  const rect = canvas.getBoundingClientRect();
+  // Map CSS pixels → canvas backing-store pixels (canvas may be scaled by CSS).
+  const px = (ev.clientX - rect.left) * (canvas.width / rect.width);
+  const py = (ev.clientY - rect.top) * (canvas.height / rect.height);
+  playController.handleClick(px, py, canvas.width, canvas.height);
+});
+
+btnNewGame.addEventListener('click', () => enterPlayMode());
+btnPlayAgain.addEventListener('click', () => startNewGame());
+btnExitPlay.addEventListener('click', () => exitPlayMode());
+
 // --- Pause / Resume ---
 
 btnPause.addEventListener('click', () => {
@@ -324,9 +427,19 @@ worker.onmessage = (e: MessageEvent) => {
     errorOverlay.innerText = "Error: " + msg.message;
     return;
   }
+  if (msg.type === 'WEIGHTS') {
+    // Response to a GET_WEIGHTS round-trip (live-weights fallback for play mode).
+    if (pendingLiveWeights) {
+      const resolve = pendingLiveWeights;
+      pendingLiveWeights = null;
+      resolve({ dense: msg.dense, embed: msg.embed, D: msg.D });
+    }
+    return;
+  }
   if (msg.type === 'BOARD') {
     if (msg.board[0]) console.log("Main received board:", msg.board[0], msg.board[1]);
-    drawBoard(msg.board);
+    // Don't let the (paused) training board overwrite the interactive play board.
+    if (!inPlayMode) drawBoard(msg.board);
     return;
   }
   if (msg.type === 'STATS') {
