@@ -34,5 +34,14 @@ self.onmessage = async (e) => {
   } else if (e.data.type === 'RESUME') {
     paused = false;
     self.postMessage({ type: 'LOG', msg: "Training resumed" });
+  } else if (e.data.type === 'GET_WEIGHTS') {
+    // Live-weights fallback for human-vs-model play when no checkpoint exists yet.
+    // Reads the current GPU weights and ships them to the main thread.
+    try {
+      const { dense, embed } = await trainer.readWeights();
+      self.postMessage({ type: 'WEIGHTS', dense, embed, D: trainer.archConfig.D });
+    } catch (err: any) {
+      self.postMessage({ type: 'ERROR', message: err.message || String(err) });
+    }
   }
 };
