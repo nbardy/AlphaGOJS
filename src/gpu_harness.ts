@@ -236,6 +236,7 @@ export class GPUTrainer {
     const start = performance.now();
     let useOpponent = false;
     let opponent: Checkpoint | null = null;
+    let opponentIsAnchor = false;
     let evalWinRate = -1;
 
     if (this.rollout > 0 && this.rollout % CONFIG.checkpointInterval === 0) {
@@ -244,7 +245,11 @@ export class GPUTrainer {
     }
 
     if (Math.random() < CONFIG.evalFraction) {
-      opponent = this.pool.sampleOpponent();
+      // Half of eval steps play the FIXED anchor (→ smooth win-rate progress curve),
+      // half play a recency-sampled opponent (→ Elo ladder). One opponent per rollout,
+      // so this splits the two metrics across eval steps instead of doubling cost.
+      opponentIsAnchor = this.pool.anchor != null && Math.random() < 0.5;
+      opponent = opponentIsAnchor ? this.pool.anchor : this.pool.sampleOpponent();
       if (opponent) {
         useOpponent = true;
         this.device.queue.writeBuffer(this.denseBuf, this.layout.denseWeightCount * 3 * 4, opponent.dense.buffer);
@@ -281,10 +286,14 @@ export class GPUTrainer {
     // Update Elo if eval
     if (useOpponent && opponent) {
        const winRate = await this.getWinRate();
-       evalWinRate = winRate;
-       const isDraw = winRate === 0.5;
-       const isWin = winRate > 0.5;
-       this.pool.updateElo(opponent.elo, isWin, isDraw);
+       if (opponentIsAnchor) {
+         // vs the fixed anchor → report as the smooth win-rate progress metric.
+         evalWinRate = winRate;
+       } else {
+         // ladder game → update Elo only; leave evalWinRate = -1 so the win-rate chart
+         // shows the clean anchor curve, not the noisy vs-random-opponent series.
+         this.pool.updateElo(opponent.elo, winRate > 0.5, winRate === 0.5);
+       }
     }
 
     // Capture board for rendering
@@ -316,13 +325,11 @@ export class GPUTrainer {
     }
 
     await this.device.queue.onSubmittedWorkDone();
-    const stepCounts = await this.readStepCounts();
-    const totalSteps = stepCounts.reduce((sum, count) => sum + count, 0);
+    // One fused readback for stepCount + loss + entropy (was three separate sync points).
+    const { totalSteps, loss: finalLoss, entropy: finalEntropy } = await this.readTrainingStats();
     // Use actual step counts from GPU instead of hardcoded approximation
     this.adamStep += Math.round(totalSteps / CONFIG.numBoards);
     const avgSteps = totalSteps / CONFIG.numBoards;
-    const finalLoss = await this.readLoss();
-    const finalEntropy = await this.readEntropy();
     const time = performance.now() - start;
     const gamesPerSecTrained = (CONFIG.numBoards / time) * 1000;
     const stepsPerSecTrained = time > 0 ? (totalSteps / time) * 1000 : 0;
@@ -399,57 +406,45 @@ export class GPUTrainer {
     const packed = new Uint32Array(this.readbackBuf.getMappedRange().slice(0, WPB * 4));
     const copy = new Uint32Array(packed);
     this.readbackBuf.unmap();
-    if (this.rollout % 10 === 0) console.log("captureBoard packed:", copy[0], copy[1]);
     this.onBoard(copy);
   }
 
-  async readLoss() {
+  /**
+   * Fused post-rollout readback: stepCount, loss, and entropy for all boards in a
+   * SINGLE copy + SINGLE mapAsync, replacing the three separate readbacks that used
+   * to cost three GPU→CPU sync points (each one flushes the pipeline). The three
+   * fields all live in bytes 152..175 of each board's state:
+   *   - stepCount   @ +152          (u32)
+   *   - loss        @ +160+8  = 168 (f16, transitions[0].reward, written by kernel)
+   *   - entropy     @ +160+14 = 174 (f16, transitions[0]._pad,   written by kernel)
+   * We copy that 24-byte window (offset 152 is 4-aligned, length 24 is a multiple of
+   * 4 — copyBufferToBuffer requires both) per board and parse all three out.
+   * NOTE on the 4-byte-alignment trap: an earlier version read entropy directly from
+   * offset 174, which is NOT a multiple of 4 → the submit silently failed and entropy
+   * read back as the stale loss value. Caught by bench/headless.ts.
+   */
+  async readTrainingStats(): Promise<{ totalSteps: number; loss: number; entropy: number }> {
+    const STRIDE = 24; // bytes [152, 176): stepCount(0) .. loss(16) .. entropy(22)
     const encoder = this.device.createCommandEncoder();
     for (let i = 0; i < CONFIG.numBoards; i++) {
-      encoder.copyBufferToBuffer(this.boardsBuf, i * BOARD_STATE_STRIDE + 160 + 8, this.readbackBuf, i * 4, 4);
+      encoder.copyBufferToBuffer(this.boardsBuf, i * BOARD_STATE_STRIDE + 152, this.readbackBuf, i * STRIDE, STRIDE);
     }
     this.device.queue.submit([encoder.finish()]);
     await this.readbackBuf.mapAsync(GPUMapMode.READ);
-    
-    let sum = 0;
-    if (typeof Float16Array !== "undefined") {
-      const view = new Float16Array(this.readbackBuf.getMappedRange().slice(0, CONFIG.numBoards * 4));
-      for (let i = 0; i < CONFIG.numBoards; i++) { sum += view[i * 2]; }
-    }
-    this.readbackBuf.unmap();
-    return sum / CONFIG.numBoards;
-  }
+    const range = this.readbackBuf.getMappedRange().slice(0, CONFIG.numBoards * STRIDE);
+    const u32 = new Uint32Array(range);
+    const f16 = typeof Float16Array !== "undefined" ? new Float16Array(range) : null;
 
-  async readEntropy() {
-    // Mirror readLoss exactly: entropy is written to transitions[0]._pad (f16).
-    // Transition header offset = 160; _pad sits at byte 14 within the transition.
-    const encoder = this.device.createCommandEncoder();
+    let totalSteps = 0, lossSum = 0, entSum = 0;
     for (let i = 0; i < CONFIG.numBoards; i++) {
-      encoder.copyBufferToBuffer(this.boardsBuf, i * BOARD_STATE_STRIDE + 160 + 14, this.readbackBuf, i * 4, 4);
-    }
-    this.device.queue.submit([encoder.finish()]);
-    await this.readbackBuf.mapAsync(GPUMapMode.READ);
-
-    let sum = 0;
-    if (typeof Float16Array !== "undefined") {
-      const view = new Float16Array(this.readbackBuf.getMappedRange().slice(0, CONFIG.numBoards * 4));
-      for (let i = 0; i < CONFIG.numBoards; i++) { sum += view[i * 2]; }
+      totalSteps += u32[i * 6];          // stepCount: rel byte 0  → u32 index i*6
+      if (f16) {
+        lossSum += f16[i * 12 + 8];      // loss:     rel byte 16 → f16 index i*12+8
+        entSum  += f16[i * 12 + 11];     // entropy:  rel byte 22 → f16 index i*12+11
+      }
     }
     this.readbackBuf.unmap();
-    return sum / CONFIG.numBoards;
-  }
-
-  async readStepCounts() {
-    const encoder = this.device.createCommandEncoder();
-    for (let i = 0; i < CONFIG.numBoards; i++) {
-      encoder.copyBufferToBuffer(this.boardsBuf, i * BOARD_STATE_STRIDE + 152, this.readbackBuf, i * 4, 4);
-    }
-    this.device.queue.submit([encoder.finish()]);
-    await this.readbackBuf.mapAsync(GPUMapMode.READ);
-    const steps = new Uint32Array(this.readbackBuf.getMappedRange().slice(0, CONFIG.numBoards * 4));
-    const copy = new Uint32Array(steps);
-    this.readbackBuf.unmap();
-    return copy;
+    return { totalSteps, loss: lossSum / CONFIG.numBoards, entropy: entSum / CONFIG.numBoards };
   }
 
   /** Read back current weights from GPU — needed for cross-architecture eval. */
