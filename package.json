@@ -12,6 +12,7 @@
   },
   "devDependencies": {
     "@webgpu/types": "^0.1.69",
+    "bun-webgpu": "^0.1.7",
     "typescript": "^5.8.0",
     "vite": "^6.0.0"
   }
