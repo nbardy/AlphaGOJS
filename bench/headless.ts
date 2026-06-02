@@ -33,8 +33,10 @@ const WARMUP = Number(process.env.WARMUP ?? 3);
 const ARCH_NAME = process.env.ARCH ?? "standard";
 const arch = LEAGUE_ARCHS.find((a: any) => a.name === ARCH_NAME) ?? LEAGUE_ARCHS[1];
 
-// Optional batch-size override so we can A/B the batch lever WITHOUT editing source.
+// Tuning overrides so we can A/B levers WITHOUT editing source.
 if (process.env.B) CONFIG.numBoards = Number(process.env.B);
+if (process.env.PPO_EPOCHS) CONFIG.ppoEpochs = Number(process.env.PPO_EPOCHS);
+if (process.env.MAX_STEPS) CONFIG.maxSteps = Number(process.env.MAX_STEPS);
 
 console.log(`\n=== AlphaGOJS headless bench ===`);
 console.log(`arch=${arch.name} D=${arch.D} | B=${CONFIG.numBoards} | maxSteps=${CONFIG.maxSteps} | ppoEpochs=${CONFIG.ppoEpochs}`);
