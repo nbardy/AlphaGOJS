@@ -39,19 +39,59 @@ One `runStep()` = a full training iteration: rollout (self-play to terminal) + G
 - The canvas/worker are simply never used (`onBoard` is left unset → `captureBoard()`
   early-returns).
 
-## Results (Apple M4, B=256, maxSteps=600, ppoEpochs=3)
+## ⚠️ Correctness fix that changed the conclusions: D-hardcoded backward
 
-| Arch | D | games/sec | per-runStep | board-steps/sec | entropy first→last |
-|------|---|----------:|------------:|----------------:|--------------------|
-| compact  | 4  | **333** | 768 ms  | 9,141 | 0.08 → 0.02 ⚠️ collapses |
-| standard | 8  | **141** | 1,814 ms | 3,099 | 2.83 → 1.63 |
-| wide     | 16 | **49**  | 5,250 ms | 1,071 | 2.75 → 1.64 |
+The fused backward/PPO pass in `fused_ppo.wgsl` was pervasively **hardcoded to D=8**
+(literal `8u/16u/72u/128/145u/177u/512u/576u` for channel counts) while the forward used
+`D`. So **only D=8 ever trained correctly**: D=4 read out of bounds → corrupt gradients
+→ entropy collapse + NaN loss (NOT genuine under-capacity); D=16 trained only 8 of 16
+channels. League mode and any earlier D≠8 comparison were invalid. Fixed by generalizing
+every channel literal to a D-expression (validated: D=8 unchanged, D=4/16 now healthy).
+**Any D-comparison numbers from before this fix are garbage — ignore them.**
 
-**`D` is the dominant throughput lever** — roughly the O(D²) convolution cost. D=4 is
-~2.4× faster than D=8; D=16 is ~2.9× slower. **But** the (now-working) policy-entropy
-metric shows D=4's policy **collapses to ~0 entropy almost immediately** (no
-exploration) — a learning-quality risk, not a free speedup. Validate training quality
-before adopting D=4.
+## Results (Apple M4, B=256, maxSteps=600, ppoEpochs=3) — post-fix
+
+| Arch | D | games/sec | per-runStep | entropy first→last |
+|------|---|----------:|------------:|--------------------|
+| compact  | 4  | **333–894** | 286–768 ms | 6.36 → 1.3 ✅ healthy |
+| standard | 8  | **141–166** | 1,536–1,814 ms | 6.36 → 1.4 |
+| wide     | 16 | **26–49**  | 5,250–9,888 ms | 6.36 → 2.0 |
+
+**`D` is the dominant throughput lever** — roughly the O(D²) convolution cost. Entropy now
+starts at the true uniform max `ln(576) ≈ 6.36` for all archs and decays sensibly, with
+**final entropy rising with D** (more capacity → richer policy). D=4 does NOT collapse;
+the earlier collapse was the backward bug above.
+
+### Expressiveness: equal-generations + cross-arch head-to-head (50 gens, post-fix)
+
+Self-play Elo is a separate ladder per arch (not comparable); head-to-head with the final
+weights is. After 50 generations:
+
+| Matchup | Result | Notes |
+|---|---|---|
+| D=4 vs D=8 | D=4 60% (12–8) | small sample — within noise of 50/50 |
+| D=4 vs D=16 | D=4 60% (12–8) | " |
+| D=8 vs D=16 | D=8 60% (12–8) | " |
+
+**D=4 is not less expressive at this budget** — it converges fastest per generation and is
+at least competitive head-to-head (the opposite of the pre-fix buggy result). Caveat: 50
+generations is early-training and 20 eval games is a small sample — this measures early
+*efficiency*, not the asymptotic capacity ceiling. At equal wall-clock D=4 gets ~5–30× more
+generations, so per-unit-compute it dominates decisively.
+
+### Safe-lever tuning stack (no kernel changes) — `bench/sweep.ts`
+
+| Config | games/sec | vs D=8/ep=3 baseline |
+|---|---:|---|
+| D=8, ppoEpochs=3 (baseline) | 161 | 1× |
+| D=8, ppoEpochs=1 | 443 | 2.7× |
+| D=4, ppoEpochs=3 | 878 | 5.4× |
+| **D=4, ppoEpochs=1** | **2341** | **~14.5×** |
+
+Most of the predicted "10×" is reachable from **config alone** (D=4 + fewer PPO epochs),
+now that D=4 actually trains correctly — before reaching for the riskier kernel-numeric
+flags. ppoEpochs trades throughput for sample-efficiency; confirm learning quality over a
+longer run before locking it in.
 
 ### Levers that were tested and did **not** help (full pipeline)
 
