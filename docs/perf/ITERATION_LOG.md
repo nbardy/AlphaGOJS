@@ -32,7 +32,17 @@ compile headless. Its math is the same D-generic code proven exact at D=4. D=16 
 - ⚠️ M4 now heavily throttled (~6× slower than early-session) after sustained benching —
   let it cool for trustworthy absolute numbers; ratios from back-to-back A/B still hold.
 
-| 2 | `fused_ppo.vec4fwd.wgsl` (planned) | forward conv1/conv2/fuse MACs → vec4 (the new ~60% bottleneck); exact-match validation | _pending_ | _pending_ | next |
+| 2 | `fused_ppo.vec4fwd.wgsl` | forward conv1/conv2/fuse MACs → vec4 (the new forward bottleneck) | **PASS** exact at D=8 & D=4 (0 drift) | **D=8 1.33×, D=4 4.42×** | ✅ DONE |
+
+### Iteration 2 finding — the forward was the D=4 bottleneck
+- vec4 forward conv: at D=4 the whole channel dim is ONE vec4, so the conv c-loop collapses
+  → **4.42× at D=4** (123 ms vs 554 ms), even beating cell-parallel alone (234 ms). At D=8
+  (D/4 = 2 vec4 iters) it's a modest **1.33×**.
+- KEY INSIGHT: the two wins target different configs — **cell-parallel fixes the backward
+  (big at D=8), vec4 fixes the forward (huge at D=4). They are disjoint edits → they STACK.**
+- So "diminishing returns" was wrong: the forward at D=4 was a real, large, untapped win.
+
+| 3 | `fused_ppo.combined.wgsl` (planned) | cell-parallel backward + vec4 forward stacked | _pending_ | _pending_ | next |
 
 > Process per the goal: fork baseline → sub-agent applies the guide's precise edit → validate
 > B=1 → measure B=256 → record here → pick next direction from the re-measured bottleneck.
