@@ -93,6 +93,25 @@ now that D=4 actually trains correctly — before reaching for the riskier kerne
 flags. ppoEpochs trades throughput for sample-efficiency; confirm learning quality over a
 longer run before locking it in.
 
+### Equal-WALL-CLOCK validation (`bench/validate_config.ts`)
+
+Equal generations is unfair (D=4 is far cheaper/gen). Giving each config the SAME 50 s of
+compute and then a 60-game head-to-head (2σ significance band = >63%):
+
+| config | gens in 50s | entropy (late) | head-to-head |
+|---|---:|---:|---|
+| D8, ep=3 | 33  | 1.39 | vs D4/ep1: 55% (within noise) |
+| D4, ep=3 | 170 | 1.22 | vs D4/ep1: 58% (within noise) |
+| D4, ep=1 | **464** | 1.22 (no late collapse) | — |
+
+**Finding: the ~14× throughput win does NOT buy a stronger agent.** D4/ep1 ran 14× more
+generations with healthy entropy throughout, yet all three are statistically tied
+head-to-head — the task **plateaus** at roughly equal skill. So D4/ep1 is a validated win
+for reaching the *same* skill ~14× faster/cheaper, not for a better policy. (Budget caveat:
+50 s gave D=8 only 33 gens; a much longer run could still separate them.) Implication for
+the kernel-numeric flags (vec4/fp16): they buy **faster iteration**, not model quality,
+under this plateau.
+
 ### Levers that were tested and did **not** help (full pipeline)
 
 These contradict rollout-only microbenchmark intuition; the full training loop behaves
