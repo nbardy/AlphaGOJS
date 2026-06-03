@@ -32,17 +32,21 @@ compile headless. Its math is the same D-generic code proven exact at D=4. D=16 
 - ⚠️ M4 now heavily throttled (~6× slower than early-session) after sustained benching —
   let it cool for trustworthy absolute numbers; ratios from back-to-back A/B still hold.
 
-| 2 | `fused_ppo.vec4fwd.wgsl` | forward conv1/conv2/fuse MACs → vec4 (the new forward bottleneck) | **PASS** exact at D=8 & D=4 (0 drift) | **D=8 1.33×, D=4 4.42×** | ✅ DONE |
+| 2 | `fused_ppo.vec4fwd.wgsl` | forward conv1/conv2/fuse MACs → vec4 | **PASS** exact at D=8 & D=4 (0 drift) | D=8 1.33×, D=4 **~1.45×** (cool) | ✅ DONE |
+| 3 | `fused_ppo.combined.wgsl` | cell-parallel backward + vec4 forward (stacked, disjoint edits) | **PASS** exact at D=4 (0 drift); D=8 in-browser only | **D=4 2.29×** (cool, order-balanced) | ✅ DONE |
 
-### Iteration 2 finding — the forward was the D=4 bottleneck
-- vec4 forward conv: at D=4 the whole channel dim is ONE vec4, so the conv c-loop collapses
-  → **4.42× at D=4** (123 ms vs 554 ms), even beating cell-parallel alone (234 ms). At D=8
-  (D/4 = 2 vec4 iters) it's a modest **1.33×**.
-- KEY INSIGHT: the two wins target different configs — **cell-parallel fixes the backward
-  (big at D=8), vec4 fixes the forward (huge at D=4). They are disjoint edits → they STACK.**
-- So "diminishing returns" was wrong: the forward at D=4 was a real, large, untapped win.
+### Iterations 2–3 findings + a measurement correction
+- ⚠️ **Correction:** iter-2's "4.42× at D=4" was **thermal-inflated** — measured while the M4
+  was heavily throttled, which penalizes the scalar-heavy baseline more than the vec4 variant.
+  The rigorous **cool-state, order-balanced** number (iter-3 agent) is **vec4 ~1.45×** at D=4.
+  Lesson: thermal control matters — use single-process, order-alternated, cool-regime pairs.
+- Trustworthy cool-state D=4 full-step speedups vs baseline: cell-parallel **1.64×** (backward),
+  vec4 **1.45×** (forward), **combined 2.29×** — they stack multiplicatively (1.64×1.45≈2.38).
+- The two wins are complementary: cell-parallel helps the backward (dominant at D=8), vec4
+  helps the forward (dominant at D=4). Combined wins everywhere.
+- Full stack vs original default (D=8/ep=3 serial → D=4/ep=1 combined) ≈ 14× config × 2.29× kernel.
 
-| 3 | `fused_ppo.combined.wgsl` (planned) | cell-parallel backward + vec4 forward stacked | _pending_ | _pending_ | next |
+| 4 | promote to baseline | graduate vec4-forward (exact, all-D, no shared-mem cost) into `src/fused_ppo.wgsl`; keep cell-parallel as a browser-gated variant (D=16 needs >32KB) | _pending_ | _pending_ | next |
 
 > Process per the goal: fork baseline → sub-agent applies the guide's precise edit → validate
 > B=1 → measure B=256 → record here → pick next direction from the re-measured bottleneck.
