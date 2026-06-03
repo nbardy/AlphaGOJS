@@ -50,14 +50,6 @@ const RED_DWF:    u32 = 2u * D + 1u;                // start of dWf
 const RED_DECELL: u32 = 2u * D + 1u + 2u * D * D;   // start of dE_cell
 const RED_TOTAL:  u32 = RED_DECELL + 4u * D;        // total reduced scalars
 
-// Profiling ablation switches (default 1u = run normally; generateKernel flips a phase
-// to 0u to zero its loop bound, measuring that phase's wall-clock cost). Inert in normal
-// runs — do NOT ship anything that relies on these being 0.
-const RUN_CONV2BWD: u32 = 1u; // conv2+fuse backward + DW2 + bar_a1 (the 64-patch loop)
-const RUN_REDUCE:   u32 = 1u; // small-gradient 2-at-a-time reduction
-const RUN_CONV1BWD: u32 = 1u; // conv1 weight gradient
-const RUN_EMBEDBWD: u32 = 1u; // patch-embedding gradient
-
 struct Params {
   batch_size: u32,
   step: u32,
@@ -609,7 +601,7 @@ fn ppo_step(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) 
     for (var i = 0u; i < P * P * D; i += WG) { sh_bar_a1[lid + i] = 0.0; }
     workgroupBarrier();
 
-    for (var patch_idx = 0u; patch_idx < P * P * RUN_CONV2BWD; patch_idx++) {
+    for (var patch_idx = 0u; patch_idx < P * P; patch_idx++) {
       if (lid < 9u) {
         let sub = lid;
         let py = patch_idx / P; let px = patch_idx % P;
@@ -675,7 +667,7 @@ fn ppo_step(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) 
       workgroupBarrier();
     }
 
-    for (var chunk = 0u; chunk < RED_TOTAL * RUN_REDUCE; chunk += 2u) {
+    for (var chunk = 0u; chunk < RED_TOTAL; chunk += 2u) {
       let count = min(2u, RED_TOTAL - chunk);
       let c0 = chunk; let c1 = chunk + 1u;
 
@@ -718,7 +710,7 @@ fn ppo_step(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) 
     }
     workgroupBarrier();
 
-    for (var w_idx = lid; w_idx < 9u * D * D * RUN_CONV1BWD; w_idx += WG) {
+    for (var w_idx = lid; w_idx < 9u * D * D; w_idx += WG) {
       let o = w_idx % D; let c = (w_idx / D) % D;
       let v = (w_idx / (D * D)) % 3u; let u = (w_idx / (D * D * 3u)) % 3u;
       var grad = 0.0;
@@ -739,7 +731,7 @@ fn ppo_step(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) 
     var pi = select(0u, sh_patch_state[lid], lid < P * P);
     var l_bar_patch0: array<f32, D>;
     let patch_p = i32(lid / P); let patch_q = i32(lid % P);
-    for (var c = 0u; c < D * RUN_EMBEDBWD; c++) {
+    for (var c = 0u; c < D; c++) {
       var grad = 0.0;
       for (var u = 0u; u < 3u; u++) {
         for (var v = 0u; v < 3u; v++) {

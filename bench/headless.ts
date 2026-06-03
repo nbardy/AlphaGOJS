@@ -33,6 +33,10 @@ const WARMUP = Number(process.env.WARMUP ?? 3);
 const ARCH_NAME = process.env.ARCH ?? "standard";
 const arch = LEAGUE_ARCHS.find((a: any) => a.name === ARCH_NAME) ?? LEAGUE_ARCHS[1];
 
+// Profiling ablation: ABLATE=CONV2BWD,REDUCE,... zeroes those backward phases' loop
+// bounds (set before generateKernel runs in trainer.init()) to measure each phase's cost.
+(globalThis as any).__ABLATE__ = process.env.ABLATE ?? '';
+
 // Tuning overrides so we can A/B levers WITHOUT editing source.
 if (process.env.B) CONFIG.numBoards = Number(process.env.B);
 if (process.env.PPO_EPOCHS) CONFIG.ppoEpochs = Number(process.env.PPO_EPOCHS);
