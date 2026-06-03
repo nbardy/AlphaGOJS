@@ -1,7 +1,10 @@
 import baseWgsl from './fused_ppo.wgsl?raw';
 
 export function generateKernel(D: number): string {
-  let wgsl = baseWgsl.replace(
+  // Allow a forked shader variant (headless A/B testing) via globalThis.__KERNEL_SRC__;
+  // defaults to the committed baseline. No-op in the browser (undefined → baseWgsl).
+  const src: string = (globalThis as any).__KERNEL_SRC__ ?? baseWgsl;
+  let wgsl = src.replace(
     /const D: u32 = \d+u;/,
     `const D: u32 = ${D}u;`
   );

@@ -33,6 +33,13 @@ const WARMUP = Number(process.env.WARMUP ?? 3);
 const ARCH_NAME = process.env.ARCH ?? "standard";
 const arch = LEAGUE_ARCHS.find((a: any) => a.name === ARCH_NAME) ?? LEAGUE_ARCHS[1];
 
+// Kernel variant: KERNEL=path/to/variant.wgsl loads a forked shader instead of the
+// committed src/fused_ppo.wgsl, for A/B testing optimizations without touching baseline.
+if (process.env.KERNEL) {
+  (globalThis as any).__KERNEL_SRC__ = await Bun.file(process.env.KERNEL).text();
+  console.log(`(kernel variant: ${process.env.KERNEL})`);
+}
+
 // Profiling ablation: ABLATE=CONV2BWD,REDUCE,... zeroes those backward phases' loop
 // bounds (set before generateKernel runs in trainer.init()) to measure each phase's cost.
 (globalThis as any).__ABLATE__ = process.env.ABLATE ?? '';
