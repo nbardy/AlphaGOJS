@@ -73,9 +73,21 @@ export class GPUTrainer {
       throw new Error("Your browser does not support the 'shader-f16' WebGPU feature. Please enable it in your browser flags (e.g. chrome://flags/#enable-webgpu-developer-features).");
     }
     
-    this.device = await adapter.requestDevice({
-      requiredFeatures: ["shader-f16"],
-    });
+    // Request the adapter's full workgroup-storage limit (default is only 16 KB; M4 and
+    // most browsers support 32 KB). The baseline kernel uses <16 KB so this is a no-op for
+    // it, but optimization variants (e.g. cell-parallel backward) need up to ~26 KB.
+    // NOTE: bun-webgpu's requiredLimits packing is buggy (rejects the field), so we try the
+    // raised limit and fall back to the default — browsers get 32 KB, headless gets 16 KB.
+    try {
+      this.device = await adapter.requestDevice({
+        requiredFeatures: ["shader-f16"],
+        requiredLimits: {
+          maxComputeWorkgroupStorageSize: adapter.limits?.maxComputeWorkgroupStorageSize ?? 32768,
+        },
+      });
+    } catch {
+      this.device = await adapter.requestDevice({ requiredFeatures: ["shader-f16"] });
+    }
 
     // Initialize checkpoint pool from IDB before checking for saved checkpoints
     await this.pool.init();
