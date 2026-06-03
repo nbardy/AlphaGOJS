@@ -225,19 +225,22 @@ fn sh_a_at(py: i32, px: i32, d: u32) -> f32 {
 }
 
 fn conv2_at_patch(py: i32, px: i32, o: u32) -> f32 {
-  var acc: f32 = 0.0;
-  for (var c: u32 = 0u; c < D; c++) {
-    for (var ky: u32 = 0u; ky < 3u; ky++) {
-      for (var kx: u32 = 0u; kx < 3u; kx++) {
-        let y = py + 2*(i32(ky)-1);
-        let x = px + 2*(i32(kx)-1);
-        if (y >= 0 && y < i32(P) && x >= 0 && x < i32(P)) {
-          acc += c2w(ky, kx, c, o) * sh_a[u32(y)*P*D + u32(x)*D + c];
+  var acc4 = vec4<f32>(0.0);
+  for (var ky: u32 = 0u; ky < 3u; ky++) {
+    for (var kx: u32 = 0u; kx < 3u; kx++) {
+      let y = py + 2*(i32(ky)-1);
+      let x = px + 2*(i32(kx)-1);
+      if (y >= 0 && y < i32(P) && x >= 0 && x < i32(P)) {
+        let base = u32(y)*P*D + u32(x)*D;
+        for (var c: u32 = 0u; c < D; c += 4u) {
+          let a4 = vec4<f32>(sh_a[base+c], sh_a[base+c+1u], sh_a[base+c+2u], sh_a[base+c+3u]);
+          let w4 = vec4<f32>(c2w(ky, kx, c, o), c2w(ky, kx, c+1u, o), c2w(ky, kx, c+2u, o), c2w(ky, kx, c+3u, o));
+          acc4 += a4 * w4;
         }
       }
     }
   }
-  return max(acc, 0.0);
+  return max(acc4.x + acc4.y + acc4.z + acc4.w, 0.0);
 }
 
 fn forward_pass(b: u32, lid: u32, is_live: bool) {
@@ -270,18 +273,21 @@ fn forward_pass(b: u32, lid: u32, is_live: bool) {
   if (lid < P * P) {
     let py = i32(lid / P); let px = i32(lid % P);
     for (var o: u32 = 0u; o < D; o++) {
-      var acc: f32 = 0.0;
-      for (var c: u32 = 0u; c < D; c++) {
-        for (var ky: u32 = 0u; ky < 3u; ky++) {
-          for (var kx: u32 = 0u; kx < 3u; kx++) {
-            let y = py + i32(ky) - 1; let x = px + i32(kx) - 1;
-            if (y >= 0 && y < i32(P) && x >= 0 && x < i32(P)) {
-              acc += c1w(ky, kx, c, o) * sh_a[u32(y)*P*D + u32(x)*D + c];
+      var acc4 = vec4<f32>(0.0);
+      for (var ky: u32 = 0u; ky < 3u; ky++) {
+        for (var kx: u32 = 0u; kx < 3u; kx++) {
+          let y = py + i32(ky) - 1; let x = px + i32(kx) - 1;
+          if (y >= 0 && y < i32(P) && x >= 0 && x < i32(P)) {
+            let base = u32(y)*P*D + u32(x)*D;
+            for (var c: u32 = 0u; c < D; c += 4u) {
+              let a4 = vec4<f32>(sh_a[base+c], sh_a[base+c+1u], sh_a[base+c+2u], sh_a[base+c+3u]);
+              let w4 = vec4<f32>(c1w(ky, kx, c, o), c1w(ky, kx, c+1u, o), c1w(ky, kx, c+2u, o), c1w(ky, kx, c+3u, o));
+              acc4 += a4 * w4;
             }
           }
         }
       }
-      conv1_reg[o] = max(acc, 0.0);
+      conv1_reg[o] = max(acc4.x + acc4.y + acc4.z + acc4.w, 0.0);
     }
   }
   workgroupBarrier();
@@ -306,10 +312,15 @@ fn forward_pass(b: u32, lid: u32, is_live: bool) {
 
     var fused: array<f32, D>;
     for (var o: u32 = 0u; o < D; o++) {
-      var acc: f32 = 0.0;
-      for (var c: u32 = 0u; c < D; c++) {
-        acc += fw(c, o) * decoded[c] + fw(D + c, o) * cell_e(state, c);
+      var acc4 = vec4<f32>(0.0);
+      for (var c: u32 = 0u; c < D; c += 4u) {
+        let dec4 = vec4<f32>(decoded[c], decoded[c+1u], decoded[c+2u], decoded[c+3u]);
+        let wd4 = vec4<f32>(fw(c, o), fw(c+1u, o), fw(c+2u, o), fw(c+3u, o));
+        let ce4 = vec4<f32>(cell_e(state, c), cell_e(state, c+1u), cell_e(state, c+2u), cell_e(state, c+3u));
+        let we4 = vec4<f32>(fw(D+c, o), fw(D+c+1u, o), fw(D+c+2u, o), fw(D+c+3u, o));
+        acc4 += dec4 * wd4 + ce4 * we4;
       }
+      let acc = acc4.x + acc4.y + acc4.z + acc4.w;
       fused[o] = max(acc, 0.0);
       pool[o] += fused[o];
     }

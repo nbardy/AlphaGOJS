@@ -50,6 +50,14 @@ const RED_DWF:    u32 = 2u * D + 1u;                // start of dWf
 const RED_DECELL: u32 = 2u * D + 1u + 2u * D * D;   // start of dE_cell
 const RED_TOTAL:  u32 = RED_DECELL + 4u * D;        // total reduced scalars
 
+// Profiling ablation switches (default 1u = run normally; generateKernel flips a phase
+// to 0u to zero its loop bound, measuring that phase's wall-clock cost). Inert in normal
+// runs — do NOT ship anything that relies on these being 0.
+const RUN_CONV2BWD: u32 = 1u; // conv2+fuse backward + DW2 + bar_a1 (the 64-patch loop)
+const RUN_REDUCE:   u32 = 1u; // small-gradient 2-at-a-time reduction
+const RUN_CONV1BWD: u32 = 1u; // conv1 weight gradient
+const RUN_EMBEDBWD: u32 = 1u; // patch-embedding gradient
+
 struct Params {
   batch_size: u32,
   step: u32,
@@ -217,19 +225,22 @@ fn sh_a_at(py: i32, px: i32, d: u32) -> f32 {
 }
 
 fn conv2_at_patch(py: i32, px: i32, o: u32) -> f32 {
-  var acc: f32 = 0.0;
-  for (var c: u32 = 0u; c < D; c++) {
-    for (var ky: u32 = 0u; ky < 3u; ky++) {
-      for (var kx: u32 = 0u; kx < 3u; kx++) {
-        let y = py + 2*(i32(ky)-1);
-        let x = px + 2*(i32(kx)-1);
-        if (y >= 0 && y < i32(P) && x >= 0 && x < i32(P)) {
-          acc += c2w(ky, kx, c, o) * sh_a[u32(y)*P*D + u32(x)*D + c];
+  var acc4 = vec4<f32>(0.0);
+  for (var ky: u32 = 0u; ky < 3u; ky++) {
+    for (var kx: u32 = 0u; kx < 3u; kx++) {
+      let y = py + 2*(i32(ky)-1);
+      let x = px + 2*(i32(kx)-1);
+      if (y >= 0 && y < i32(P) && x >= 0 && x < i32(P)) {
+        let base = u32(y)*P*D + u32(x)*D;
+        for (var c: u32 = 0u; c < D; c += 4u) {
+          let a4 = vec4<f32>(sh_a[base+c], sh_a[base+c+1u], sh_a[base+c+2u], sh_a[base+c+3u]);
+          let w4 = vec4<f32>(c2w(ky, kx, c, o), c2w(ky, kx, c+1u, o), c2w(ky, kx, c+2u, o), c2w(ky, kx, c+3u, o));
+          acc4 += a4 * w4;
         }
       }
     }
   }
-  return max(acc, 0.0);
+  return max(acc4.x + acc4.y + acc4.z + acc4.w, 0.0);
 }
 
 fn forward_pass(b: u32, lid: u32, is_live: bool) {
@@ -262,18 +273,21 @@ fn forward_pass(b: u32, lid: u32, is_live: bool) {
   if (lid < P * P) {
     let py = i32(lid / P); let px = i32(lid % P);
     for (var o: u32 = 0u; o < D; o++) {
-      var acc: f32 = 0.0;
-      for (var c: u32 = 0u; c < D; c++) {
-        for (var ky: u32 = 0u; ky < 3u; ky++) {
-          for (var kx: u32 = 0u; kx < 3u; kx++) {
-            let y = py + i32(ky) - 1; let x = px + i32(kx) - 1;
-            if (y >= 0 && y < i32(P) && x >= 0 && x < i32(P)) {
-              acc += c1w(ky, kx, c, o) * sh_a[u32(y)*P*D + u32(x)*D + c];
+      var acc4 = vec4<f32>(0.0);
+      for (var ky: u32 = 0u; ky < 3u; ky++) {
+        for (var kx: u32 = 0u; kx < 3u; kx++) {
+          let y = py + i32(ky) - 1; let x = px + i32(kx) - 1;
+          if (y >= 0 && y < i32(P) && x >= 0 && x < i32(P)) {
+            let base = u32(y)*P*D + u32(x)*D;
+            for (var c: u32 = 0u; c < D; c += 4u) {
+              let a4 = vec4<f32>(sh_a[base+c], sh_a[base+c+1u], sh_a[base+c+2u], sh_a[base+c+3u]);
+              let w4 = vec4<f32>(c1w(ky, kx, c, o), c1w(ky, kx, c+1u, o), c1w(ky, kx, c+2u, o), c1w(ky, kx, c+3u, o));
+              acc4 += a4 * w4;
             }
           }
         }
       }
-      conv1_reg[o] = max(acc, 0.0);
+      conv1_reg[o] = max(acc4.x + acc4.y + acc4.z + acc4.w, 0.0);
     }
   }
   workgroupBarrier();
@@ -298,10 +312,15 @@ fn forward_pass(b: u32, lid: u32, is_live: bool) {
 
     var fused: array<f32, D>;
     for (var o: u32 = 0u; o < D; o++) {
-      var acc: f32 = 0.0;
-      for (var c: u32 = 0u; c < D; c++) {
-        acc += fw(c, o) * decoded[c] + fw(D + c, o) * cell_e(state, c);
+      var acc4 = vec4<f32>(0.0);
+      for (var c: u32 = 0u; c < D; c += 4u) {
+        let dec4 = vec4<f32>(decoded[c], decoded[c+1u], decoded[c+2u], decoded[c+3u]);
+        let wd4 = vec4<f32>(fw(c, o), fw(c+1u, o), fw(c+2u, o), fw(c+3u, o));
+        let ce4 = vec4<f32>(cell_e(state, c), cell_e(state, c+1u), cell_e(state, c+2u), cell_e(state, c+3u));
+        let we4 = vec4<f32>(fw(D+c, o), fw(D+c+1u, o), fw(D+c+2u, o), fw(D+c+3u, o));
+        acc4 += dec4 * wd4 + ce4 * we4;
       }
+      let acc = acc4.x + acc4.y + acc4.z + acc4.w;
       fused[o] = max(acc, 0.0);
       pool[o] += fused[o];
     }
@@ -601,7 +620,7 @@ fn ppo_step(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) 
     for (var i = 0u; i < P * P * D; i += WG) { sh_bar_a1[lid + i] = 0.0; }
     workgroupBarrier();
 
-    for (var patch_idx = 0u; patch_idx < P * P; patch_idx++) {
+    for (var patch_idx = 0u; patch_idx < P * P * RUN_CONV2BWD; patch_idx++) {
       if (lid < 9u) {
         let sub = lid;
         let py = patch_idx / P; let px = patch_idx % P;
@@ -667,7 +686,7 @@ fn ppo_step(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) 
       workgroupBarrier();
     }
 
-    for (var chunk = 0u; chunk < RED_TOTAL; chunk += 2u) {
+    for (var chunk = 0u; chunk < RED_TOTAL * RUN_REDUCE; chunk += 2u) {
       let count = min(2u, RED_TOTAL - chunk);
       let c0 = chunk; let c1 = chunk + 1u;
 
@@ -710,7 +729,7 @@ fn ppo_step(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) 
     }
     workgroupBarrier();
 
-    for (var w_idx = lid; w_idx < 9u * D * D; w_idx += WG) {
+    for (var w_idx = lid; w_idx < 9u * D * D * RUN_CONV1BWD; w_idx += WG) {
       let o = w_idx % D; let c = (w_idx / D) % D;
       let v = (w_idx / (D * D)) % 3u; let u = (w_idx / (D * D * 3u)) % 3u;
       var grad = 0.0;
@@ -731,7 +750,7 @@ fn ppo_step(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) 
     var pi = select(0u, sh_patch_state[lid], lid < P * P);
     var l_bar_patch0: array<f32, D>;
     let patch_p = i32(lid / P); let patch_q = i32(lid % P);
-    for (var c = 0u; c < D; c++) {
+    for (var c = 0u; c < D * RUN_EMBEDBWD; c++) {
       var grad = 0.0;
       for (var u = 0u; u < 3u; u++) {
         for (var v = 0u; v < 3u; v++) {
