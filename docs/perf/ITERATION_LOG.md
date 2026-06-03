@@ -46,7 +46,18 @@ compile headless. Its math is the same D-generic code proven exact at D=4. D=16 
   helps the forward (dominant at D=4). Combined wins everywhere.
 - Full stack vs original default (D=8/ep=3 serial → D=4/ep=1 combined) ≈ 14× config × 2.29× kernel.
 
-| 4 | promote to baseline | graduate vec4-forward (exact, all-D, no shared-mem cost) into `src/fused_ppo.wgsl`; keep cell-parallel as a browser-gated variant (D=16 needs >32KB) | _pending_ | _pending_ | next |
+| 4 | promote to baseline | graduate vec4-forward into `src/fused_ppo.wgsl` (exact, all-D, no shared-mem cost) | **PASS** baseline B=1 unchanged at all D; build green | ~1.3–1.45× live, all configs | ✅ DONE |
+
+### Where the loop landed
+- **Baseline now includes vec4 forward** — a safe, universal ~1.3–1.45× for every config
+  (incl. D=16), exact, headless-testable. Re-snapshotted in `bench/baselines/`.
+- **`fused_ppo.combined.wgsl` (cell-parallel backward + vec4) = 2.29× at D=4**, validated,
+  kept as a variant for a future **browser-gated** baseline promotion (the cell-parallel
+  backward needs 32 KB workgroup storage → in-browser only; D=16 needs a patch-tiled version).
+- Remaining levers are now genuinely marginal: subgroups (~5% of the now-small backward),
+  fp16-accumulate (~1%). Not worth it vs the config + cell-parallel + vec4 stack.
+- **Total available stack** vs original default: ~14× (config: D=4 + ppoEpochs=1) × ~2.3×
+  (combined kernel) ≈ **~30×**, with the safe vec4 portion already live in the baseline.
 
 > Process per the goal: fork baseline → sub-agent applies the guide's precise edit → validate
 > B=1 → measure B=256 → record here → pick next direction from the re-measured bottleneck.
