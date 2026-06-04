@@ -59,6 +59,21 @@ compile headless. Its math is the same D-generic code proven exact at D=4. D=16 
 - **Total available stack** vs original default: ~14× (config: D=4 + ppoEpochs=1) × ~2.3×
   (combined kernel) ≈ **~30×**, with the safe vec4 portion already live in the baseline.
 
+| 5 | gated promotion → DEFAULT | combined kernel made the baseline, gated `USE_CELLPAR_BWD` (cell-parallel D≤8, serial D=16) | headless B=1 exact (D=4 0.4805, D=16 0.4985) + **in-browser D=8** | **D=8 default ~4.2×** (162→687 g/s) | ✅ DONE |
+
+### The default is now the combined kernel (browser-validated)
+- `src/fused_ppo.wgsl` IS the gated combined kernel. The live app's default (**D=8 single
+  mode**) was validated **in a real headed Chrome** (bun-webgpu can't bench D=8): **no GPU
+  errors, 686 games/s (~4.2× over the original ~162), Elo climbing 1000→1251, entropy
+  decaying ~6.4→1.5, win-rate smooth.** D=16/league uses the serial fallback (unbroken).
+- Kernel-only speedup at the *original config* (D=8, ep=3): **~4.2× measured in-browser** —
+  this is the apples-to-apples number (cell-parallel dominates since the backward is ~96%
+  at ep=3). At ep=1 the kernel win shrinks to ~2.3× because the config already shrank the backward.
+- Design note: the gating uses generateKernel const-injection (USE_CELLPAR_BWD/PD2_ALL_FACTOR)
+  because WGSL workgroup-array sizes are compile-time — a runtime `if` can't shrink the D=16
+  array. The cleaner *single-path* alternative is patch-tiling the cell-parallel to fit 16 KB
+  at all D (no gating, headless-testable at D=8 too) — a future refinement.
+
 > Process per the goal: fork baseline → sub-agent applies the guide's precise edit → validate
 > B=1 → measure B=256 → record here → pick next direction from the re-measured bottleneck.
 > Candidate next directions (re-measure after each to re-rank): register-spill relief for the
