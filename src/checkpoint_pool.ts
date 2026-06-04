@@ -57,11 +57,19 @@ export class CheckpointPool {
 
   sampleOpponent(): Checkpoint | null {
     if (this.checkpoints.length === 0) return null;
-    // Exponential recency bias: u^0.5 maps uniform [0,1] toward higher indices (recent checkpoints)
-    const u = Math.random();
-    const biased = Math.floor(Math.pow(u, 0.5) * this.checkpoints.length);
-    const idx = Math.min(biased, this.checkpoints.length - 1);
-    return this.checkpoints[idx];
+    const n = this.checkpoints.length;
+    // PFSP-style DIVERSITY blend: ~50% of the time draw a recency-biased opponent
+    // (keeps the Elo ladder pushing against strong recent versions), and ~50% draw
+    // UNIFORMLY over the full pool (revisits older / more diverse opponents so the
+    // agent doesn't overfit to its current self and forget how to beat earlier styles).
+    // The recency branch uses u^0.5 to skew toward higher (more recent) indices.
+    let idx: number;
+    if (Math.random() < 0.5) {
+      idx = Math.floor(Math.pow(Math.random(), 0.5) * n); // recency-biased
+    } else {
+      idx = Math.floor(Math.random() * n);                // uniform over all checkpoints
+    }
+    return this.checkpoints[Math.min(idx, n - 1)];
   }
 
   updateElo(opponentElo: number, currentWon: boolean, draw: boolean) {

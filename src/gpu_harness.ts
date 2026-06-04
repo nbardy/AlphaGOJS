@@ -1,6 +1,8 @@
 import { generateKernel } from './kernel_template';
 import { computeWeightLayout, type ArchConfig, type WeightLayout } from './arch_config';
 import { CheckpointPool, type Checkpoint } from './checkpoint_pool';
+import { inferAction } from './js_inference';
+import { initBoard, setCellState, plagueSpread, isTerminal, countTerritory, pcg } from './js_game';
 
 export const CONFIG = {
   numBoards: 256,
@@ -55,6 +57,21 @@ export class GPUTrainer {
 
   adamStep = 0;
   rollout = 0;
+
+  // FIXED ANCHOR: a COPY of the gen-0 random-init player weights, captured in init().
+  // The init RNG seed (12345) is hard-coded, so this gen-0 model is byte-identical on
+  // every run — making it a run-independent yardstick. We rate the live agent against
+  // it (position-corrected) so skill is comparable ACROSS runs, unlike self-play Elo
+  // which is purely relative. Only set in the deterministic random-init branch; when
+  // resuming from a checkpoint we can't reconstruct gen-0, so it stays null and the
+  // anchor eval is skipped.
+  fixedAnchor: { dense: Float32Array; embed: Float16Array } | null = null;
+
+  // Last computed calibrated anchor Elos, carried forward between the every-10-rollout
+  // evals so the onStats series hold flat instead of combing to a sentinel each step.
+  lastEloAnchorFirst = 1000;
+  lastEloAnchorSecond = 1000;
+  lastEloAnchorMixed = 1000;
 
   onStats?: (stats: any) => void;
   onBoard?: (board: Uint32Array) => void;
@@ -162,6 +179,18 @@ export class GPUTrainer {
           embedWeights[i] = (nextRng() - 0.5) * 0.02;
         }
       }
+
+      // Capture the gen-0 player-slot weights as the FIXED ANCHOR. The weight buffers
+      // are laid out [player w | player m | player v | opp w | opp m | opp v]; the
+      // player's w component is the front denseWeightCount floats / embedWeightCount
+      // f16s, which is exactly what we just initialized above. We snapshot a COPY so
+      // later GPU training (which mutates the front buffer in place) can't perturb it.
+      this.fixedAnchor = {
+        dense: new Float32Array(denseWeights.subarray(0, this.layout.denseWeightCount)),
+        embed: embedWeights
+          ? new Float16Array(embedWeights.subarray(0, this.layout.embedWeightCount))
+          : new Float16Array(this.layout.embedWeightCount),
+      };
     }
 
     this.device.queue.writeBuffer(this.denseBuf, 0, denseWeights);
@@ -347,7 +376,14 @@ export class GPUTrainer {
     const stepsPerSecTrained = time > 0 ? (totalSteps / time) * 1000 : 0;
     
     this.rollout++;
-    
+
+    // CROSS-RUN-COMPARABLE SKILL METRIC: every 10 rollouts, rate the agent vs the fixed
+    // gen-0 anchor (position-corrected). Between evals we carry forward the last values
+    // (held in this.lastEloAnchor*) so the onStats series hold flat instead of combing.
+    if (this.fixedAnchor && this.rollout % 10 === 0) {
+      await this.evalVsAnchor(); // updates this.lastEloAnchor{First,Second,Mixed}
+    }
+
     if (this.onStats) {
       this.onStats({
          rollout: this.rollout,
@@ -359,7 +395,11 @@ export class GPUTrainer {
          trainedStepsPerSec: stepsPerSecTrained,
          avgStepsPerGame: avgSteps,
          winRate: evalWinRate,
-         entropy: finalEntropy
+         entropy: finalEntropy,
+         // Calibrated skill vs the FIXED anchor (run-independent, position-corrected).
+         eloAnchorFirst: this.lastEloAnchorFirst,
+         eloAnchorSecond: this.lastEloAnchorSecond,
+         eloAnchorMixed: this.lastEloAnchorMixed
       });
     }
   }
@@ -474,6 +514,76 @@ export class GPUTrainer {
     const embed = new Float16Array(new Float16Array(mapped, denseBytes, this.layout.embedWeightCount));
     this.readbackBuf.unmap();
     return { dense, embed };
+  }
+
+  /**
+   * Cross-run-comparable skill eval vs the FIXED gen-0 anchor, POSITION-CORRECTED.
+   *
+   * Why: self-play Elo is purely relative (it climbs even when the agent is ~random in
+   * clean play) and the first move is worth ~83% win-rate, so a single mixed number is
+   * misleading. We instead rate the live agent against the run-independent gen-0 model
+   * with the position split made explicit:
+   *   - eloAnchorFirst:  agent plays P1 (moves first) — first-move-ADVANTAGED.
+   *   - eloAnchorSecond: agent plays P2 (moves second) — first-move-DISADVANTAGED.
+   *   - eloAnchorMixed:  pooled over both — the position-neutral skill estimate.
+   * Because the anchor is byte-identical every run, these numbers are reproducible
+   * across runs (unlike self-play Elo). Measurement-only: training is untouched.
+   *
+   * Mirrors bench/head2head.ts playGame for the game loop and outcome rule.
+   */
+  async evalVsAnchor(): Promise<{ first: number; second: number; mixed: number }> {
+    if (!this.fixedAnchor) {
+      return { first: this.lastEloAnchorFirst, second: this.lastEloAnchorSecond, mixed: this.lastEloAnchorMixed };
+    }
+
+    const agent = { weights: await this.readWeights(), layout: this.layout };
+    const anchor = { weights: this.fixedAnchor, layout: this.layout };
+    const GAMES_PER_SIDE = 6;
+
+    // One game; p1 moves first. Mirrors bench/head2head.ts playGame exactly.
+    const playGame = (p1: typeof agent, p2: typeof agent, seed: number): "p1" | "p2" | "draw" => {
+      const board = initBoard(seed, CONFIG.wallDensity);
+      let cur = 1, step = 0;
+      while (step < CONFIG.maxSteps) {
+        if (isTerminal(board)) break;
+        const slot = cur === 1 ? p1 : p2;
+        const stepSeed = pcg((seed ^ pcg(step >>> 0)) >>> 0);
+        const action = inferAction(slot.weights, slot.layout, board, cur, stepSeed);
+        setCellState(board, action, cur);
+        plagueSpread(board, seed, step, action, 0);
+        cur = cur === 1 ? 2 : 1; step++;
+      }
+      const { p1: t1, p2: t2 } = countTerritory(board);
+      return t1 > t2 ? "p1" : t2 > t1 ? "p2" : "draw";
+    };
+
+    let firstWins = 0, firstDecisive = 0; // agent as P1
+    let secondWins = 0, secondDecisive = 0; // agent as P2
+    for (let g = 0; g < GAMES_PER_SIDE; g++) {
+      const seed = pcg((0x51A1 ^ pcg(g >>> 0)) >>> 0);
+      // Agent is P1 (moves first) vs anchor.
+      const r1 = playGame(agent, anchor, seed);
+      if (r1 === "p1") { firstWins++; firstDecisive++; } else if (r1 === "p2") { firstDecisive++; }
+      // Agent is P2 (moves second); anchor is P1.
+      const r2 = playGame(anchor, agent, seed);
+      if (r2 === "p2") { secondWins++; secondDecisive++; } else if (r2 === "p1") { secondDecisive++; }
+    }
+
+    // Calibrated Elo from a win-rate p: 1000 + 400*log10(p/(1-p)), p clamped to [1e-3, 1-1e-3]
+    // (so a 0% or 100% sweep maps to a finite ±~1200 Elo instead of ±Infinity).
+    const toElo = (wins: number, decisive: number): number => {
+      const raw = decisive > 0 ? wins / decisive : 0.5;
+      const p = Math.max(1e-3, Math.min(1 - 1e-3, raw));
+      return 1000 + 400 * Math.log10(p / (1 - p));
+    };
+
+    const first = toElo(firstWins, firstDecisive);
+    const second = toElo(secondWins, secondDecisive);
+    const mixed = toElo(firstWins + secondWins, firstDecisive + secondDecisive);
+    this.lastEloAnchorFirst = first;
+    this.lastEloAnchorSecond = second;
+    this.lastEloAnchorMixed = mixed;
+    return { first, second, mixed };
   }
 
   async saveCheckpoint() {

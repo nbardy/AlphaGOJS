@@ -76,6 +76,16 @@ const history = {
   entropy:     [] as number[],
 };
 
+// Calibrated skill vs the FIXED gen-0 anchor (position-corrected, cross-run-comparable).
+// Three OVERLAPPING series on one Elo chart: agent-as-first (advantaged), agent-as-second
+// (disadvantaged), and the position-neutral mixed estimate. Unlike self-play Elo these are
+// reproducible across runs because the anchor is byte-identical every run.
+const anchorEloHistory = {
+  first:  [] as number[], // green
+  second: [] as number[], // red
+  mixed:  [] as number[], // blue
+};
+
 // Win-rate is only measured on eval steps (~CONFIG.evalFraction of steps); on
 // non-eval steps the worker reports winRate = -1 as a "no eval" sentinel. We must
 // NOT plot that -1, or the [0,1] chart combs down to the floor every other step.
@@ -133,11 +143,33 @@ const chartCanvases = chartDefs.map(def => {
   return { canvas: c, def };
 });
 
-/** Redraw all 6 charts from current history. */
+// Dedicated multi-series chart for the three anchor Elos (overlapping lines). Uses the
+// same drawLineChart multi-series path as the league Elo chart, but lives in single mode
+// alongside the per-metric charts.
+const anchorEloCanvas = createChartCanvas(300, 150);
+chartGrid.appendChild(anchorEloCanvas);
+
+/** Redraw the anchor-Elo chart: first=green, second=red, mixed=blue, overlapping. */
+function redrawAnchorEloChart(): void {
+  const series: ChartSeries[] = [
+    { data: anchorEloHistory.first,  color: '#44ff44', label: 'agent first' },
+    { data: anchorEloHistory.second, color: '#ff4444', label: 'agent second' },
+    { data: anchorEloHistory.mixed,  color: '#4488ff', label: 'mixed' },
+  ];
+  drawLineChart(anchorEloCanvas, [], {
+    title: 'Skill vs Fixed Anchor (gen-0, calibrated Elo)',
+    series,
+    refLine: 1000,
+    refColor: '#ffcc00',
+  });
+}
+
+/** Redraw all per-metric charts (and the anchor-Elo multi-series chart) from history. */
 function redrawCharts(): void {
   for (const { canvas: c, def } of chartCanvases) {
     drawLineChart(c, history[def.key], def.options);
   }
+  redrawAnchorEloChart();
 }
 
 // Draw initial empty state
@@ -484,6 +516,13 @@ worker.onmessage = (e: MessageEvent) => {
     if (wr >= 0) realWinRates.push(wr);
     history.winRate.push(realWinRates.length > 0 ? smoothedWinRate() : 0);
     history.entropy.push(s.entropy ?? 0);
+
+    // Anchor Elos are carried forward by the worker between its every-10-rollout evals,
+    // so a value is present on every STATS message — push all three each step so the
+    // three overlapping lines stay aligned with the other charts' x-axis.
+    anchorEloHistory.first.push(s.eloAnchorFirst ?? 1000);
+    anchorEloHistory.second.push(s.eloAnchorSecond ?? 1000);
+    anchorEloHistory.mixed.push(s.eloAnchorMixed ?? 1000);
 
     redrawCharts();
     return;
