@@ -18,6 +18,13 @@ const WPB: u32 = (N + 15u) / 16u; // 36
 const MASK_FILL: f32 = -3.4e38;
 const EPS: f32 = 1.0e-12;
 
+// KOMI: territory bonus (in cells) granted to the SECOND player (P2), like Go komi, to
+// neutralize the measured first-move advantage. Empirically swept in bench/_komi_sweep
+// (60-gen compact agents, 720 games): P1 win-rate is ~50% at KOMI=64 (50.3%) / 65 (49.4%)
+// vs ~74-79% at KOMI=0. Only the terminal reward in rollout_step uses this; everything
+// else (forward/backward/optimizer) is byte-for-byte the baseline kernel.
+const KOMI: f32 = 64.0;
+
 // Dense Weights
 const W_CONV1: u32 = 0u;
 const W_CONV2: u32 = W_CONV1 + 9u * D * D;
@@ -496,11 +503,17 @@ fn rollout_step(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_
         if (s == 1u) { p1++; } else if (s == 2u) { p2++; }
       }
       
-      let base_reward = select(select(-1.0, 1.0, p1 > p2), 0.0, p1 == p2);
-      let total_cells = f32(p1 + p2);
-      let p1_pct = select(0.5, f32(p1) / total_cells, total_cells > 0.0);
+      // KOMI: give the SECOND player a +KOMI-cell territory handicap, so the new
+      // break-even is p1 == p2 + KOMI (P1 must out-territory P2 by >KOMI cells to win).
+      // p2k is P2's komi-adjusted territory; the win sign and the proportional
+      // territory_diff bonus both re-center on this komi break-even.
+      let p2k = f32(p2) + KOMI;
+      let f_p1 = f32(p1);
+      let base_reward = select(select(-1.0, 1.0, f_p1 > p2k), 0.0, f_p1 == p2k);
+      let total_cells = f_p1 + p2k;
+      let p1_pct = select(0.5, f_p1 / total_cells, total_cells > 0.0);
       let territory_diff = (p1_pct - 0.5) * 2.0;
-      
+
       let scaled_reward = (base_reward * params.elo_scale) + (territory_diff * params.territory_bonus);
       boards[b].transitions[ns - 1u].reward = f16(scaled_reward);
     }

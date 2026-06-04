@@ -58,9 +58,6 @@ const RUN_REDUCE:   u32 = 1u; // small-gradient 2-at-a-time reduction
 const RUN_CONV1BWD: u32 = 1u; // conv1 weight gradient
 const RUN_EMBEDBWD: u32 = 1u; // patch-embedding gradient
 
-const USE_CELLPAR_BWD: bool = true; // generateKernel sets false for D>8 (serial fallback)
-const PD2_ALL_FACTOR: u32 = 64u;    // = P*P for the cell-parallel scratch; generateKernel sets 1u for D>8
-
 struct Params {
   batch_size: u32,
   step: u32,
@@ -124,8 +121,7 @@ var<workgroup> sh_b: array<f32, SH_B_SIZE>;
 var<workgroup> sh_pool: array<f32, 64u>;
 var<workgroup> sh_reduce_m: array<f32, 64u>;
 var<workgroup> sh_reduce_s: array<f32, 64u>;
-var<workgroup> sh_patch_delta2: array<f32, PATCH_CH>;
-var<workgroup> sh_patch_delta2_all: array<f32, PD2_ALL_FACTOR * PATCH_CH>;
+var<workgroup> sh_patch_delta2_all: array<f32, P * P * PATCH_CH>;
 var<workgroup> sh_value: f32;
 var<workgroup> sh_action: u32;
 var<workgroup> sh_log_prob: f32;
@@ -229,22 +225,19 @@ fn sh_a_at(py: i32, px: i32, d: u32) -> f32 {
 }
 
 fn conv2_at_patch(py: i32, px: i32, o: u32) -> f32 {
-  var acc4 = vec4<f32>(0.0);
-  for (var ky: u32 = 0u; ky < 3u; ky++) {
-    for (var kx: u32 = 0u; kx < 3u; kx++) {
-      let y = py + 2*(i32(ky)-1);
-      let x = px + 2*(i32(kx)-1);
-      if (y >= 0 && y < i32(P) && x >= 0 && x < i32(P)) {
-        let base = u32(y)*P*D + u32(x)*D;
-        for (var c: u32 = 0u; c < D; c += 4u) {
-          let a4 = vec4<f32>(sh_a[base+c], sh_a[base+c+1u], sh_a[base+c+2u], sh_a[base+c+3u]);
-          let w4 = vec4<f32>(c2w(ky, kx, c, o), c2w(ky, kx, c+1u, o), c2w(ky, kx, c+2u, o), c2w(ky, kx, c+3u, o));
-          acc4 += a4 * w4;
+  var acc: f32 = 0.0;
+  for (var c: u32 = 0u; c < D; c++) {
+    for (var ky: u32 = 0u; ky < 3u; ky++) {
+      for (var kx: u32 = 0u; kx < 3u; kx++) {
+        let y = py + 2*(i32(ky)-1);
+        let x = px + 2*(i32(kx)-1);
+        if (y >= 0 && y < i32(P) && x >= 0 && x < i32(P)) {
+          acc += c2w(ky, kx, c, o) * sh_a[u32(y)*P*D + u32(x)*D + c];
         }
       }
     }
   }
-  return max(acc4.x + acc4.y + acc4.z + acc4.w, 0.0);
+  return max(acc, 0.0);
 }
 
 fn forward_pass(b: u32, lid: u32, is_live: bool) {
@@ -277,21 +270,18 @@ fn forward_pass(b: u32, lid: u32, is_live: bool) {
   if (lid < P * P) {
     let py = i32(lid / P); let px = i32(lid % P);
     for (var o: u32 = 0u; o < D; o++) {
-      var acc4 = vec4<f32>(0.0);
-      for (var ky: u32 = 0u; ky < 3u; ky++) {
-        for (var kx: u32 = 0u; kx < 3u; kx++) {
-          let y = py + i32(ky) - 1; let x = px + i32(kx) - 1;
-          if (y >= 0 && y < i32(P) && x >= 0 && x < i32(P)) {
-            let base = u32(y)*P*D + u32(x)*D;
-            for (var c: u32 = 0u; c < D; c += 4u) {
-              let a4 = vec4<f32>(sh_a[base+c], sh_a[base+c+1u], sh_a[base+c+2u], sh_a[base+c+3u]);
-              let w4 = vec4<f32>(c1w(ky, kx, c, o), c1w(ky, kx, c+1u, o), c1w(ky, kx, c+2u, o), c1w(ky, kx, c+3u, o));
-              acc4 += a4 * w4;
+      var acc: f32 = 0.0;
+      for (var c: u32 = 0u; c < D; c++) {
+        for (var ky: u32 = 0u; ky < 3u; ky++) {
+          for (var kx: u32 = 0u; kx < 3u; kx++) {
+            let y = py + i32(ky) - 1; let x = px + i32(kx) - 1;
+            if (y >= 0 && y < i32(P) && x >= 0 && x < i32(P)) {
+              acc += c1w(ky, kx, c, o) * sh_a[u32(y)*P*D + u32(x)*D + c];
             }
           }
         }
       }
-      conv1_reg[o] = max(acc4.x + acc4.y + acc4.z + acc4.w, 0.0);
+      conv1_reg[o] = max(acc, 0.0);
     }
   }
   workgroupBarrier();
@@ -316,15 +306,10 @@ fn forward_pass(b: u32, lid: u32, is_live: bool) {
 
     var fused: array<f32, D>;
     for (var o: u32 = 0u; o < D; o++) {
-      var acc4 = vec4<f32>(0.0);
-      for (var c: u32 = 0u; c < D; c += 4u) {
-        let dec4 = vec4<f32>(decoded[c], decoded[c+1u], decoded[c+2u], decoded[c+3u]);
-        let wd4 = vec4<f32>(fw(c, o), fw(c+1u, o), fw(c+2u, o), fw(c+3u, o));
-        let ce4 = vec4<f32>(cell_e(state, c), cell_e(state, c+1u), cell_e(state, c+2u), cell_e(state, c+3u));
-        let we4 = vec4<f32>(fw(D+c, o), fw(D+c+1u, o), fw(D+c+2u, o), fw(D+c+3u, o));
-        acc4 += dec4 * wd4 + ce4 * we4;
+      var acc: f32 = 0.0;
+      for (var c: u32 = 0u; c < D; c++) {
+        acc += fw(c, o) * decoded[c] + fw(D + c, o) * cell_e(state, c);
       }
-      let acc = acc4.x + acc4.y + acc4.z + acc4.w;
       fused[o] = max(acc, 0.0);
       pool[o] += fused[o];
     }
@@ -624,7 +609,6 @@ fn ppo_step(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) 
     for (var i = 0u; i < P * P * D; i += WG) { sh_bar_a1[lid + i] = 0.0; }
     workgroupBarrier();
 
-    if (USE_CELLPAR_BWD) {
     // === CONV2/FUSE BACKWARD — cell-parallel (replaces 64 serial patches @ 9/64 threads) ===
     if (RUN_CONV2BWD == 1u) {
       // Phase 1: all 64 threads, ~9 cells each. Per-cell delta_f + small weight grads
@@ -711,73 +695,6 @@ fn ppo_step(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) 
         sh_bar_a1[out_idx] += acc;
       }
       workgroupBarrier();
-    }
-    } else {
-    for (var patch_idx = 0u; patch_idx < P * P * RUN_CONV2BWD; patch_idx++) {
-      if (lid < 9u) {
-        let sub = lid;
-        let py = patch_idx / P; let px = patch_idx % P;
-        let y = py * 3u + sub / 3u; let x = px * 3u + sub % 3u;
-        let state = get_sh_cell_state(y, x);
-
-        var decoded: array<f32, D>;
-        for (var c = 0u; c < D; c++) { decoded[c] = conv2_at_patch(i32(py), i32(px), sub * D + c); }
-
-        var af: array<f32, D>;
-        for (var o = 0u; o < D; o++) {
-          var acc = 0.0;
-          for (var c = 0u; c < D; c++) { acc += fw(c, o) * decoded[c] + fw(D + c, o) * cell_e(state, c); }
-          af[o] = max(acc, 0.0);
-        }
-
-        let delta_pi_i = sh_b[y * K + x];
-        let delta_v_N = sh_delta_v / f32(N);
-        var delta_f: array<f32, D>;
-
-        for (var o = 0u; o < D; o++) {
-          l_dWpi[o] += delta_pi_i * af[o];
-          l_dWv[o] += delta_v_N * af[o];
-
-          let bar_af = delta_pi_i * pw(o) + delta_v_N * vw(o);
-          delta_f[o] = select(0.0, bar_af, af[o] > 0.0);
-
-          for (var c = 0u; c < D; c++) {
-            l_dWf[c * D + o] += delta_f[o] * decoded[c];
-            l_dWf[(D + c) * D + o] += delta_f[o] * cell_e(state, c);
-            l_dE_cell[state * D + c] += delta_f[o] * fw(D + c, o);
-          }
-        }
-
-        for (var d = 0u; d < D; d++) {
-          var bar_decoded_d = 0.0;
-          for (var o = 0u; o < D; o++) { bar_decoded_d += delta_f[o] * fw(d, o); }
-          sh_patch_delta2[sub * D + d] = select(0.0, bar_decoded_d, decoded[d] > 0.0);
-        }
-      }
-      workgroupBarrier();
-
-      for (var i = 0u; i < DW2_PER_THREAD; i++) {
-        let w_idx = lid + i * WG;
-        if (w_idx < DW2_SIZE) {
-          let k = w_idx % PATCH_CH; let c = (w_idx / PATCH_CH) % D;
-          let kx = (w_idx / (PATCH_CH * D)) % 3u; let ky = (w_idx / (PATCH_CH * D * 3u)) % 3u;
-          let py = patch_idx / P; let px = patch_idx % P;
-          local_dW2[i] += sh_patch_delta2[k] * sh_a_at(i32(py) + 2*(i32(ky)-1), i32(px) + 2*(i32(kx)-1), c);
-        }
-      }
-
-      for (var item = lid; item < PATCH_CH; item += WG) {
-        let c = item % D; let v = (item / D) % 3u; let u = (item / (3u * D)) % 3u;
-        let py = i32(patch_idx / P) + 2 * (i32(u) - 1);
-        let px = i32(patch_idx % P) + 2 * (i32(v) - 1);
-        if (py >= 0 && py < i32(P) && px >= 0 && px < i32(P)) {
-          var sum = 0.0;
-          for (var k = 0u; k < PATCH_CH; k++) { sum += sh_patch_delta2[k] * c2w(u, v, c, k); }
-          sh_bar_a1[u32(py) * P * D + u32(px) * D + c] += sum;
-        }
-      }
-      workgroupBarrier();
-    }
     }
 
     for (var chunk = 0u; chunk < RED_TOTAL * RUN_REDUCE; chunk += 2u) {

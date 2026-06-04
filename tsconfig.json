@@ -13,5 +13,5 @@
     "types": ["@webgpu/types"]
   },
   "include": ["src/**/*.ts", "vite-env.d.ts"],
-  "exclude": ["node_modules"]
+  "exclude": ["node_modules", "bench"]
 }

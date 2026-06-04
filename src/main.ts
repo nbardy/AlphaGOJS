@@ -1,6 +1,7 @@
 import { createChartCanvas, drawLineChart } from './charts';
 import type { ChartOptions, ChartSeries } from './charts';
 import { LEAGUE_ARCHS } from './arch_config';
+import { PlayController, type LiveWeightsGetter } from './play_vs_model';
 
 // --- System diagnostics ---
 console.log("--- SYSTEM DIAGNOSTICS ---");
@@ -33,6 +34,14 @@ const leagueTrainingStatus = document.getElementById('league-training-status')!;
 const evalLog        = document.getElementById('eval-log')!;
 const boardLabel     = document.getElementById('board-label')!;
 const statsBar       = document.querySelector('.stats') as HTMLElement;
+
+// --- Play-vs-model DOM refs ---
+const btnNewGame     = document.getElementById('btn-newgame') as HTMLButtonElement;
+const playPanel      = document.getElementById('play-panel')!;
+const playStatus     = document.getElementById('play-status')!;
+const playSource     = document.getElementById('play-source')!;
+const btnPlayAgain   = document.getElementById('btn-play-again') as HTMLButtonElement;
+const btnExitPlay    = document.getElementById('btn-exit-play') as HTMLButtonElement;
 
 // --- Board rendering ---
 const K = 24;
@@ -67,6 +76,32 @@ const history = {
   entropy:     [] as number[],
 };
 
+// Calibrated skill vs the FIXED gen-0 anchor (position-corrected, cross-run-comparable).
+// Three OVERLAPPING series on one Elo chart: agent-as-first (advantaged), agent-as-second
+// (disadvantaged), and the position-neutral mixed estimate. Unlike self-play Elo these are
+// reproducible across runs because the anchor is byte-identical every run.
+const anchorEloHistory = {
+  first:  [] as number[], // green
+  second: [] as number[], // red
+  mixed:  [] as number[], // blue
+};
+
+// Win-rate is only measured on eval steps (~CONFIG.evalFraction of steps); on
+// non-eval steps the worker reports winRate = -1 as a "no eval" sentinel. We must
+// NOT plot that -1, or the [0,1] chart combs down to the floor every other step.
+// Instead we keep only genuine eval points here and carry the smoothed trend
+// forward into history.winRate so the line holds flat between evals.
+const realWinRates: number[] = [];      // only true eval measurements
+const WINRATE_SMOOTH_WINDOW = 10;       // trailing avg window, like Elo's smooth read
+
+/** Trailing moving average of the last N real eval win-rates. */
+function smoothedWinRate(): number {
+  const n = Math.min(WINRATE_SMOOTH_WINDOW, realWinRates.length);
+  let sum = 0;
+  for (let i = realWinRates.length - n; i < realWinRates.length; i++) sum += realWinRates[i];
+  return sum / n;
+}
+
 // --- Chart setup: one canvas per metric, inserted into the 2x3 grid ---
 
 interface ChartDef {
@@ -93,7 +128,7 @@ const chartDefs: ChartDef[] = [
   },
   {
     key: 'winRate',
-    options: { title: 'Win Rate vs Checkpoints', color: '#44dddd', refLine: 0.5, refColor: '#ffcc00', minY: 0, maxY: 1 },
+    options: { title: 'Win Rate vs Checkpoints (10-eval avg)', color: '#44dddd', refLine: 0.5, refColor: '#ffcc00', minY: 0, maxY: 1 },
   },
   {
     key: 'entropy',
@@ -108,11 +143,33 @@ const chartCanvases = chartDefs.map(def => {
   return { canvas: c, def };
 });
 
-/** Redraw all 6 charts from current history. */
+// Dedicated multi-series chart for the three anchor Elos (overlapping lines). Uses the
+// same drawLineChart multi-series path as the league Elo chart, but lives in single mode
+// alongside the per-metric charts.
+const anchorEloCanvas = createChartCanvas(300, 150);
+chartGrid.appendChild(anchorEloCanvas);
+
+/** Redraw the anchor-Elo chart: first=green, second=red, mixed=blue, overlapping. */
+function redrawAnchorEloChart(): void {
+  const series: ChartSeries[] = [
+    { data: anchorEloHistory.first,  color: '#44ff44', label: 'agent first' },
+    { data: anchorEloHistory.second, color: '#ff4444', label: 'agent second' },
+    { data: anchorEloHistory.mixed,  color: '#4488ff', label: 'mixed' },
+  ];
+  drawLineChart(anchorEloCanvas, [], {
+    title: 'Skill vs Fixed Anchor (gen-0, calibrated Elo)',
+    series,
+    refLine: 1000,
+    refColor: '#ffcc00',
+  });
+}
+
+/** Redraw all per-metric charts (and the anchor-Elo multi-series chart) from history. */
 function redrawCharts(): void {
   for (const { canvas: c, def } of chartCanvases) {
     drawLineChart(c, history[def.key], def.options);
   }
+  redrawAnchorEloChart();
 }
 
 // Draw initial empty state
@@ -299,6 +356,100 @@ function setMode(newMode: 'single' | 'league'): void {
 btnSingle.addEventListener('click', () => setMode('single'));
 btnLeague.addEventListener('click', () => setMode('league'));
 
+// --- Play-vs-model mode ---
+// Human plays the BEST trained model. Weights come from the highest-Elo checkpoint
+// in IndexedDB (read directly on the main thread); if none exists yet we fall back
+// to live GPU weights via a GET_WEIGHTS round-trip to the training worker.
+
+let playController: PlayController | null = null;
+let inPlayMode = false;
+
+// Pending resolver for the live-weights round-trip (set while awaiting WEIGHTS).
+let pendingLiveWeights: ((w: { dense: Float32Array; embed: Float16Array; D: number }) => void) | null = null;
+
+const getLiveWeights: LiveWeightsGetter = () =>
+  new Promise((resolve, reject) => {
+    pendingLiveWeights = resolve;
+    worker.postMessage({ type: 'GET_WEIGHTS' });
+    // Guard against a hung worker so the controller never waits forever.
+    setTimeout(() => {
+      if (pendingLiveWeights) {
+        pendingLiveWeights = null;
+        reject(new Error('Timed out reading live weights from worker.'));
+      }
+    }, 10000);
+  });
+
+function enterPlayMode(): void {
+  if (inPlayMode) return;
+  inPlayMode = true;
+
+  // Pause training (mirror setMode's PAUSE behavior) so the GPU is free.
+  if (!paused) worker.postMessage({ type: 'PAUSE' });
+  // If league mode was active, stop its worker too.
+  stopLeagueWorker();
+
+  // Hide training/league chrome, show the play panel + interactive board.
+  leaguePanel.style.display = 'none';
+  statsBar.style.display = 'none';
+  boardLabel.style.display = 'none';
+  playPanel.style.display = 'flex';
+  canvas.classList.add('playable');
+  btnNewGame.classList.add('active');
+
+  startNewGame();
+}
+
+function exitPlayMode(): void {
+  if (!inPlayMode) return;
+  inPlayMode = false;
+
+  playController?.dispose();
+  playController = null;
+
+  playPanel.style.display = 'none';
+  canvas.classList.remove('playable');
+  btnNewGame.classList.remove('active');
+
+  // Resume the previous mode. setMode short-circuits if mode is unchanged, so
+  // force a clean re-entry: temporarily flip mode then set it back.
+  const target = mode;
+  mode = target === 'single' ? 'league' : 'single';
+  setMode(target);
+}
+
+function startNewGame(): void {
+  playController?.dispose();
+  playController = new PlayController(
+    {
+      onRender: (board) => drawBoard(board),
+      onStatus: (text) => { playStatus.textContent = text; },
+      onGameOver: () => { /* status already set; Play Again button handles restart */ },
+    },
+    getLiveWeights,
+    1, // human plays first (blue)
+  );
+  void playController.start().then(() => {
+    playSource.textContent = `Opponent: ${playController?.modelSource() ?? 'unknown'}`;
+  }).catch((err) => {
+    playStatus.textContent = 'Could not start game: ' + (err?.message ?? String(err));
+  });
+}
+
+// Canvas click → human move (only active in play mode; controller ignores otherwise).
+canvas.addEventListener('click', (ev: MouseEvent) => {
+  if (!inPlayMode || !playController) return;
+  const rect = canvas.getBoundingClientRect();
+  // Map CSS pixels → canvas backing-store pixels (canvas may be scaled by CSS).
+  const px = (ev.clientX - rect.left) * (canvas.width / rect.width);
+  const py = (ev.clientY - rect.top) * (canvas.height / rect.height);
+  playController.handleClick(px, py, canvas.width, canvas.height);
+});
+
+btnNewGame.addEventListener('click', () => enterPlayMode());
+btnPlayAgain.addEventListener('click', () => startNewGame());
+btnExitPlay.addEventListener('click', () => exitPlayMode());
+
 // --- Pause / Resume ---
 
 btnPause.addEventListener('click', () => {
@@ -324,9 +475,19 @@ worker.onmessage = (e: MessageEvent) => {
     errorOverlay.innerText = "Error: " + msg.message;
     return;
   }
+  if (msg.type === 'WEIGHTS') {
+    // Response to a GET_WEIGHTS round-trip (live-weights fallback for play mode).
+    if (pendingLiveWeights) {
+      const resolve = pendingLiveWeights;
+      pendingLiveWeights = null;
+      resolve({ dense: msg.dense, embed: msg.embed, D: msg.D });
+    }
+    return;
+  }
   if (msg.type === 'BOARD') {
     if (msg.board[0]) console.log("Main received board:", msg.board[0], msg.board[1]);
-    drawBoard(msg.board);
+    // Don't let the (paused) training board overwrite the interactive play board.
+    if (!inPlayMode) drawBoard(msg.board);
     return;
   }
   if (msg.type === 'STATS') {
@@ -346,10 +507,22 @@ worker.onmessage = (e: MessageEvent) => {
     history.loss.push(s.loss);
     history.gamesPerSec.push(s.trainedGamesPerSec);
     history.avgSteps.push(s.avgStepsPerGame);
-    // winRate and entropy may not be present yet -- the worker-side protocol
-    // addition is handled by a separate agent. Default to 0 until available.
-    history.winRate.push(s.winRate ?? 0);
+    // Win-rate: the worker sends -1 on non-eval steps (no game played this step).
+    // `?? 0` only catches null/undefined, NOT the -1 sentinel, so plotting it
+    // directly made the chart comb to the floor between evals. Only record genuine
+    // eval points (winRate >= 0); on non-eval steps carry the smoothed trend forward
+    // so the line holds flat instead of dropping to 0.
+    const wr = s.winRate ?? -1;
+    if (wr >= 0) realWinRates.push(wr);
+    history.winRate.push(realWinRates.length > 0 ? smoothedWinRate() : 0);
     history.entropy.push(s.entropy ?? 0);
+
+    // Anchor Elos are carried forward by the worker between its every-10-rollout evals,
+    // so a value is present on every STATS message — push all three each step so the
+    // three overlapping lines stay aligned with the other charts' x-axis.
+    anchorEloHistory.first.push(s.eloAnchorFirst ?? 1000);
+    anchorEloHistory.second.push(s.eloAnchorSecond ?? 1000);
+    anchorEloHistory.mixed.push(s.eloAnchorMixed ?? 1000);
 
     redrawCharts();
     return;
