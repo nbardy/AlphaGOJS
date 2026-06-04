@@ -8,6 +8,14 @@ export function generateKernel(D: number): string {
     /const D: u32 = \d+u;/,
     `const D: u32 = ${D}u;`
   );
+  // Backward-path gating (only affects a kernel that defines these consts — no-op otherwise):
+  // cell-parallel backward fits D<=8 (needs 32KB workgroup storage, browser-granted); for
+  // D>8 fall back to the serial backward and shrink the cell-parallel scratch array so it
+  // stays within limits.
+  if (D > 8) {
+    wgsl = wgsl.replace('const USE_CELLPAR_BWD: bool = true;', 'const USE_CELLPAR_BWD: bool = false;');
+    wgsl = wgsl.replace('const PD2_ALL_FACTOR: u32 = 64u;', 'const PD2_ALL_FACTOR: u32 = 1u;');
+  }
   // Profiling ablation (headless only): set globalThis.__ABLATE__ to a comma list of
   // phase names (CONV2BWD,REDUCE,CONV1BWD,EMBEDBWD) to zero each phase's loop bound and
   // measure its wall-clock cost. No-op in the browser (globalThis.__ABLATE__ undefined).
