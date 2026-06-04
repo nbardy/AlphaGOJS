@@ -58,6 +58,9 @@ const RUN_REDUCE:   u32 = 1u; // small-gradient 2-at-a-time reduction
 const RUN_CONV1BWD: u32 = 1u; // conv1 weight gradient
 const RUN_EMBEDBWD: u32 = 1u; // patch-embedding gradient
 
+const USE_CELLPAR_BWD: bool = true; // generateKernel sets false for D>8 (serial fallback)
+const PD2_ALL_FACTOR: u32 = 64u;    // = P*P for the cell-parallel scratch; generateKernel sets 1u for D>8
+
 struct Params {
   batch_size: u32,
   step: u32,
@@ -122,6 +125,7 @@ var<workgroup> sh_pool: array<f32, 64u>;
 var<workgroup> sh_reduce_m: array<f32, 64u>;
 var<workgroup> sh_reduce_s: array<f32, 64u>;
 var<workgroup> sh_patch_delta2: array<f32, PATCH_CH>;
+var<workgroup> sh_patch_delta2_all: array<f32, PD2_ALL_FACTOR * PATCH_CH>;
 var<workgroup> sh_value: f32;
 var<workgroup> sh_action: u32;
 var<workgroup> sh_log_prob: f32;
@@ -620,6 +624,95 @@ fn ppo_step(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) 
     for (var i = 0u; i < P * P * D; i += WG) { sh_bar_a1[lid + i] = 0.0; }
     workgroupBarrier();
 
+    if (USE_CELLPAR_BWD) {
+    // === CONV2/FUSE BACKWARD — cell-parallel (replaces 64 serial patches @ 9/64 threads) ===
+    if (RUN_CONV2BWD == 1u) {
+      // Phase 1: all 64 threads, ~9 cells each. Per-cell delta_f + small weight grads
+      // (l_dWpi/l_dWv/l_dWf/l_dE_cell accumulate per-thread; the later REDUCE sums threads).
+      // Each cell writes its own unique slot of sh_patch_delta2_all → no races.
+      for (var cell = lid; cell < N; cell += WG) {
+        let y = cell / K; let x = cell % K;
+        let py = y / 3u; let px = x / 3u;
+        let sub = (y % 3u) * 3u + (x % 3u);
+        let patch_idx = py * P + px;
+        let state = get_sh_cell_state(y, x);
+
+        var decoded: array<f32, D>;
+        for (var c = 0u; c < D; c++) { decoded[c] = conv2_at_patch(i32(py), i32(px), sub * D + c); }
+
+        var af: array<f32, D>;
+        for (var o = 0u; o < D; o++) {
+          var acc = 0.0;
+          for (var c = 0u; c < D; c++) { acc += fw(c, o) * decoded[c] + fw(D + c, o) * cell_e(state, c); }
+          af[o] = max(acc, 0.0);
+        }
+
+        let delta_pi_i = sh_b[cell];
+        let delta_v_N = sh_delta_v / f32(N);
+        var delta_f: array<f32, D>;
+
+        for (var o = 0u; o < D; o++) {
+          l_dWpi[o] += delta_pi_i * af[o];
+          l_dWv[o] += delta_v_N * af[o];
+          let bar_af = delta_pi_i * pw(o) + delta_v_N * vw(o);
+          delta_f[o] = select(0.0, bar_af, af[o] > 0.0);
+          for (var c = 0u; c < D; c++) {
+            l_dWf[c * D + o] += delta_f[o] * decoded[c];
+            l_dWf[(D + c) * D + o] += delta_f[o] * cell_e(state, c);
+            l_dE_cell[state * D + c] += delta_f[o] * fw(D + c, o);
+          }
+        }
+
+        for (var d = 0u; d < D; d++) {
+          var bar_decoded_d = 0.0;
+          for (var o = 0u; o < D; o++) { bar_decoded_d += delta_f[o] * fw(d, o); }
+          sh_patch_delta2_all[patch_idx * PATCH_CH + sub * D + d] = select(0.0, bar_decoded_d, decoded[d] > 0.0);
+        }
+      }
+      workgroupBarrier();
+
+      // Phase 2: conv2 weight gradient (DW2). Each thread owns DW2_PER_THREAD weights and
+      // gathers each weight's gradient over ALL patches (no races; was per-patch scatter).
+      for (var i = 0u; i < DW2_PER_THREAD; i++) {
+        let w_idx = lid + i * WG;
+        if (w_idx < DW2_SIZE) {
+          let k = w_idx % PATCH_CH; let c = (w_idx / PATCH_CH) % D;
+          let kx = (w_idx / (PATCH_CH * D)) % 3u; let ky = (w_idx / (PATCH_CH * D * 3u)) % 3u;
+          var acc = 0.0;
+          for (var patch_idx = 0u; patch_idx < P * P; patch_idx++) {
+            let py = patch_idx / P; let px = patch_idx % P;
+            acc += sh_patch_delta2_all[patch_idx * PATCH_CH + k] * sh_a_at(i32(py) + 2*(i32(ky)-1), i32(px) + 2*(i32(kx)-1), c);
+          }
+          local_dW2[i] += acc;
+        }
+      }
+
+      // Phase 3: conv1-output gradient (sh_bar_a1) as a GATHER — one thread per output
+      // (patch,channel), summing the 3x3 neighborhood of SOURCE patches. This is the
+      // transpose of the original scatter: original did target=(src_py+2(u-1), src_px+2(v-1)),
+      // so for target (opy,opx) the source is (opy-2(u-1), opx-2(v-1)).
+      for (var out_idx = lid; out_idx < P * P * D; out_idx += WG) {
+        let oc = out_idx % D;
+        let opx = (out_idx / D) % P;
+        let opy = (out_idx / D) / P;
+        var acc = 0.0;
+        for (var u = 0u; u < 3u; u++) {
+          for (var v = 0u; v < 3u; v++) {
+            let spy = i32(opy) - 2 * (i32(u) - 1);
+            let spx = i32(opx) - 2 * (i32(v) - 1);
+            if (spy >= 0 && spy < i32(P) && spx >= 0 && spx < i32(P)) {
+              let sp = u32(spy) * P + u32(spx);
+              var sum = 0.0;
+              for (var k = 0u; k < PATCH_CH; k++) { sum += sh_patch_delta2_all[sp * PATCH_CH + k] * c2w(u, v, oc, k); }
+              acc += sum;
+            }
+          }
+        }
+        sh_bar_a1[out_idx] += acc;
+      }
+      workgroupBarrier();
+    }
+    } else {
     for (var patch_idx = 0u; patch_idx < P * P * RUN_CONV2BWD; patch_idx++) {
       if (lid < 9u) {
         let sub = lid;
@@ -684,6 +777,7 @@ fn ppo_step(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) 
         }
       }
       workgroupBarrier();
+    }
     }
 
     for (var chunk = 0u; chunk < RED_TOTAL * RUN_REDUCE; chunk += 2u) {
